@@ -1,5 +1,5 @@
 ---
-version: 2
+version: 3
 model: anthropic/claude-sonnet-4.6
 temperature: 0.2
 max_tokens: 16000
@@ -19,6 +19,9 @@ into every chapter's translation prompt, so the list must be:
 - GENDERED — for characters, give grammatical gender when possible (critical
   for correct {{ target_lang_name }} agreement).
 - BRIEF — notes stay short.
+- FOCUSED ON NEW ITEMS — if a list of already-known terms is provided
+  below, do NOT repeat them. Return only what is NEW or truly needs
+  overriding.
 
 Categories to extract:
 
@@ -54,7 +57,26 @@ For plural forms in {{ target_lang_name }}: if the term appears in plural
 or if plural forms will plausibly be needed, provide `plural`. Otherwise
 leave it `null`.
 
-Output STRICT JSON, no preamble, no code fences, no commentary. Schema:
+## Known terms (from earlier books in the series)
+
+You MAY receive a list of previously-curated terms with their canonical
+{{ target_lang_name }} translations. Treat those as authoritative:
+
+- Do NOT repeat them in your output.
+- Use their canonical translations if you reference them in your notes.
+- If this book CONTRADICTS a known term (e.g. reveals a character's
+  full name where only a first name was known; introduces a name spelling
+  that clashes with a previous one), include that term in your output
+  with the additional field `"override": true` and briefly explain in
+  `notes` why it needs updating. The human reviewer will decide whether
+  to accept the override.
+
+Do not invent overrides for cosmetic reasons — only when the book's
+content actually requires a change.
+
+## Output schema
+
+Output STRICT JSON, no preamble, no code fences, no commentary:
 
 ```
 {
@@ -65,15 +87,17 @@ Output STRICT JSON, no preamble, no code fences, no commentary. Schema:
       "type": "person" | "place" | "concept" | "term" | "other",
       "gender": "m" | "f" | "n" | "unknown" | null,
       "plural": "string" | null,
-      "notes": "string" | null
+      "notes": "string" | null,
+      "override": true | false   // optional; only on overrides
     }
   ]
 }
 ```
 
-Do not include duplicates. If a character is referred to by multiple names
-(first name, last name, nickname), include the MOST FREQUENT form as
-the canonical `original`, and mention the alternates in `notes`.
+Do not include duplicates within your own output. If a character is
+referred to by multiple names (first name, last name, nickname), include
+the MOST FREQUENT form as the canonical `original`, and mention the
+alternates in `notes`.
 
 Sort entries by `type` then by `original`.
 
@@ -85,6 +109,18 @@ Sort entries by `type` then by `original`.
 - Source language: {{ source_lang_name }}
 - Target language: {{ target_lang_name }}
 
+{% if known_terms %}
+## Known terms (DO NOT REPEAT)
+
+The following terms have canonical translations. Use them as authoritative.
+Your output must contain ONLY new terms specific to this book, plus
+overrides if strictly necessary.
+
+```
+{{ known_terms }}
+```
+
+{% endif %}
 ## Full text
 
 {{ book_text }}

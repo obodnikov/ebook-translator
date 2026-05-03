@@ -31,7 +31,13 @@ def _strip_code_fences(text: str) -> str:
 
 
 def _parse_llm_response(raw: str) -> list[GlossaryEntry]:
-    """Parse the LLM's JSON output into a list of validated entries."""
+    """Parse the LLM's JSON output into a list of validated entries.
+
+    Tolerates the extra `override` field used for series-aware extraction:
+    it is folded into `notes` (prefixed with "[override] ") because the
+    book-level `GlossaryEntry` schema doesn't carry it. The promote step
+    decides what to do with overrides.
+    """
     cleaned = _strip_code_fences(raw)
     try:
         data = json.loads(cleaned)
@@ -54,6 +60,15 @@ def _parse_llm_response(raw: str) -> list[GlossaryEntry]:
     entries: list[GlossaryEntry] = []
     errors: list[str] = []
     for i, item in enumerate(entries_raw):
+        if not isinstance(item, dict):
+            errors.append(f"  entry {i}: not an object ({item!r})")
+            continue
+        item = dict(item)
+        is_override = bool(item.pop("override", False))
+        if is_override:
+            existing_notes = item.get("notes") or ""
+            prefix = "[override] "
+            item["notes"] = prefix + existing_notes if existing_notes else prefix.strip()
         try:
             entries.append(GlossaryEntry.model_validate(item))
         except ValidationError as e:
@@ -75,11 +90,16 @@ def extract_glossary(
     model: str | None = None,
     source_lang: str = "en",
     target_lang: str = "ru",
+    known_terms: str | None = None,
 ) -> tuple[Glossary, CompletionResult | None, str]:
     """Run the glossary extraction pass on the whole book.
 
     Returns a tuple of (Glossary, CompletionResult or None if cache hit,
     raw LLM text for debugging).
+
+    If `known_terms` is given (typically the series glossary rendered as
+    a compact table), it is injected into the prompt so the model can
+    skip already-known names and only return new or overriding entries.
     """
     prompt = load_prompt(prompt_path)
     chosen_model = model or prompt.model
@@ -94,6 +114,7 @@ def extract_glossary(
         "target_lang": target_lang,
         "target_lang_name": LANG_NAMES.get(target_lang, target_lang),
         "book_text": book.full_text(),
+        "known_terms": known_terms or "",
     }
     system, user = render_prompt(prompt, context)
 

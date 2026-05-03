@@ -96,6 +96,40 @@ class Glossary(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Series glossary (canonical, curated across multiple books)
+# ---------------------------------------------------------------------------
+
+
+class SeriesGlossaryEntry(BaseModel):
+    """Curated entry used across all books in a series.
+
+    Simplified compared to `GlossaryEntry`: no `approved_by_human` (by
+    construction everything in a series glossary is approved). Tracks
+    which book the entry originally came from, for auditing.
+    """
+
+    original: str
+    translation: str
+    type: Literal["person", "place", "concept", "term", "other"]
+    gender: Literal["m", "f", "n", "unknown"] | None = None
+    plural: str | None = None
+    notes: str | None = None
+    origin_book: str | None = None
+
+
+class SeriesGlossary(BaseModel):
+    series_slug: str
+    title: str
+    author: str
+    source_lang: str
+    target_lang: str
+    entries: list[SeriesGlossaryEntry] = Field(default_factory=list)
+
+    def index_by_original(self) -> dict[str, SeriesGlossaryEntry]:
+        return {e.original: e for e in self.entries}
+
+
+# ---------------------------------------------------------------------------
 # State
 # ---------------------------------------------------------------------------
 
