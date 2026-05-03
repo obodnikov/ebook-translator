@@ -1,0 +1,55 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "book-translator"
+version = "0.1.0"
+description = "Translate EPUB books from English to Russian via OpenRouter LLMs."
+requires-python = ">=3.12"
+authors = [{ name = "eobomik" }]
+license = { text = "MIT" }
+readme = "README.md"
+
+dependencies = [
+    # EPUB I/O
+    "ebooklib>=0.18",
+    "lxml>=5.2",
+
+    # LLM client (OpenAI SDK pointed at OpenRouter)
+    "openai>=1.54",
+
+    # Config, data modeling, retries
+    "pydantic>=2.7",
+    "pyyaml>=6.0",
+    "python-frontmatter>=1.1",
+    "jinja2>=3.1",
+    "tenacity>=8.3",
+
+    # CLI and env
+    "typer>=0.12",
+    "rich>=13.7",
+    "python-dotenv>=1.0",
+
+    # Networking (Telegram)
+    "httpx>=0.27",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.5"]
+
+[project.scripts]
+btrans = "booktranslator.cli:app"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+booktranslator = ["py.typed"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM"]

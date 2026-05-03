@@ -1,0 +1,39 @@
+source_lang: en
+target_lang: ru
+
+chunker:
+  target_words: 2000
+  overlap_paragraphs: 1
+
+models:
+  glossary:   anthropic/claude-sonnet-4.6
+  translate:  anthropic/claude-sonnet-4.6
+  judge:      anthropic/claude-haiku-4.5
+  reflect:    anthropic/claude-sonnet-4.6
+  proofread:  anthropic/claude-haiku-4.5
+  style:      anthropic/claude-sonnet-4.6
+  verify:     anthropic/claude-sonnet-4.6
+
+reflection:
+  trigger_score: 3
+  extended_thinking: true
+
+pauses:
+  after_glossary: true
+  after_translate: true
+
+stages:
+  proofread: true
+  style: true
+  verify: true
+
+retry:
+  max_attempts: 5
+  backoff_base: 2.0
+
+notifications:
+  enabled: true
+  provider: telegram
+
+cost:
+  hard_limit_usd: 50.0
