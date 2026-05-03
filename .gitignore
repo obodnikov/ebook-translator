@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+
+# Environment
+.env
+
+# Project artifacts
+work/
+
+# Book files: we never commit copyrighted content.
+# The entire books/ directory is ignored.
+books/
+
+# Editor
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Peek / temp
+.peek/
