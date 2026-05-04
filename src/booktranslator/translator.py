@@ -35,6 +35,24 @@ _PARAGRAPH_MARKER_RE = re.compile(
     r"^===PARAGRAPH\s+(\d+)===\s*$", re.MULTILINE
 )
 
+# Matches a `&` that does NOT start a valid XML entity
+# (&amp; &lt; &gt; &quot; &apos; or numeric like &#123; / &#xAF;).
+# Used to fix stray ampersands in LLM output like "M&S", "AT&T".
+_BARE_AMPERSAND_RE = re.compile(
+    r"&(?!(?:amp|lt|gt|quot|apos|#\d+|#x[0-9a-fA-F]+);)"
+)
+
+
+def _escape_bare_ampersands(fragment: str) -> str:
+    """Replace stray `&` (not part of a valid entity) with `&amp;`.
+
+    LLMs sometimes return English brand names like "M&S" or "AT&T"
+    verbatim inside XHTML fragments. Those break lxml parsing. We fix
+    them here rather than asking the model to escape, because the
+    instruction is easy to miss on a long chunk.
+    """
+    return _BARE_AMPERSAND_RE.sub("&amp;", fragment)
+
 LANG_NAMES = {
     "en": "English",
     "ru": "Russian",
@@ -148,6 +166,9 @@ class Translator:
         # the chapter. But the fragment we received from the LLM has no
         # namespaces. We'll splice it directly; the enclosing chapter
         # already declares xmlns on <html>.
+        # Fix stray ampersands first — LLMs often return "M&S" / "AT&T"
+        # verbatim, which would make the fragment non-well-formed XML.
+        fragment = _escape_bare_ampersands(fragment)
         try:
             return etree.fromstring(fragment)
         except etree.XMLSyntaxError as e:
