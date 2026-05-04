@@ -28,3 +28,11 @@ Thumbs.db
 
 # Peek / temp
 .peek/
+
+# Semantic index
+.index/
+
+# OwnCloud
+.owncloudsync.log
+.sync_journal.db
+.sync_journal.db-wal
