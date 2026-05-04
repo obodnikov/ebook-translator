@@ -42,7 +42,10 @@ class CachedEntry:
 class Cache:
     def __init__(self, path: Path):
         path.parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(path)
+        # check_same_thread=False lets us share the connection across
+        # worker threads; our Translator serialises cache put/get with
+        # its own lock, so concurrent access is safe.
+        self.conn = sqlite3.connect(path, check_same_thread=False)
         self.conn.execute(SCHEMA)
         self.conn.commit()
 

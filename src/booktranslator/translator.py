@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import logging
 import re
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -73,6 +75,10 @@ class Translator:
         self._glossary_block = (
             render_for_prompt(glossary) if glossary else "(no glossary provided)"
         )
+        # Serialize stats updates and live-tree mutations when running
+        # chunks in parallel. The lxml tree itself is not thread-safe
+        # for writes even across disjoint elements on some builds.
+        self._lock = threading.Lock()
 
     # -- prompt building ---------------------------------------------------
 
@@ -195,10 +201,12 @@ class Translator:
             system,
             user,
         )
-        cached = self.cache.get(cache_key)
+        with self._lock:
+            cached = self.cache.get(cache_key)
         if cached is not None:
             raw_text = cached.content
-            stats.chunks_cached += 1
+            with self._lock:
+                stats.chunks_cached += 1
             result = None
         else:
             result = self.provider.complete(
@@ -209,44 +217,87 @@ class Translator:
                 max_tokens=self.prompt.max_tokens,
             )
             raw_text = result.text
-            self.cache.put(
-                key=cache_key,
-                stage="translate",
-                model=self.model,
-                prompt_version=self.prompt.version,
-                content=raw_text,
-                input_tokens=result.input_tokens,
-                output_tokens=result.output_tokens,
-            )
-            stats.chunks_translated += 1
-            stats.input_tokens += result.input_tokens
-            stats.output_tokens += result.output_tokens
+            with self._lock:
+                self.cache.put(
+                    key=cache_key,
+                    stage="translate",
+                    model=self.model,
+                    prompt_version=self.prompt.version,
+                    content=raw_text,
+                    input_tokens=result.input_tokens,
+                    output_tokens=result.output_tokens,
+                )
+                stats.chunks_translated += 1
+                stats.input_tokens += result.input_tokens
+                stats.output_tokens += result.output_tokens
 
         expected = len(chunk.paragraph_indexes)
         fragments = self._parse_response(raw_text, expected)
 
-        # Splice fragments into the live tree.
-        chapter = chunk_set.book.chapters[chunk.chapter_index]
-        for para_idx, frag_str in zip(chunk.paragraph_indexes, fragments):
-            original_el = chapter.paragraphs[para_idx]
-            new_el = self._parse_fragment(frag_str)
-            self._replace_element(original_el, new_el)
-            # Keep chapter.paragraphs pointing at the new element so
-            # later passes (if any) see the latest state.
-            chapter.paragraphs[para_idx] = new_el
+        # Splice fragments into the live tree. Guarded by the lock so
+        # parallel chunks don't race when mutating lxml elements (even
+        # though they target different subtrees, we stay on the safe
+        # side).
+        with self._lock:
+            chapter = chunk_set.book.chapters[chunk.chapter_index]
+            for para_idx, frag_str in zip(chunk.paragraph_indexes, fragments):
+                original_el = chapter.paragraphs[para_idx]
+                new_el = self._parse_fragment(frag_str)
+                self._replace_element(original_el, new_el)
+                chapter.paragraphs[para_idx] = new_el
 
     # -- full book translation loop ---------------------------------------
 
     def translate_book(
-        self, chunk_set: ChunkSet, on_progress=None
+        self,
+        chunk_set: ChunkSet,
+        on_progress=None,
+        parallelism: int = 1,
     ) -> TranslateStats:
         stats = TranslateStats(chunks_total=len(chunk_set.chunks))
-        for i, chunk in enumerate(chunk_set.chunks):
-            try:
-                self.translate_chunk(chunk_set, chunk, stats)
-            except Exception as e:
-                stats.chunks_failed += 1
-                logger.warning("Chunk %s failed: %s", chunk.id, e)
-            if on_progress:
-                on_progress(i + 1, len(chunk_set.chunks), chunk, stats)
+        total = len(chunk_set.chunks)
+
+        if parallelism <= 1:
+            # Sequential path: simplest, matches v1 behaviour.
+            for i, chunk in enumerate(chunk_set.chunks):
+                try:
+                    self.translate_chunk(chunk_set, chunk, stats)
+                except Exception as e:
+                    stats.chunks_failed += 1
+                    logger.warning("Chunk %s failed: %s", chunk.id, e)
+                if on_progress:
+                    on_progress(i + 1, total, chunk, stats)
+            return stats
+
+        # Parallel path. Chunks execute on a thread pool; the provider
+        # call is blocking I/O so threads are fine here (no GIL issues
+        # for network waits).
+        done_count = 0
+        last_chunk: Chunk | None = None
+        with ThreadPoolExecutor(max_workers=parallelism) as pool:
+            futures = {
+                pool.submit(self._translate_chunk_safe, chunk_set, chunk, stats): chunk
+                for chunk in chunk_set.chunks
+            }
+            for fut in as_completed(futures):
+                chunk = futures[fut]
+                last_chunk = chunk
+                err = fut.result()
+                if err is not None:
+                    with self._lock:
+                        stats.chunks_failed += 1
+                    logger.warning("Chunk %s failed: %s", chunk.id, err)
+                done_count += 1
+                if on_progress:
+                    on_progress(done_count, total, chunk, stats)
         return stats
+
+    def _translate_chunk_safe(
+        self, chunk_set: ChunkSet, chunk: Chunk, stats: TranslateStats
+    ) -> Exception | None:
+        """Translate a single chunk, returning any exception raised."""
+        try:
+            self.translate_chunk(chunk_set, chunk, stats)
+            return None
+        except Exception as e:  # noqa: BLE001
+            return e

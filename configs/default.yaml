@@ -5,6 +5,9 @@ chunker:
   target_words: 2000
   overlap_paragraphs: 1
 
+translate:
+  parallelism: 1    # concurrent chunks; raise to 4-8 for speedup.
+
 models:
   glossary:   anthropic/claude-sonnet-4.6
   translate:  anthropic/claude-sonnet-4.6

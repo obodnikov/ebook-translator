@@ -28,6 +28,12 @@ class ChunkerConfig(BaseModel):
     overlap_paragraphs: int = 1
 
 
+class TranslateConfig(BaseModel):
+    """Runtime knobs for the translate stage."""
+
+    parallelism: int = 1  # How many chunks to translate concurrently.
+
+
 class ReflectionConfig(BaseModel):
     trigger_score: int = 3
     extended_thinking: bool = True
@@ -62,6 +68,7 @@ class Config(BaseModel):
     source_lang: str = "en"
     target_lang: str = "ru"
     chunker: ChunkerConfig = Field(default_factory=ChunkerConfig)
+    translate: TranslateConfig = Field(default_factory=TranslateConfig)
     models: ModelsConfig = Field(default_factory=ModelsConfig)
     reflection: ReflectionConfig = Field(default_factory=ReflectionConfig)
     pauses: PausesConfig = Field(default_factory=PausesConfig)

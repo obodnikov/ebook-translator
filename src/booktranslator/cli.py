@@ -373,6 +373,11 @@ def translate(
         None, "--limit-chunks",
         help="Translate only the first N chunks (for quick tests).",
     ),
+    parallelism: int | None = typer.Option(
+        None, "--parallelism", "-j",
+        help="Number of chunks to translate concurrently "
+             "(overrides config.translate.parallelism).",
+    ),
 ) -> None:
     """Translate an EPUB into the target language."""
     cfg = load_config(config_path if config_path.exists() else None)
@@ -420,6 +425,12 @@ def translate(
         f"{cfg.chunker.overlap_paragraphs} paragraphs)"
     )
 
+    effective_parallelism = parallelism if parallelism is not None else cfg.translate.parallelism
+    if effective_parallelism > 1:
+        console.print(
+            f"[bold]Parallelism:[/bold] {effective_parallelism} chunks"
+        )
+
     cache = Cache(wd.cache_path)
     provider = OpenRouterProvider()
     chosen_model = model or cfg.models.translate
@@ -456,7 +467,11 @@ def translate(
                 ),
             )
 
-        stats = translator.translate_book(chunk_set, on_progress=on_progress)
+        stats = translator.translate_book(
+            chunk_set,
+            on_progress=on_progress,
+            parallelism=parallelism if parallelism is not None else cfg.translate.parallelism,
+        )
 
     if stats.chunks_failed:
         console.print(
