@@ -30,7 +30,7 @@ from .chunker import chunk_book
 from .config import load_config
 from .epub_io import read_book, read_book_structured, write_translated_epub
 from .glossary import extract_glossary, save_glossary
-from .models import Glossary, Stage
+from .models import Glossary, SeriesGlossary, SeriesGlossaryEntry, Stage
 from .provider import OpenRouterProvider
 from .series import (
     SeriesWorkDir,
@@ -355,6 +355,12 @@ def translate(
         None, "--series", "-s",
         help="Series slug: use its curated glossary for consistency.",
     ),
+    glossary_path: Path | None = typer.Option(
+        None, "--glossary", "-g",
+        exists=True, dir_okay=False,
+        help="Path to a single-book glossary.json. "
+             "Mutually exclusive with --series.",
+    ),
     config_path: Path = typer.Option(
         DEFAULT_CONFIG, "--config", "-c", help="YAML config file.",
     ),
@@ -392,6 +398,14 @@ def translate(
     )
 
     glossary = None
+    if series and glossary_path:
+        console.print(
+            "[red]--series and --glossary are mutually exclusive.[/red]\n"
+            "[dim]Use --series SLUG for books in a curated series, "
+            "--glossary PATH for a stand-alone book.[/dim]"
+        )
+        raise typer.Exit(code=1)
+
     if series:
         swd = SeriesWorkDir.for_series(work_dir, series)
         if not swd.exists():
@@ -401,9 +415,40 @@ def translate(
         console.print(
             f"[bold]Series:[/bold]   {series} ({len(glossary.entries)} terms)"
         )
+    elif glossary_path:
+        # Load a book-level Glossary and adapt it to the SeriesGlossary
+        # shape the Translator expects. We take ALL entries (the operator
+        # chose this file explicitly; approved_by_human is advisory).
+        book_glossary = Glossary.model_validate(
+            json.loads(glossary_path.read_text(encoding="utf-8"))
+        )
+        glossary = SeriesGlossary(
+            series_slug=f"ad-hoc:{book.meta.title}",
+            title=book.meta.title,
+            author=book.meta.author,
+            source_lang=cfg.source_lang,
+            target_lang=cfg.target_lang,
+            entries=[
+                SeriesGlossaryEntry(
+                    original=e.original,
+                    translation=e.translation,
+                    type=e.type,
+                    gender=e.gender,
+                    plural=e.plural,
+                    notes=e.notes,
+                    origin_book=book_glossary.book,
+                )
+                for e in book_glossary.entries
+            ],
+        )
+        console.print(
+            f"[bold]Glossary:[/bold] {len(glossary.entries)} terms "
+            f"from {glossary_path} [dim](ad-hoc, not tied to a series)[/dim]"
+        )
     else:
         console.print(
-            "[yellow]No --series given; translating without a glossary.[/yellow]"
+            "[yellow]No --series or --glossary given; "
+            "translating without a glossary.[/yellow]"
         )
 
     wd = WorkDir.for_book(work_dir, book.meta.title)

@@ -159,6 +159,20 @@ btrans translate ... -j 4      # 4 параллельных chunk
 - Ожидание: при 4–8 параллельных chunks full book с 60 chunks ≈
   10–20 минут вместо прошлых ~90 минут.
 
+### 2.7 Стендэлон-сценарий без серии
+
+```
+btrans translate EPUB --glossary work/<book-slug>/glossary.json
+```
+
+- `--series` и `--glossary` взаимоисключающие.
+- При `--glossary` book-level `Glossary` приводится in-memory к
+  `SeriesGlossary` (берутся все entries; approved_by_human здесь не
+  фильтрует — выбор файла оператором и есть согласие).
+- Промпт и кэш одинаковые для обоих путей.
+- Без `--series`/`--glossary` — жёлтое предупреждение и перевод без
+  глоссария (только для быстрой прикидки).
+
 ---
 
 ## 3. Текущее ограничение и немедленная задача
