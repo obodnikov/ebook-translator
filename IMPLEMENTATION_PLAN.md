@@ -213,34 +213,146 @@ LLM-выводе), собран `books/extracted/broken-homes-ben-aaronovitch-ru
 
 ## 4. Ближайшие итерации
 
-### Итерация 4 — Judge + Reflect
+### Итерация 4 — Judge + Reflect + Multi-pass storage
 
 **Цель.** Автоматически находить слабые места перевода и переделывать
-их.
+их, сохраняя все варианты для сравнения и отката.
 
-**Что делаем.**
+#### 4.1 Multi-pass storage (фундамент для итераций 4 и 5)
+
+**Принцип.** Каждый проход (translate, reflect, proofread, style, verify)
+хранится в кэше как отдельная запись с `stage`. Ничего не перезаписывается.
+При сборке EPUB выбирается нужный вариант по waterfall или явному указанию.
+
+**Новая таблица в SQLite:**
+
+```sql
+CREATE TABLE IF NOT EXISTS chunk_preferences (
+    chunk_id TEXT PRIMARY KEY,
+    preferred_stage TEXT NOT NULL,
+    reason TEXT,
+    updated_at TEXT DEFAULT (datetime('now'))
+);
+```
+
+**Логика выбора при сборке EPUB (waterfall с override):**
+
+1. Если есть запись в `chunk_preferences` → берём указанный stage.
+2. Иначе — waterfall по умолчанию:
+   `verify > style > proofread > reflect > translate`
+   (берём самый "поздний" доступный stage).
+3. CLI-флаг `--assemble-from STAGE` перекрывает всё:
+   собирает EPUB только из указанного stage для всех chunks.
+
+**CLI-команды:**
+
+```bash
+# Собрать EPUB из конкретного прохода (игнорируя все последующие)
+btrans assemble book.epub --from translate      # "чистый" первый перевод
+btrans assemble book.epub --from reflect        # после рефлексии
+btrans assemble book.epub --from style          # после стилистики
+
+# Для одного chunk выбрать предпочтительный вариант
+btrans prefer ch03_c02 translate --reason "reflect ухудшил диалог"
+btrans prefer ch03_c02 style     --reason "style хорошо убрал кальку"
+
+# Посмотреть все проходы для chunk-а
+btrans diff ch03_c02
+btrans diff ch03_c02 --stages translate,reflect  # сравнить два
+
+# Сбросить предпочтение (вернуться к waterfall)
+btrans prefer ch03_c02 --reset
+```
+
+**Стоимость хранения:** 60 chunks × 5 stages × ~3KB = ~900KB на книгу.
+На 9 книгах серии <10MB. SQLite справляется без проблем.
+
+#### 4.2 Judge
+
 - `prompts/judge.md`: модель (Haiku 4.5) получает original + translation,
   возвращает `{score: 1-5, issues: [...]}`.
-- `prompts/reflect.md`: на низкий score запускается рефлексия по
-  методу Andrew Ng: модель читает свой перевод, составляет замечания,
-  перепереводит с учётом.
-- `judge.py`, `reviewer.py` (частично). Оркестрация в `pipeline.py`.
-- Config: `reflection.trigger_score` (default 3), `reflection.extended_thinking`.
+- Критерии scoring: точность, естественность, консистентность с
+  глоссарием, стиль.
+- Результаты сохраняются в кэше (`stage=judge`), не участвуют в
+  waterfall сборки (это метаданные, не текст).
+- CLI: `btrans judge book.epub [--model M]`.
+- Отчёт: `btrans scores show work/<book>/` — таблица
+  chunk_id | score | issues.
+
+#### 4.3 Reflect
+
+- Триггер: score ≤ `reflection.trigger_score` (default 3) ИЛИ
+  флаг `--reflect-all`.
+- Метод Andrew Ng: рефлексия по переводу → список замечаний →
+  повторный перевод с учётом замечаний.
+- Два промпта: `prompts/reflect.md` (критика) + reuse `translate.md`
+  с добавленным полем `reflection_notes`.
+- Модель: `anthropic/claude-sonnet-4.6` с extended thinking.
+- Результат сохраняется как `stage=reflect` — первый перевод
+  (`stage=translate`) остаётся нетронутым.
+- CLI: `btrans reflect book.epub [--threshold N] [--all]`.
+- Config: `reflection.trigger_score`, `reflection.extended_thinking`.
+
+#### 4.4 UX при запуске
+
+```
+$ btrans translate book.epub --series rivers-of-london -j 8
+
+[translate] ████████████████████ 60/60 done (12m 34s, $4.31)
+
+[judge] ████████████████████ 60/60 done (1m 02s, $0.11)
+  Score distribution: ★5: 34  ★4: 18  ★3: 6  ★2: 2  ★1: 0
+  Chunks needing reflection: 8 (score ≤ 3)
+
+[reflect] ████████████████████ 8/8 done (3m 15s, $0.89)
+  Improved: 7/8  |  No change: 1/8
+
+Summary:
+  Total cost: $5.31  |  Time: 16m 51s
+  Output: books/extracted/broken-homes-ru.epub
+
+  💡 Skip judge+reflect: --no-judge
+  💡 Review scores: btrans scores show work/broken-homes/
+  💡 Revert a reflection: btrans prefer ch03_c02 translate
+  💡 Assemble from first pass only: btrans assemble ... --from translate
+```
+
+#### 4.5 Флаги CLI
+
+- `--no-judge` — пропустить judge + reflect целиком.
+- `--no-reflect` — judge запускается (для статистики), но reflect нет.
+- `--reflect-threshold N` — перекрыть `reflection.trigger_score`.
+- `--reflect-all` — рефлексия для всех chunks независимо от score.
 
 **Эстимейт.** +~$0.30–$1.00 на книгу (рефлексия 20–40% chunks).
+Judge на Haiku 4.5 — ~$0.11 на книгу.
+
+---
 
 ### Итерация 5 — Proofread / Style / Verify
 
 **Цель.** Три отдельных прохода post-translate для финального качества.
+Все проходы хранятся в кэше как отдельные stage, участвуют в waterfall
+сборки, могут быть откачены через `btrans prefer`.
 
 - **Proofread** (`prompts/proofread.md`, Haiku 4.5): грамматика,
-  пунктуация, опечатки.
+  пунктуация, опечатки. Stage: `proofread`.
 - **Style** (`prompts/style.md`, Sonnet 4.6): кальки, канцелярит,
-  авторский голос.
+  авторский голос. Stage: `style`.
 - **Verify** (`prompts/verify.md`, Sonnet 4.6): сверка с оригиналом,
-  пропуски, искажения.
-- Флаги CLI: `--proofread/--no-proofread`, `--style/--no-style`,
-  `--verify/--no-verify`. В конфиге `stages.{proofread,style,verify}`.
+  пропуски, искажения. Stage: `verify`.
+
+**Каждый проход:**
+- Берёт на вход текст из предыдущего stage по waterfall (verify читает
+  результат style, style читает результат proofread, и т.д.).
+- Сохраняет результат в кэше как свой stage.
+- Не трогает предыдущие записи.
+
+**Флаги CLI:** `--proofread/--no-proofread`, `--style/--no-style`,
+`--verify/--no-verify`. В конфиге `stages.{proofread,style,verify}`.
+
+**Сборка:** `btrans assemble book.epub --from proofread` даёт EPUB
+после корректуры но до стилистики. Полезно для A/B сравнения этапов.
 
 ### Итерация 6 — Оптимизация: relevancy-фильтр глоссария
 
