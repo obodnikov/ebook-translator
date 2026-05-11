@@ -354,6 +354,79 @@ Judge на Haiku 4.5 — ~$0.11 на книгу.
 **Сборка:** `btrans assemble book.epub --from proofread` даёт EPUB
 после корректуры но до стилистики. Полезно для A/B сравнения этапов.
 
+### Итерация 4.5 — Maintenance CLI (`btrans status` / `prefer` / `assemble`)
+
+**Статус: ✅ ВЫПОЛНЕНО (11 мая 2026)**
+
+**Цель.** Дать оператору полный контроль и обзор состояния перевода
+пока процесс не устаканится. Read-only инспекция + точечное управление
+сборкой.
+
+**Реализуется ДО judge/reflect** — нужна рабочая инфраструктура для
+инспекции кэша, которую judge/reflect будут использовать.
+
+#### Команды
+
+**`btrans status WORKDIR [--scores] [--diff CHUNK] [--assembly-map] [--below N]`**
+
+Read-only инспекция:
+- Без флагов: обзор (chunks, какие stages пройдены, стоимость, scores
+  distribution если есть judge).
+- `--scores`: таблица chunk_id | score | issues.
+- `--scores --below N`: только chunks с оценкой < N.
+- `--diff CHUNK [--stages S1,S2]`: показать текст chunk-а из разных
+  stages для сравнения.
+- `--assembly-map`: для каждого chunk показать, какой stage будет
+  использован при сборке (waterfall + preferences).
+
+**`btrans prefer CHUNK STAGE [--reason TEXT] [--reset] [--work WORKDIR]`**
+
+Пометить предпочтительный stage для chunk-а. Не удаляет данные из кэша,
+только пишет в `chunk_preferences`. `--reset` убирает override.
+
+**`btrans assemble WORKDIR [--from STAGE] [--out PATH]`**
+
+Собрать EPUB из кэша. По умолчанию waterfall, `--from STAGE` берёт
+конкретный stage для всех chunks.
+
+#### Пример вывода `btrans status`
+
+```
+Broken Homes — Ben Aaronovitch
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Chunks: 60 total, 2187 words avg
+
+Passes in cache:
+  translate   60/60  ✓  ($4.31, 12m 34s)
+  judge       60/60  ✓  ($0.11, 1m 02s)
+  reflect      8/60     ($0.89, 3m 15s)
+  proofread    0/60     —
+  style        0/60     —
+  verify       0/60     —
+
+Judge scores:
+  ★5: 34  ★4: 18  ★3: 6  ★2: 2  ★1: 0
+  Reflected: 8 chunks (score ≤ 3)
+
+Preferences: 1 override (ch12_c01 → translate)
+
+Assembly source (current waterfall):
+  reflect: 7 chunks  |  translate: 53 chunks
+
+Total cost: $5.31
+```
+
+#### Реализация
+
+- Новый модуль: `src/booktranslator/status.py` — логика запросов к кэшу.
+- Расширение `cache.py`: добавить таблицу `chunk_preferences`, методы
+  `list_stages()`, `get_all_for_chunk()`, `get_preference()`,
+  `set_preference()`.
+- CLI: три новые команды в `cli.py` (или отдельный `status_app` typer group).
+
+---
+
 ### Итерация 6 — Оптимизация: relevancy-фильтр глоссария
 
 **Цель.** Уменьшить input tokens в 5-10× за счёт подачи в каждый chunk

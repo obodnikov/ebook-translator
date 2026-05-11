@@ -25,7 +25,7 @@ from rich.progress import (
 )
 from rich.table import Table
 
-from .cache import Cache
+from .cache import Cache, STAGE_WATERFALL
 from .chunker import chunk_book
 from .config import load_config
 from .epub_io import read_book, read_book_structured, write_translated_epub
@@ -546,6 +546,457 @@ def translate(
 def _default_output_path(epub: Path, target_lang: str) -> Path:
     suffix = f"-{target_lang}.epub"
     return epub.with_name(epub.stem + suffix)
+
+
+# ---------------------------------------------------------------------------
+# status
+# ---------------------------------------------------------------------------
+
+
+@app.command("status")
+def status_overview(
+    work_path: Path = typer.Argument(
+        ..., exists=True, file_okay=False,
+        help="Book workdir (e.g. work/broken-homes).",
+    ),
+    scores: bool = typer.Option(
+        False, "--scores", help="Show judge scores table.",
+    ),
+    below: int | None = typer.Option(
+        None, "--below", help="Only show chunks with score below N.",
+    ),
+    diff: str | None = typer.Option(
+        None, "--diff", help="Show all passes for a specific chunk_id.",
+    ),
+    stages_filter: str | None = typer.Option(
+        None, "--stages",
+        help="Comma-separated stages to compare (use with --diff).",
+    ),
+    assembly_map: bool = typer.Option(
+        False, "--assembly-map",
+        help="Show which stage each chunk will use at assembly.",
+    ),
+) -> None:
+    """Inspect the translation state of a book."""
+    from .status import (
+        build_status_report,
+        get_chunk_diff,
+        get_scores,
+    )
+
+    cache_path = work_path / "cache.sqlite"
+    if not cache_path.exists():
+        console.print(f"[red]No cache.sqlite in {work_path}[/red]")
+        raise typer.Exit(code=1)
+
+    cache = Cache(cache_path)
+    try:
+        _run_status(cache, work_path, scores, below, diff, stages_filter, assembly_map)
+    finally:
+        cache.close()
+
+
+def _run_status(
+    cache: Cache,
+    work_path: Path,
+    scores: bool,
+    below: int | None,
+    diff: str | None,
+    stages_filter: str | None,
+    assembly_map: bool,
+) -> None:
+    """Inner logic for status command (cache is managed by caller)."""
+    from .status import (
+        build_status_report,
+        get_chunk_diff,
+        get_scores,
+    )
+
+    # --diff mode: show passes for a specific chunk
+    if diff:
+        filter_list = stages_filter.split(",") if stages_filter else None
+        entries = get_chunk_diff(cache, diff, filter_list)
+        if not entries:
+            console.print(f"[yellow]No cached entries for chunk {diff!r}[/yellow]")
+            return
+
+        console.print(f"\n[bold]Chunk:[/bold] {diff}")
+        console.print(f"[dim]Available stages: {', '.join(e['stage'] for e in entries)}[/dim]\n")
+
+        for entry in entries:
+            console.print(f"[bold cyan]─── {entry['stage']} ───[/bold cyan] "
+                          f"[dim]({entry['model']}, {entry['created_at']})[/dim]")
+            # Show first ~800 chars of content for readability
+            content = entry["content"]
+            if len(content) > 800:
+                content = content[:800] + "\n[dim]... (truncated, use btrans cache export for full)[/dim]"
+            console.print(content)
+            console.print()
+        return
+
+    # --scores mode
+    if scores:
+        score_entries = get_scores(cache)
+        if not score_entries:
+            console.print("[yellow]No judge scores found. Run judge first.[/yellow]")
+            return
+
+        if below is not None:
+            score_entries = [s for s in score_entries if s.score < below]
+
+        if not score_entries:
+            console.print(f"[green]All chunks scored {below} or above.[/green]")
+            return
+
+        table = Table(
+            title=f"Judge scores{f' (below {below})' if below is not None else ''}",
+            show_header=True,
+        )
+        table.add_column("Chunk", style="cyan")
+        table.add_column("Score", justify="center")
+        table.add_column("Issues")
+        table.add_column("Reflected", justify="center")
+
+        for entry in score_entries:
+            score_style = "green" if entry.score >= 4 else "yellow" if entry.score == 3 else "red"
+            table.add_row(
+                entry.chunk_id,
+                f"[{score_style}]{entry.score}[/{score_style}]",
+                "; ".join(entry.issues[:3]) + ("..." if len(entry.issues) > 3 else ""),
+                "✓" if entry.reflected else "",
+            )
+
+        console.print(table)
+        return
+
+    # --assembly-map mode
+    if assembly_map:
+        translate_ids = cache.get_all_chunk_ids_for_stage("translate")
+        legacy_count = cache.count_legacy_rows("translate")
+
+        if translate_ids:
+            table = Table(title="Assembly map", show_header=True)
+            table.add_column("Chunk", style="cyan")
+            table.add_column("Stage", style="bold")
+            table.add_column("Reason", style="dim")
+
+            resolved = cache.resolve_stages_bulk(translate_ids)
+            prefs = {p.chunk_id: p.preferred_stage for p in cache.list_preferences()}
+
+            for chunk_id in sorted(translate_ids):
+                stage = resolved.get(chunk_id, "—")
+                # Only mark as 'preference' if the preference was actually applied
+                pref_stage = prefs.get(chunk_id)
+                if pref_stage and pref_stage == stage:
+                    reason = "preference"
+                elif pref_stage:
+                    reason = "waterfall (preference unavailable)"
+                else:
+                    reason = "waterfall"
+                table.add_row(chunk_id, stage, reason)
+
+            console.print(table)
+
+        if legacy_count > 0:
+            console.print(
+                f"\n[yellow]Legacy data:[/yellow] ~{legacy_count} additional "
+                f"translated row(s) without chunk_id metadata.\n"
+                f"[dim]These will use 'translate' stage by default. "
+                f"Re-run translation to populate chunk_ids.[/dim]"
+            )
+
+        if not translate_ids and legacy_count == 0:
+            console.print("[yellow]No translated chunks in cache.[/yellow]")
+        return
+
+    # Default: full overview
+    report = build_status_report(cache, work_path)
+
+    console.print(f"\n[bold]{work_path.name}[/bold]")
+    console.print("━" * 70)
+    console.print(f"\nChunks: {report.total_chunks} total\n")
+
+    # Passes table
+    table = Table(title="Passes in cache", show_header=True, show_lines=False)
+    table.add_column("Stage", style="cyan")
+    table.add_column("Progress", justify="right")
+    table.add_column("Cost", justify="right")
+
+    for stage_info in report.stages:
+        if stage_info.count > 0:
+            done = "✓" if stage_info.count >= stage_info.total_chunks else ""
+            progress_str = f"{stage_info.count}/{stage_info.total_chunks} {done}"
+            cost_str = f"${stage_info.cost_usd:.2f}"
+        else:
+            progress_str = f"0/{stage_info.total_chunks}"
+            cost_str = "—"
+        table.add_row(stage_info.stage, progress_str, cost_str)
+
+    console.print(table)
+
+    # Judge scores distribution
+    if report.scores:
+        dist: dict[int, int] = {}
+        for s in report.scores:
+            dist[s.score] = dist.get(s.score, 0) + 1
+        reflected_count = sum(1 for s in report.scores if s.reflected)
+
+        dist_str = "  ".join(f"★{k}: {v}" for k, v in sorted(dist.items(), reverse=True))
+        console.print(f"\n[bold]Judge scores:[/bold] {dist_str}")
+        if reflected_count:
+            console.print(f"  Reflected: {reflected_count} chunks")
+
+    # Preferences
+    if report.preferences:
+        pref_strs = [f"{p['chunk_id']} → {p['stage']}" for p in report.preferences[:5]]
+        console.print(
+            f"\n[bold]Preferences:[/bold] {len(report.preferences)} override(s) "
+            f"({', '.join(pref_strs)}{'...' if len(report.preferences) > 5 else ''})"
+        )
+
+    # Assembly map summary
+    if report.assembly_map:
+        map_str = "  |  ".join(
+            f"{stage}: {count}" for stage, count in
+            sorted(report.assembly_map.items(), key=lambda x: STAGE_WATERFALL.index(x[0]) if x[0] in STAGE_WATERFALL else 99)
+        )
+        console.print(f"\n[bold]Assembly source:[/bold] {map_str}")
+
+    console.print(f"\n[bold]Total cost:[/bold] ${report.total_cost_usd:.2f}\n")
+
+
+# ---------------------------------------------------------------------------
+# prefer
+# ---------------------------------------------------------------------------
+
+
+@app.command("prefer")
+def prefer_cmd(
+    chunk_id: str = typer.Argument(..., help="Chunk ID (e.g. ch03_c02)."),
+    stage: str | None = typer.Argument(
+        None,
+        help="Stage to prefer (translate, reflect, proofread, style, verify).",
+    ),
+    reason: str | None = typer.Option(
+        None, "--reason", "-r", help="Why this preference.",
+    ),
+    reset: bool = typer.Option(
+        False, "--reset", help="Remove preference, revert to waterfall.",
+    ),
+    work_path: Path = typer.Option(
+        DEFAULT_WORK_DIR, "--work", "-w",
+        help="Base work directory.",
+    ),
+    book: str | None = typer.Option(
+        None, "--book", "-b",
+        help="Book slug (subfolder of work dir). Auto-detected if only one exists.",
+    ),
+) -> None:
+    """Set or reset the preferred stage for a chunk at assembly time.
+
+    Does NOT delete any data from the cache — only marks which version to use.
+    """
+    cache_path = _resolve_cache_path(work_path, book)
+    if not cache_path:
+        raise typer.Exit(code=1)
+
+    cache = Cache(cache_path)
+
+    if reset:
+        cache.reset_preference(chunk_id)
+        console.print(f"[green]Reset preference for {chunk_id} (back to waterfall).[/green]")
+        cache.close()
+        return
+
+    if not stage:
+        console.print("[red]Provide a stage name, or use --reset.[/red]")
+        cache.close()
+        raise typer.Exit(code=1)
+
+    if stage not in STAGE_WATERFALL:
+        console.print(
+            f"[red]Invalid stage {stage!r}. "
+            f"Valid: {', '.join(STAGE_WATERFALL)}[/red]"
+        )
+        cache.close()
+        raise typer.Exit(code=1)
+
+    # Verify the stage exists for this chunk
+    chunk_stages = cache.get_chunk_stages(chunk_id)
+    available = {s.stage for s in chunk_stages}
+    if stage not in available:
+        console.print(
+            f"[red]Stage {stage!r} not found for chunk {chunk_id}.[/red]\n"
+            f"[dim]Available: {', '.join(sorted(available)) or 'none'}[/dim]"
+        )
+        cache.close()
+        raise typer.Exit(code=1)
+
+    cache.set_preference(chunk_id, stage, reason)
+    console.print(
+        f"[green]Set preference:[/green] {chunk_id} → [bold]{stage}[/bold]"
+        + (f" [dim]({reason})[/dim]" if reason else "")
+    )
+    cache.close()
+
+
+# ---------------------------------------------------------------------------
+# assemble
+# ---------------------------------------------------------------------------
+
+
+@app.command("assemble")
+def assemble_cmd(
+    work_path: Path = typer.Argument(
+        ..., exists=True, file_okay=False,
+        help="Book workdir (e.g. work/broken-homes).",
+    ),
+    from_stage: str | None = typer.Option(
+        None, "--from",
+        help="Use only this stage for all chunks (ignores waterfall).",
+    ),
+    out: Path | None = typer.Option(
+        None, "--out", "-o", help="Output EPUB path.",
+    ),
+    epub: Path | None = typer.Option(
+        None, "--epub", "-e", exists=True, dir_okay=False,
+        help="Source EPUB (for structure). Auto-detected from state if possible.",
+    ),
+) -> None:
+    """Assemble an EPUB from cached translations using waterfall or --from.
+
+    With --from STAGE: strict mode. All chunks must have the specified stage
+    in cache, otherwise the command errors out. Use this for clean A/B
+    comparison between passes.
+
+    Without --from: waterfall mode. Each chunk uses the latest available
+    stage (verify > style > proofread > reflect > translate), respecting
+    any per-chunk preferences set via 'btrans prefer'.
+    """
+    cache_path = work_path / "cache.sqlite"
+    if not cache_path.exists():
+        console.print(f"[red]No cache.sqlite in {work_path}[/red]")
+        raise typer.Exit(code=1)
+
+    if from_stage and from_stage not in STAGE_WATERFALL:
+        console.print(
+            f"[red]Invalid stage {from_stage!r}. "
+            f"Valid: {', '.join(STAGE_WATERFALL)}[/red]"
+        )
+        raise typer.Exit(code=1)
+
+    cache = Cache(cache_path)
+    try:
+        # Total unique chunks
+        total_chunks = cache.count_chunks_total("translate")
+        if total_chunks == 0:
+            console.print("[red]No translated chunks in cache.[/red]")
+            raise typer.Exit(code=1)
+
+        translate_ids = cache.get_all_chunk_ids_for_stage("translate")
+        legacy_count = cache.count_legacy_rows("translate")
+
+        if from_stage:
+            # Strict mode: all tracked chunks must have the requested stage
+            stage_ids = set(cache.get_all_chunk_ids_for_stage(from_stage))
+            tracked_missing = set(translate_ids) - stage_ids
+
+            console.print(
+                f"[bold]Assembling from stage:[/bold] {from_stage} (strict)\n"
+                f"[bold]Tracked chunks:[/bold] {len(stage_ids)}/{len(translate_ids)}"
+            )
+
+            if tracked_missing:
+                console.print(
+                    f"\n[red]Error:[/red] {len(tracked_missing)} chunk(s) do not "
+                    f"have stage {from_stage!r} in cache:\n"
+                    f"[dim]  {', '.join(sorted(tracked_missing)[:10])}"
+                    f"{'...' if len(tracked_missing) > 10 else ''}[/dim]\n"
+                    f"\n[dim]Run the {from_stage} pass first, or use waterfall "
+                    f"mode (omit --from) for mixed assembly.[/dim]"
+                )
+                raise typer.Exit(code=1)
+
+            if legacy_count > 0:
+                console.print(
+                    f"[yellow]Warning:[/yellow] {legacy_count} legacy chunk(s) "
+                    f"without chunk_id cannot be verified for stage {from_stage!r}.\n"
+                    f"[dim]Re-run translation to populate chunk_ids.[/dim]"
+                )
+        else:
+            # Waterfall mode: show assembly map
+            if translate_ids:
+                resolved = cache.resolve_stages_bulk(translate_ids)
+                stage_counts: dict[str, int] = {}
+                for stage in resolved.values():
+                    stage_counts[stage] = stage_counts.get(stage, 0) + 1
+                if legacy_count > 0:
+                    stage_counts["translate"] = stage_counts.get("translate", 0) + legacy_count
+                map_str = "  |  ".join(f"{s}: {c}" for s, c in sorted(stage_counts.items()))
+                console.print(f"[bold]Assembly map:[/bold] {map_str}")
+            else:
+                console.print(
+                    f"[bold]Chunks:[/bold] {total_chunks} "
+                    f"[dim](legacy data — will use translate stage)[/dim]"
+                )
+
+        # For now, print what would happen. Full EPUB assembly requires
+        # the source EPUB and the structured book — that integration comes
+        # when we wire this into the existing write_translated_epub flow.
+        if not epub:
+            console.print(
+                "\n[yellow]Note:[/yellow] Full EPUB assembly requires --epub "
+                "(source EPUB for structure).\n"
+                "[dim]This command currently shows the assembly plan. "
+                "Full assembly will be wired in iteration 4.[/dim]"
+            )
+            return
+
+        console.print(
+            f"\n[dim]Source EPUB: {epub}[/dim]\n"
+            f"[dim]Output: {out or '(default)'}[/dim]\n"
+            "[yellow]Full assembly integration pending (iteration 4).[/yellow]"
+        )
+    finally:
+        cache.close()
+
+
+# ---------------------------------------------------------------------------
+# helpers
+# ---------------------------------------------------------------------------
+
+
+def _resolve_cache_path(work_base: Path, book_slug: str | None) -> Path | None:
+    """Find the cache.sqlite for a book, auto-detecting if only one exists."""
+    if not work_base.exists() or not work_base.is_dir():
+        console.print(f"[red]Work directory not found: {work_base}[/red]")
+        return None
+
+    if book_slug:
+        path = work_base / book_slug / "cache.sqlite"
+        if not path.exists():
+            console.print(f"[red]No cache at {path}[/red]")
+            return None
+        return path
+
+    # Auto-detect: look for subdirs with cache.sqlite
+    candidates = [
+        d / "cache.sqlite"
+        for d in work_base.iterdir()
+        if d.is_dir() and (d / "cache.sqlite").exists()
+    ]
+    if len(candidates) == 1:
+        return candidates[0]
+    elif len(candidates) == 0:
+        console.print(f"[red]No cache.sqlite found in {work_base}/*/[/red]")
+        return None
+    else:
+        names = [c.parent.name for c in candidates]
+        console.print(
+            f"[red]Multiple books found: {', '.join(names)}[/red]\n"
+            f"[dim]Use --book SLUG to specify which one.[/dim]"
+        )
+        return None
 
 
 if __name__ == "__main__":

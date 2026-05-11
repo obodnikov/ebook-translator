@@ -247,6 +247,7 @@ class Translator:
                     content=raw_text,
                     input_tokens=result.input_tokens,
                     output_tokens=result.output_tokens,
+                    meta={"chunk_id": chunk.id},
                 )
                 stats.chunks_translated += 1
                 stats.input_tokens += result.input_tokens
