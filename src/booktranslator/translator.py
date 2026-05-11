@@ -104,6 +104,7 @@ class Translator:
         self,
         chunk_set: ChunkSet,
         chunk: Chunk,
+        reflection_notes: str = "",
     ) -> dict:
         main_fragments = chunk_set.render_main(chunk)
         prev_list = chunk_set.render_overlap(chunk, "prev")
@@ -117,6 +118,7 @@ class Translator:
             "main_fragments": main_fragments,
             "prev_overlap": "\n".join(prev_list),
             "next_overlap": "\n".join(next_list),
+            "reflection_notes": reflection_notes,
         }
 
     # -- response parsing --------------------------------------------------

@@ -38,6 +38,14 @@ CREATE TABLE IF NOT EXISTS chunk_preferences (
 );
 """
 
+SCHEMA_PIPELINE_META = """
+CREATE TABLE IF NOT EXISTS pipeline_meta (
+    key TEXT PRIMARY KEY,
+    value_json TEXT NOT NULL,
+    updated_at TEXT DEFAULT (datetime('now'))
+);
+"""
+
 # Waterfall order: later stages take priority over earlier ones.
 STAGE_WATERFALL = ["translate", "reflect", "proofread", "style", "verify"]
 
@@ -87,6 +95,7 @@ class Cache:
         # Create tables if they don't exist
         self.conn.executescript(SCHEMA)
         self.conn.executescript(SCHEMA_PREFERENCES)
+        self.conn.executescript(SCHEMA_PIPELINE_META)
 
         # Migration: add chunk_id column if missing (legacy DBs)
         cols = {
@@ -422,6 +431,29 @@ class Cache:
                     break
 
         return result
+
+    # ------------------------------------------------------------------
+    # Pipeline metadata (chunker params, etc.)
+    # ------------------------------------------------------------------
+
+    def set_meta(self, key: str, value: Any) -> None:
+        """Store a pipeline metadata value (JSON-serializable)."""
+        self.conn.execute(
+            "INSERT OR REPLACE INTO pipeline_meta "
+            "(key, value_json, updated_at) VALUES (?, ?, datetime('now'))",
+            (key, json.dumps(value)),
+        )
+        self.conn.commit()
+
+    def get_meta(self, key: str) -> Any | None:
+        """Retrieve a pipeline metadata value. Returns None if not set."""
+        row = self.conn.execute(
+            "SELECT value_json FROM pipeline_meta WHERE key = ?",
+            (key,),
+        ).fetchone()
+        if row is None:
+            return None
+        return json.loads(row[0])
 
     def close(self) -> None:
         self.conn.close()

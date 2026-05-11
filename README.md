@@ -4,9 +4,9 @@
 > OpenRouter. Сохраняет вёрстку, ведёт глоссарий уровня книги и серии
 > для консистентности имён, кэширует переводы на уровне chunk-а.
 
-Статус: v0.1. Работает end-to-end по упрощённой схеме
-(`glossary → promote → translate`). Без автоматической вычитки, без
-pause-точек — оператор ведёт процесс руками. См. [`IMPLEMENTATION_PLAN.md`](IMPLEMENTATION_PLAN.md).
+Статус: v0.2. Работает end-to-end с автоматической оценкой качества
+(`glossary → promote → translate → judge → reflect`). Оператор ведёт
+процесс руками. См. [`IMPLEMENTATION_PLAN.md`](IMPLEMENTATION_PLAN.md).
 
 ---
 
@@ -18,6 +18,7 @@ pause-точек — оператор ведёт процесс руками. С
 4. [Полезные проверки по ходу](#полезные-проверки-по-ходу)
 5. [Troubleshooting](#troubleshooting)
 6. [Что сейчас не умеем](#что-сейчас-не-умеем)
+7. [Структура репозитория](#структура-репозитория)
 
 ---
 
@@ -229,11 +230,18 @@ btrans translate path/to/book.epub -j 8
 - Параллелит по `-j` потоков.
 - Переведённые XHTML-фрагменты вставляются обратно в дерево главы,
   namespace сохраняется.
+- **Judge** (если не `--no-judge`): Haiku 4.5 оценивает каждый chunk
+  по шкале 1–5 (точность, естественность, глоссарий, стиль, разметка).
+- **Reflect** (если не `--no-reflect`): chunks с оценкой ≤ 3
+  проходят рефлексию по методу Andrew Ng — критика → повторный
+  перевод с учётом замечаний. Оригинальный перевод сохраняется,
+  улучшенный записывается как отдельный stage.
 - Собирается новый EPUB: `books/extracted/<slug>-ru.epub` рядом с
   оригиналом (путь можно переопределить через `--out`).
 
-Время на ~100K слов / 60 chunks: 10–20 минут при `-j 8`.
-Стоимость: ~$4–6.
+Время на ~100K слов / 60 chunks: 15–25 минут при `-j 8`
+(translate ~12 мин + judge ~1 мин + reflect ~3 мин).
+Стоимость: ~$5–7 (translate ~$4–5, judge ~$0.11, reflect ~$0.5–1).
 
 Повторный запуск той же команды — мгновенно из SQLite-кэша
 (`work/<book-slug>/cache.sqlite`), LLM не зовётся.
@@ -249,6 +257,18 @@ btrans translate ... --out books/extracted/custom-ru.epub
 
 # Переопределить модель (например, на Haiku для экономии)
 btrans translate ... --model anthropic/claude-haiku-4.5
+
+# Только перевод, без оценки и рефлексии
+btrans translate ... --no-judge
+
+# Judge для статистики, но без рефлексии
+btrans translate ... --no-reflect
+
+# Рефлексия для всех chunks (не только плохих)
+btrans translate ... --reflect-all
+
+# Порог рефлексии: переделывать chunks с оценкой ≤ 2 (вместо ≤ 3)
+btrans translate ... --reflect-threshold 2
 ```
 
 ### Шаг 6: открыть готовый EPUB
@@ -260,6 +280,63 @@ Apple Books, Kindle (конвертация через Calibre) — любой �
 ---
 
 ## Полезные проверки по ходу
+
+### Статус перевода книги
+
+```bash
+# Обзор: chunks, stages, стоимость, scores
+btrans status work/broken-homes/
+
+# Таблица оценок judge
+btrans status work/broken-homes/ --scores
+
+# Только плохие chunks (score < 3)
+btrans status work/broken-homes/ --scores --below 3
+
+# Какой stage будет использован при сборке каждого chunk
+btrans status work/broken-homes/ --assembly-map
+
+# Сравнить translate vs reflect для конкретного chunk
+btrans status work/broken-homes/ --diff ch03_c02 --stages translate,reflect
+```
+
+### Judge и Reflect отдельно от translate
+
+Если перевод уже в кэше и хочется прогнать оценку/рефлексию
+отдельно (например, после правки промпта):
+
+```bash
+# Оценить все переведённые chunks
+btrans judge books/extracted/broken-homes-ben-aaronovitch.epub \
+  --series rivers-of-london -j 4
+
+# Рефлексия для chunks с оценкой ≤ 3
+btrans reflect books/extracted/broken-homes-ben-aaronovitch.epub \
+  --series rivers-of-london
+
+# Рефлексия для всех chunks (независимо от оценки)
+btrans reflect ... --all
+
+# Рефлексия с другим порогом
+btrans reflect ... --threshold 2
+```
+
+### Управление сборкой (prefer / assemble)
+
+```bash
+# Откатить рефлексию для конкретного chunk (вернуть первый перевод)
+btrans prefer ch03_c02 translate --reason "reflect ухудшил диалог"
+
+# Выбрать reflect-вариант для chunk (если waterfall не тот)
+btrans prefer ch12_c01 reflect --reason "reflect лучше"
+
+# Сбросить предпочтение (вернуться к waterfall)
+btrans prefer ch03_c02 --reset
+
+# Собрать EPUB из конкретного stage (игнорируя waterfall)
+btrans assemble work/broken-homes/ --from translate --epub book.epub --out first-pass.epub
+btrans assemble work/broken-homes/ --from reflect --epub book.epub --out reflected.epub
+```
 
 ### Посмотреть series glossary
 
@@ -315,10 +392,11 @@ EOF
 
 ### Chunk failed: "Expected N paragraphs, got M"
 
-Модель склеила или разбила параграфы. Retry не встроен (план
-итерации 4). Сейчас — пересобрать EPUB после другого прогона
-(`--force` на глоссарий или ручная правка `prompts/translate.md` +
-bump `version:`, чтобы пробить кэш только по translate-stage).
+Модель склеила или разбила параграфы. Сейчас chunk помечается как
+failed, перевод не записывается. При повторном запуске — retry
+автоматический (кэш не содержит failed chunks). Если chunk
+стабильно падает — попробовать `--model anthropic/claude-haiku-4.5`
+для этого конкретного прогона или поправить промпт.
 
 ### Повторный запуск долгий, а должен быть из кэша
 
@@ -346,9 +424,7 @@ sqlite3 work/broken-homes/cache.sqlite \
 ## Что сейчас не умеем
 
 - **Автоматическая вычитка** (proofread / style / verify) — итерация
-  5 по плану.
-- **Judge + Reflect** — автоматический поиск слабых chunks и
-  переделка — итерация 4.
+  5 по плану. Judge + Reflect уже работают (итерация 4 ✅).
 - **Pause-точки + Telegram** — отложено
   ([см. `IMPLEMENTATION_PLAN.md`, §4bis](IMPLEMENTATION_PLAN.md)).
   Pipeline из 3 команд оператор ведёт руками, ~1 час wall-clock.
@@ -375,7 +451,9 @@ ebook-translator/
 ├── configs/default.yaml
 ├── prompts/
 │   ├── glossary_extract.md
-│   └── translate.md
+│   ├── translate.md
+│   ├── judge.md
+│   └── reflect.md
 ├── src/booktranslator/      # код пакета
 ├── tools/split_epub.py      # standalone-скрипт для антологий
 ├── books/                   # gitignored: EPUB-файлы

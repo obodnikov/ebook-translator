@@ -31,7 +31,16 @@ from .config import load_config
 from .epub_io import read_book, read_book_structured, write_translated_epub
 from .glossary import extract_glossary, save_glossary
 from .models import Glossary, SeriesGlossary, SeriesGlossaryEntry, Stage
-from .provider import OpenRouterProvider
+from .pipeline_helpers import (
+    ChunkerConfigMismatchError,
+    build_reflect_input,
+    collect_chunk_originals,
+    collect_stage_translations,
+    create_provider,
+    normalize_judge_map,
+    save_chunker_params,
+    verify_chunker_params,
+)
 from .series import (
     SeriesWorkDir,
     init_series,
@@ -130,7 +139,7 @@ def glossary_extract(
         cache.conn.execute("DELETE FROM cache WHERE stage = 'glossary'")
         cache.conn.commit()
 
-    provider = OpenRouterProvider()
+    provider = create_provider()
     chosen_model = model or cfg.models.glossary
     console.print(f"[bold]Model:[/bold]   {chosen_model}")
     console.print("[dim]Sending full book to the LLM...[/dim]")
@@ -384,9 +393,31 @@ def translate(
         help="Number of chunks to translate concurrently "
              "(overrides config.translate.parallelism).",
     ),
+    no_judge: bool = typer.Option(
+        False, "--no-judge",
+        help="Skip judge + reflect passes entirely.",
+    ),
+    no_reflect: bool = typer.Option(
+        False, "--no-reflect",
+        help="Run judge (for stats) but skip reflect.",
+    ),
+    reflect_threshold: int | None = typer.Option(
+        None, "--reflect-threshold",
+        help="Override reflection.trigger_score (reflect chunks scoring ≤ N).",
+    ),
+    reflect_all: bool = typer.Option(
+        False, "--reflect-all",
+        help="Reflect all chunks regardless of score.",
+    ),
 ) -> None:
     """Translate an EPUB into the target language."""
     cfg = load_config(config_path if config_path.exists() else None)
+
+    if reflect_threshold is not None and not 1 <= reflect_threshold <= 5:
+        console.print(
+            "[red]--reflect-threshold must be between 1 and 5.[/red]"
+        )
+        raise typer.Exit(code=1)
 
     console.print(f"[bold]Reading EPUB:[/bold] {epub}")
     book = read_book_structured(epub)
@@ -477,7 +508,17 @@ def translate(
         )
 
     cache = Cache(wd.cache_path)
-    provider = OpenRouterProvider()
+    # Persist chunker params so judge/reflect can verify consistency.
+    # Fails fast if existing params differ (prevents mixed-cache state).
+    try:
+        save_chunker_params(
+            cache, cfg.chunker.target_words, cfg.chunker.overlap_paragraphs
+        )
+    except ChunkerConfigMismatchError as e:
+        console.print(f"[red]Error:[/red] {e}")
+        cache.close()
+        raise typer.Exit(code=1) from e
+    provider = create_provider()
     chosen_model = model or cfg.models.translate
     console.print(f"[bold]Model:[/bold]    {chosen_model}")
     console.print("[dim]Translating chunks...[/dim]\n")
@@ -525,6 +566,206 @@ def translate(
             "Re-run the same command to retry failed chunks (cache keeps successes)."
         )
 
+    # ------------------------------------------------------------------
+    # Judge pass
+    # ------------------------------------------------------------------
+    judge_stats = None
+    if not no_judge:
+        from .judge import Judge
+
+        JUDGE_PROMPT = Path("prompts/judge.md")
+
+        # Collect original and translated texts
+        translate_ids = cache.get_all_chunk_ids_for_stage("translate")
+        if translate_ids:
+            chunk_originals = collect_chunk_originals(
+                chunk_set, translate_ids
+            )
+            chunk_translations = collect_stage_translations(
+                cache, translate_ids, stage="translate"
+            )
+
+            # Only judge chunks that have both original and translation
+            judgeable_ids = (
+                set(chunk_originals.keys()) & set(chunk_translations.keys())
+            )
+            if judgeable_ids:
+                judge_model = cfg.models.judge
+                console.print(
+                    f"\n[dim]Judging {len(judgeable_ids)} chunks "
+                    f"with {judge_model}...[/dim]\n"
+                )
+
+                judge = Judge(
+                    provider=provider,
+                    prompt_path=JUDGE_PROMPT,
+                    cache=cache,
+                    glossary=glossary,
+                    model=judge_model,
+                    source_lang=cfg.source_lang,
+                    target_lang=cfg.target_lang,
+                )
+
+                judge_parallelism = (
+                    min(parallelism or cfg.translate.parallelism, 8) or 4
+                )
+
+                with Progress(
+                    TextColumn("[progress.description]{task.description}"),
+                    BarColumn(),
+                    MofNCompleteColumn(),
+                    TimeElapsedColumn(),
+                    console=console,
+                ) as progress:
+                    jtask = progress.add_task(
+                        "judging", total=len(judgeable_ids)
+                    )
+
+                    def on_judge_progress(done, total, cid, jstats):
+                        progress.update(
+                            jtask,
+                            completed=done,
+                            description=(
+                                f"judge | cached {jstats.chunks_cached} "
+                                f"new {jstats.chunks_judged} "
+                                f"failed {jstats.chunks_failed}"
+                            ),
+                        )
+
+                    judge_stats = judge.judge_chunks(
+                        {k: v for k, v in chunk_originals.items()
+                         if k in judgeable_ids},
+                        {k: v for k, v in chunk_translations.items()
+                         if k in judgeable_ids},
+                        on_progress=on_judge_progress,
+                        parallelism=judge_parallelism,
+                    )
+
+                # Print score distribution
+                if judge_stats.results:
+                    dist: dict[int, int] = {}
+                    for r in judge_stats.results:
+                        dist[r.score] = dist.get(r.score, 0) + 1
+                    dist_str = "  ".join(
+                        f"★{k}: {v}"
+                        for k, v in sorted(dist.items(), reverse=True)
+                    )
+                    console.print(
+                        f"[bold]Judge scores:[/bold] {dist_str}"
+                    )
+
+                    threshold = (
+                        reflect_threshold
+                        if reflect_threshold is not None
+                        else cfg.reflection.trigger_score
+                    )
+                    needs_reflect = [
+                        r for r in judge_stats.results
+                        if r.score <= threshold
+                    ]
+                    console.print(
+                        f"  Chunks needing reflection: "
+                        f"{len(needs_reflect)} (score ≤ {threshold})"
+                    )
+
+    # ------------------------------------------------------------------
+    # Reflect pass
+    # ------------------------------------------------------------------
+    reflect_stats = None
+    if not no_judge and not no_reflect and judge_stats and judge_stats.results:
+        from .reflect import Reflector
+
+        REFLECT_PROMPT = Path("prompts/reflect.md")
+
+        threshold = (
+            reflect_threshold
+            if reflect_threshold is not None
+            else cfg.reflection.trigger_score
+        )
+
+        if reflect_all:
+            chunks_to_reflect_results = judge_stats.results
+        else:
+            chunks_to_reflect_results = [
+                r for r in judge_stats.results if r.score <= threshold
+            ]
+
+        if chunks_to_reflect_results:
+            reflect_model = cfg.models.reflect
+            console.print(
+                f"\n[dim]Reflecting on "
+                f"{len(chunks_to_reflect_results)} chunks "
+                f"with {reflect_model}...[/dim]\n"
+            )
+
+            reflector = Reflector(
+                provider=provider,
+                reflect_prompt_path=REFLECT_PROMPT,
+                translate_prompt_path=TRANSLATE_PROMPT,
+                cache=cache,
+                glossary=glossary,
+                model=reflect_model,
+                source_lang=cfg.source_lang,
+                target_lang=cfg.target_lang,
+            )
+
+            # Build reflect input using shared helper (O(n), not O(n²))
+            judge_by_id = normalize_judge_map([
+                {"chunk_id": r.chunk_id, "score": r.score, "issues": r.issues}
+                for r in chunks_to_reflect_results
+            ])
+            chunks_to_reflect_data = build_reflect_input(
+                chunk_set, cache,
+                {r.chunk_id for r in chunks_to_reflect_results},
+                judge_by_id,
+            )
+
+            if chunks_to_reflect_data:
+                reflect_parallelism = (
+                    min(parallelism or cfg.translate.parallelism, 4) or 2
+                )
+
+                with Progress(
+                    TextColumn(
+                        "[progress.description]{task.description}"
+                    ),
+                    BarColumn(),
+                    MofNCompleteColumn(),
+                    TimeElapsedColumn(),
+                    console=console,
+                ) as progress:
+                    rtask = progress.add_task(
+                        "reflecting",
+                        total=len(chunks_to_reflect_data),
+                    )
+
+                    def on_reflect_progress(done, total, cid, rstats):
+                        progress.update(
+                            rtask,
+                            completed=done,
+                            description=(
+                                f"reflect | "
+                                f"improved {rstats.chunks_improved} "
+                                f"unchanged {rstats.chunks_unchanged} "
+                                f"failed {rstats.chunks_failed}"
+                            ),
+                        )
+
+                    reflect_stats = reflector.reflect_chunks(
+                        chunks_to_reflect_data,
+                        on_progress=on_reflect_progress,
+                        parallelism=reflect_parallelism,
+                    )
+
+                console.print(
+                    f"  Improved: "
+                    f"{reflect_stats.chunks_improved}/"
+                    f"{reflect_stats.chunks_total}  |  "
+                    f"No change: "
+                    f"{reflect_stats.chunks_unchanged}/"
+                    f"{reflect_stats.chunks_total}"
+                )
+
     out_path = out or _default_output_path(epub, cfg.target_lang)
     modified = [ch for ch in book.chapters if ch.paragraphs]
     write_translated_epub(
@@ -534,18 +775,450 @@ def translate(
         new_language=cfg.target_lang,
     )
     wd.mark_stage(state, Stage.DONE)
+    cache.close()
+
+    # Summary
+    summary_parts = [
+        f"Chunks: {stats.chunks_translated} new, {stats.chunks_cached} cached, "
+        f"{stats.chunks_failed} failed."
+    ]
+
+    if judge_stats:
+        summary_parts.append(
+            f"Judge: {judge_stats.chunks_judged} new, "
+            f"{judge_stats.chunks_cached} cached."
+        )
+    if reflect_stats:
+        summary_parts.append(
+            f"Reflect: {reflect_stats.chunks_improved} improved, "
+            f"{reflect_stats.chunks_unchanged} unchanged."
+        )
 
     console.print(
         f"\n[green]Translated EPUB:[/green] {out_path}\n"
-        f"[dim]Chunks: {stats.chunks_translated} new, {stats.chunks_cached} cached, "
-        f"{stats.chunks_failed} failed. "
-        f"Tokens: {stats.input_tokens:,} in, {stats.output_tokens:,} out.[/dim]"
+        f"[dim]{' '.join(summary_parts)}\n"
+        f"Tokens: {stats.input_tokens:,} in, "
+        f"{stats.output_tokens:,} out.[/dim]"
     )
+
+    # Helpful tips
+    if not no_judge and judge_stats and judge_stats.results:
+        wd_str = str(wd.root)
+        console.print(
+            "\n[dim]💡 Skip judge+reflect: --no-judge\n"
+            f"💡 Review scores: btrans status {wd_str} --scores\n"
+            "💡 Revert a reflection: btrans prefer CHUNK translate\n"
+            f"💡 Assemble from first pass: btrans assemble {wd_str}"
+            " --from translate[/dim]"
+        )
 
 
 def _default_output_path(epub: Path, target_lang: str) -> Path:
     suffix = f"-{target_lang}.epub"
     return epub.with_name(epub.stem + suffix)
+
+
+# ---------------------------------------------------------------------------
+# judge (standalone)
+# ---------------------------------------------------------------------------
+
+
+@app.command("judge")
+def judge_cmd(
+    epub: Path = typer.Argument(..., exists=True, dir_okay=False, help="Source EPUB."),
+    series: str | None = typer.Option(
+        None, "--series", "-s",
+        help="Series slug for glossary context.",
+    ),
+    glossary_path: Path | None = typer.Option(
+        None, "--glossary", "-g",
+        exists=True, dir_okay=False,
+        help="Path to a single-book glossary.json.",
+    ),
+    config_path: Path = typer.Option(
+        DEFAULT_CONFIG, "--config", "-c", help="YAML config file.",
+    ),
+    work_dir: Path = typer.Option(
+        DEFAULT_WORK_DIR, "--work", "-w", help="Base directory for artifacts.",
+    ),
+    model: str | None = typer.Option(
+        None, "--model", "-m",
+        help="Override the judge model.",
+    ),
+    parallelism: int | None = typer.Option(
+        None, "--parallelism", "-j",
+        help="Number of chunks to judge concurrently.",
+    ),
+) -> None:
+    """Run the judge pass on already-translated chunks.
+
+    Scores each chunk 1-5 and stores results in the cache.
+    Use 'btrans status WORKDIR --scores' to view results.
+    """
+    from .judge import Judge
+
+    cfg = load_config(config_path if config_path.exists() else None)
+
+    console.print(f"[bold]Reading EPUB:[/bold] {epub}")
+    book = read_book_structured(epub)
+    console.print(f"[bold]Book:[/bold] {book.meta.title}")
+
+    glossary = _resolve_glossary(series, glossary_path, work_dir, cfg, book)
+
+    wd = WorkDir.for_book(work_dir, book.meta.title)
+    cache = Cache(wd.cache_path)
+
+    # Get translated chunk IDs
+    translate_ids = cache.get_all_chunk_ids_for_stage("translate")
+    if not translate_ids:
+        console.print(
+            "[red]No translated chunks found. Run translate first.[/red]"
+        )
+        cache.close()
+        raise typer.Exit(code=1)
+
+    # Verify chunker config matches what was used during translate
+    try:
+        verify_chunker_params(
+            cache, cfg.chunker.target_words, cfg.chunker.overlap_paragraphs
+        )
+    except ChunkerConfigMismatchError as e:
+        console.print(f"[red]Error:[/red] {e}")
+        cache.close()
+        raise typer.Exit(code=1) from e
+
+    # Build chunk set for originals
+    chunk_set = chunk_book(
+        book,
+        target_words=cfg.chunker.target_words,
+        overlap_paragraphs=cfg.chunker.overlap_paragraphs,
+    )
+
+    # Collect originals and translations using shared helpers
+    chunk_originals = collect_chunk_originals(chunk_set, translate_ids)
+    chunk_translations = collect_stage_translations(
+        cache, translate_ids, stage="translate"
+    )
+
+    judgeable_ids = sorted(
+        set(chunk_originals.keys()) & set(chunk_translations.keys())
+    )
+    console.print(f"[bold]Chunks to judge:[/bold] {len(judgeable_ids)}")
+
+    judge_model = model or cfg.models.judge
+    console.print(f"[bold]Model:[/bold] {judge_model}")
+
+    JUDGE_PROMPT = Path("prompts/judge.md")
+    judge = Judge(
+        provider=create_provider(),
+        prompt_path=JUDGE_PROMPT,
+        cache=cache,
+        glossary=glossary,
+        model=judge_model,
+        source_lang=cfg.source_lang,
+        target_lang=cfg.target_lang,
+    )
+
+    if parallelism is not None and parallelism < 1:
+        console.print("[red]--parallelism must be ≥ 1.[/red]")
+        cache.close()
+        raise typer.Exit(code=1)
+
+    judge_parallelism = parallelism or 4
+
+    with Progress(
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        MofNCompleteColumn(),
+        TimeElapsedColumn(),
+        console=console,
+    ) as progress:
+        jtask = progress.add_task("judging", total=len(judgeable_ids))
+
+        def on_progress(done, total, cid, jstats):
+            progress.update(
+                jtask,
+                completed=done,
+                description=(
+                    f"judge | cached {jstats.chunks_cached} "
+                    f"new {jstats.chunks_judged} "
+                    f"failed {jstats.chunks_failed}"
+                ),
+            )
+
+        judge_stats = judge.judge_chunks(
+            {k: v for k, v in chunk_originals.items() if k in judgeable_ids},
+            {k: v for k, v in chunk_translations.items() if k in judgeable_ids},
+            on_progress=on_progress,
+            parallelism=judge_parallelism,
+        )
+
+    cache.close()
+
+    # Print results
+    if judge_stats.results:
+        dist: dict[int, int] = {}
+        for r in judge_stats.results:
+            dist[r.score] = dist.get(r.score, 0) + 1
+        dist_str = "  ".join(f"★{k}: {v}" for k, v in sorted(dist.items(), reverse=True))
+        console.print(f"\n[bold]Score distribution:[/bold] {dist_str}")
+        console.print(
+            f"[dim]Judged: {judge_stats.chunks_judged} new, "
+            f"{judge_stats.chunks_cached} cached, "
+            f"{judge_stats.chunks_failed} failed. "
+            f"Tokens: {judge_stats.input_tokens:,} in, "
+            f"{judge_stats.output_tokens:,} out.[/dim]"
+        )
+    else:
+        console.print("[yellow]No chunks were judged.[/yellow]")
+
+
+# ---------------------------------------------------------------------------
+# reflect (standalone)
+# ---------------------------------------------------------------------------
+
+
+@app.command("reflect")
+def reflect_cmd(
+    epub: Path = typer.Argument(..., exists=True, dir_okay=False, help="Source EPUB."),
+    series: str | None = typer.Option(
+        None, "--series", "-s",
+        help="Series slug for glossary context.",
+    ),
+    glossary_path: Path | None = typer.Option(
+        None, "--glossary", "-g",
+        exists=True, dir_okay=False,
+        help="Path to a single-book glossary.json.",
+    ),
+    config_path: Path = typer.Option(
+        DEFAULT_CONFIG, "--config", "-c", help="YAML config file.",
+    ),
+    work_dir: Path = typer.Option(
+        DEFAULT_WORK_DIR, "--work", "-w", help="Base directory for artifacts.",
+    ),
+    model: str | None = typer.Option(
+        None, "--model", "-m",
+        help="Override the reflect model.",
+    ),
+    threshold: int | None = typer.Option(
+        None, "--threshold", "-t",
+        help="Reflect chunks with judge score ≤ N (default from config).",
+    ),
+    all_chunks: bool = typer.Option(
+        False, "--all",
+        help="Reflect all chunks regardless of score.",
+    ),
+    parallelism: int | None = typer.Option(
+        None, "--parallelism", "-j",
+        help="Number of chunks to reflect concurrently.",
+    ),
+) -> None:
+    """Run the reflect pass on chunks that scored poorly.
+
+    Requires judge scores in cache. Use 'btrans judge' first if needed.
+    """
+    from .reflect import Reflector
+
+    cfg = load_config(config_path if config_path.exists() else None)
+
+    if threshold is not None and not 1 <= threshold <= 5:
+        console.print(
+            "[red]--threshold must be between 1 and 5.[/red]"
+        )
+        raise typer.Exit(code=1)
+
+    console.print(f"[bold]Reading EPUB:[/bold] {epub}")
+    book = read_book_structured(epub)
+    console.print(f"[bold]Book:[/bold] {book.meta.title}")
+
+    glossary = _resolve_glossary(series, glossary_path, work_dir, cfg, book)
+
+    wd = WorkDir.for_book(work_dir, book.meta.title)
+    cache = Cache(wd.cache_path)
+
+    # Get judge scores
+    judge_scores = cache.get_judge_scores()
+    if not judge_scores and not all_chunks:
+        console.print(
+            "[red]No judge scores found. Run 'btrans judge' first, "
+            "or use --all to reflect all translated chunks.[/red]"
+        )
+        cache.close()
+        raise typer.Exit(code=1)
+
+    # Determine which chunks to reflect
+    trigger = (
+        threshold if threshold is not None
+        else cfg.reflection.trigger_score
+    )
+
+    if all_chunks:
+        # Reflect all translated chunks regardless of judge scores.
+        # judge_by_id may be empty if judge hasn't run — that's fine,
+        # build_reflect_input handles missing entries with defaults.
+        translate_ids = cache.get_all_chunk_ids_for_stage("translate")
+        chunks_to_reflect_ids = set(translate_ids)
+        judge_by_id = normalize_judge_map(judge_scores) if judge_scores else {}
+    else:
+        chunks_to_reflect_ids = set()
+        judge_by_id = normalize_judge_map(judge_scores)
+        for cid, data in judge_by_id.items():
+            if data["score"] <= trigger:
+                chunks_to_reflect_ids.add(cid)
+
+    if not chunks_to_reflect_ids:
+        console.print(
+            f"[green]All chunks scored above {trigger}. "
+            f"Nothing to reflect.[/green]"
+        )
+        cache.close()
+        return
+
+    console.print(
+        f"[bold]Chunks to reflect:[/bold] {len(chunks_to_reflect_ids)}"
+    )
+
+    # Verify chunker config matches what was used during translate
+    try:
+        verify_chunker_params(
+            cache, cfg.chunker.target_words, cfg.chunker.overlap_paragraphs
+        )
+    except ChunkerConfigMismatchError as e:
+        console.print(f"[red]Error:[/red] {e}")
+        cache.close()
+        raise typer.Exit(code=1) from e
+
+    # Build chunk set for originals
+    chunk_set = chunk_book(
+        book,
+        target_words=cfg.chunker.target_words,
+        overlap_paragraphs=cfg.chunker.overlap_paragraphs,
+    )
+
+    # Build reflect input using shared helper
+    chunks_to_reflect_data = build_reflect_input(
+        chunk_set, cache, chunks_to_reflect_ids, judge_by_id
+    )
+
+    if not chunks_to_reflect_data:
+        console.print(
+            "[yellow]No chunks with translations to reflect on.[/yellow]"
+        )
+        cache.close()
+        return
+
+    reflect_model = model or cfg.models.reflect
+    console.print(f"[bold]Model:[/bold] {reflect_model}")
+
+    REFLECT_PROMPT = Path("prompts/reflect.md")
+    reflector = Reflector(
+        provider=create_provider(),
+        reflect_prompt_path=REFLECT_PROMPT,
+        translate_prompt_path=TRANSLATE_PROMPT,
+        cache=cache,
+        glossary=glossary,
+        model=reflect_model,
+        source_lang=cfg.source_lang,
+        target_lang=cfg.target_lang,
+    )
+
+    if parallelism is not None and parallelism < 1:
+        console.print("[red]--parallelism must be ≥ 1.[/red]")
+        cache.close()
+        raise typer.Exit(code=1)
+
+    reflect_parallelism = parallelism or 2
+
+    with Progress(
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        MofNCompleteColumn(),
+        TimeElapsedColumn(),
+        console=console,
+    ) as progress:
+        rtask = progress.add_task("reflecting", total=len(chunks_to_reflect_data))
+
+        def on_progress(done, total, cid, rstats):
+            progress.update(
+                rtask,
+                completed=done,
+                description=(
+                    f"reflect | improved {rstats.chunks_improved} "
+                    f"unchanged {rstats.chunks_unchanged} "
+                    f"failed {rstats.chunks_failed}"
+                ),
+            )
+
+        reflect_stats = reflector.reflect_chunks(
+            chunks_to_reflect_data,
+            on_progress=on_progress,
+            parallelism=reflect_parallelism,
+        )
+
+    cache.close()
+
+    console.print(
+        f"\n[bold]Reflect results:[/bold]\n"
+        f"  Improved: {reflect_stats.chunks_improved}/{reflect_stats.chunks_total}\n"
+        f"  No change: {reflect_stats.chunks_unchanged}/{reflect_stats.chunks_total}\n"
+        f"  Failed: {reflect_stats.chunks_failed}/{reflect_stats.chunks_total}\n"
+        f"[dim]Tokens: {reflect_stats.input_tokens:,} in, "
+        f"{reflect_stats.output_tokens:,} out.[/dim]"
+    )
+
+
+# ---------------------------------------------------------------------------
+# helper: resolve glossary for judge/reflect commands
+# ---------------------------------------------------------------------------
+
+
+def _resolve_glossary(
+    series: str | None,
+    glossary_path: Path | None,
+    work_dir: Path,
+    cfg,
+    book,
+) -> SeriesGlossary | None:
+    """Resolve glossary from --series or --glossary flags."""
+    if series and glossary_path:
+        console.print("[red]--series and --glossary are mutually exclusive.[/red]")
+        raise typer.Exit(code=1)
+
+    if series:
+        swd = SeriesWorkDir.for_series(work_dir, series)
+        if not swd.exists():
+            console.print(f"[red]Series {series!r} not found.[/red]")
+            raise typer.Exit(code=1)
+        glossary = load_series_glossary(swd.glossary_path)
+        console.print(f"[bold]Series:[/bold] {series} ({len(glossary.entries)} terms)")
+        return glossary
+
+    if glossary_path:
+        book_glossary = Glossary.model_validate(
+            json.loads(glossary_path.read_text(encoding="utf-8"))
+        )
+        glossary = SeriesGlossary(
+            series_slug=f"ad-hoc:{book.meta.title}",
+            title=book.meta.title,
+            author=book.meta.author,
+            source_lang=cfg.source_lang,
+            target_lang=cfg.target_lang,
+            entries=[
+                SeriesGlossaryEntry(
+                    original=e.original,
+                    translation=e.translation,
+                    type=e.type,
+                    gender=e.gender,
+                    plural=e.plural,
+                    notes=e.notes,
+                    origin_book=book_glossary.book,
+                )
+                for e in book_glossary.entries
+            ],
+        )
+        return glossary
+
+    return None
 
 
 # ---------------------------------------------------------------------------

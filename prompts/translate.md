@@ -88,3 +88,14 @@ directly with `===PARAGRAPH 1===`.
 ===END OVERLAP===
 
 {% endif %}
+{% if reflection_notes %}
+## Reflection notes (improve your translation based on these)
+
+A critic reviewed a previous translation of this chunk and found issues.
+Apply these corrections in your translation:
+
+{{ reflection_notes }}
+
+Pay special attention to the specific suggestions above. Fix the
+identified problems while maintaining overall translation quality.
+{% endif %}
