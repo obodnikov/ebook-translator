@@ -235,6 +235,51 @@ class Cache:
             ))
         return results
 
+    def get_stages_for_chunks_bulk(
+        self, chunk_ids: list[str]
+    ) -> dict[str, list[ChunkStageInfo]]:
+        """Get all cached stages for multiple chunks in one query.
+
+        Returns {chunk_id: [ChunkStageInfo, ...]} for each chunk that
+        has at least one entry. More efficient than calling
+        get_chunk_stages() per chunk.
+        """
+        if not chunk_ids:
+            return {}
+
+        batch_size = 500
+        all_rows: list[tuple] = []
+
+        for i in range(0, len(chunk_ids), batch_size):
+            batch = chunk_ids[i:i + batch_size]
+            placeholders = ",".join("?" * len(batch))
+            rows = self.conn.execute(
+                f"SELECT chunk_id, stage, model, cost_usd, input_tokens, "
+                f"output_tokens, created_at, content "
+                f"FROM cache WHERE chunk_id IN ({placeholders}) "
+                f"AND chunk_id IS NOT NULL "
+                f"ORDER BY chunk_id, created_at",
+                batch,
+            ).fetchall()
+            all_rows.extend(rows)
+
+        result: dict[str, list[ChunkStageInfo]] = {}
+        for row in all_rows:
+            cid = row[0]
+            info = ChunkStageInfo(
+                chunk_id=cid,
+                stage=row[1],
+                model=row[2],
+                cost_usd=row[3] or 0.0,
+                input_tokens=row[4] or 0,
+                output_tokens=row[5] or 0,
+                created_at=row[6] or "",
+                content=row[7],
+            )
+            result.setdefault(cid, []).append(info)
+
+        return result
+
     def get_all_chunk_ids_for_stage(self, stage: str) -> list[str]:
         """Get all chunk_ids that have entries for a given stage.
 

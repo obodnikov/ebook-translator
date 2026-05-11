@@ -10,11 +10,15 @@ CLI commands. Addresses code review concerns about:
 
 from __future__ import annotations
 
+import logging
+import re
 from typing import Any
 
 from .cache import Cache
 from .chunker import ChunkSet
 from .provider import OpenRouterProvider
+
+logger = logging.getLogger(__name__)
 
 # Key used to store chunker parameters in pipeline_meta
 CHUNKER_META_KEY = "chunker_params"
@@ -239,6 +243,328 @@ def build_reflect_input(
         })
 
     return chunks_data
+
+
+def collect_waterfall_translations(
+    cache: Cache,
+    chunk_ids: list[str],
+    target_stage: str,
+) -> dict[str, str]:
+    """Get the best available translation for each chunk BEFORE target_stage.
+
+    The waterfall order is: translate → reflect → proofread → style → verify.
+    For a given target_stage, we pick the latest stage that precedes it.
+
+    Example: if target_stage='style', we look for proofread first, then
+    reflect, then translate — and return the first one found for each chunk.
+
+    Returns {chunk_id: content} for chunks that have at least one
+    preceding stage available.
+    """
+    from .cache import STAGE_WATERFALL
+
+    if not chunk_ids:
+        return {}
+
+    # Determine which stages precede the target
+    if target_stage not in STAGE_WATERFALL:
+        # Fallback: just get the best available
+        preceding_stages = STAGE_WATERFALL[:]
+    else:
+        target_idx = STAGE_WATERFALL.index(target_stage)
+        preceding_stages = STAGE_WATERFALL[:target_idx]
+
+    # Batch-fetch all stages for all chunks in one query
+    all_chunk_stages = cache.get_stages_for_chunks_bulk(chunk_ids)
+
+    # For each chunk, find the latest preceding stage that has content
+    translations: dict[str, str] = {}
+
+    for cid in chunk_ids:
+        stages = all_chunk_stages.get(cid, [])
+        stage_content: dict[str, str] = {}
+        for s in stages:
+            if s.stage in preceding_stages:
+                stage_content[s.stage] = s.content
+
+        # Pick the latest available preceding stage
+        for stage in reversed(preceding_stages):
+            if stage in stage_content:
+                translations[cid] = stage_content[stage]
+                break
+
+    return translations
+
+
+def collect_waterfall_paragraphs(
+    cache: Cache,
+    chunk_ids: list[str],
+    target_stage: str,
+    paragraph_counts: dict[str, int],
+) -> dict[str, list[str]]:
+    """Get waterfall translations parsed into paragraph lists.
+
+    For each chunk, iterates preceding stages from newest to oldest and
+    accepts the first stage whose content parses correctly and matches
+    the expected paragraph count. Falls back to earlier stages if the
+    latest one is malformed.
+
+    Args:
+        cache: Cache instance.
+        chunk_ids: Chunks to collect.
+        target_stage: The stage we're about to run (determines waterfall).
+        paragraph_counts: {chunk_id: expected_paragraph_count} for validation.
+
+    Returns {chunk_id: [paragraph_fragments]} for chunks with valid content.
+    """
+    import re
+
+    from .cache import STAGE_WATERFALL
+
+    _MARKER_RE = re.compile(r"^===PARAGRAPH\s+\d+===\s*$", re.MULTILINE)
+
+    if not chunk_ids:
+        return {}
+
+    # Determine which stages precede the target
+    if target_stage not in STAGE_WATERFALL:
+        preceding_stages = STAGE_WATERFALL[:]
+    else:
+        target_idx = STAGE_WATERFALL.index(target_stage)
+        preceding_stages = STAGE_WATERFALL[:target_idx]
+
+    # Batch-fetch all stages for all chunks
+    all_chunk_stages = cache.get_stages_for_chunks_bulk(chunk_ids)
+
+    result: dict[str, list[str]] = {}
+    for cid in chunk_ids:
+        stages = all_chunk_stages.get(cid, [])
+        # Build {stage_name: content} for preceding stages
+        stage_content: dict[str, str] = {}
+        for s in stages:
+            if s.stage in preceding_stages:
+                stage_content[s.stage] = s.content
+
+        expected = paragraph_counts.get(cid)
+
+        # Try stages from newest to oldest, accept first valid one
+        for stage in reversed(preceding_stages):
+            content = stage_content.get(stage)
+            if content is None:
+                continue
+
+            fragments = _parse_waterfall_content(content, _MARKER_RE)
+            if fragments is None:
+                # No markers and not a single-paragraph case
+                if expected == 1:
+                    # Treat entire content as single paragraph
+                    text = content.strip()
+                    if text:
+                        result[cid] = [text]
+                        break
+                continue
+
+            if expected is not None and len(fragments) != expected:
+                # Paragraph count mismatch — try earlier stage
+                logger.debug(
+                    "Waterfall %s/%s: %d paragraphs, expected %d; trying earlier stage",
+                    cid, stage, len(fragments), expected,
+                )
+                continue
+
+            result[cid] = fragments
+            break
+
+    return result
+
+
+def _parse_waterfall_content(
+    content: str, marker_re: re.Pattern[str]
+) -> list[str] | None:
+    """Parse ===PARAGRAPH N=== markers from cached content.
+
+    Returns list of fragments, or None if no markers found.
+    """
+    text = content.strip()
+    if text.startswith("```"):
+        lines = text.splitlines()
+        if lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].startswith("```"):
+            lines = lines[:-1]
+        text = "\n".join(lines)
+
+    matches = list(marker_re.finditer(text))
+    if not matches:
+        return None
+
+    fragments: list[str] = []
+    for i, m in enumerate(matches):
+        start = m.end()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+        fragment = text[start:end].strip()
+        fragments.append(fragment)
+
+    return fragments
+
+
+def rehydrate_book_from_waterfall(
+    cache: Cache,
+    chunk_set: ChunkSet,
+) -> int:
+    """Update in-memory book trees with the latest waterfall content.
+
+    After post-processing passes write results to cache, the in-memory
+    lxml trees still contain the translate-stage content. This function
+    reads the final waterfall result for each chunk, parses the XHTML
+    fragments, and splices them back into the chapter trees so that
+    write_translated_epub() produces the correct output.
+
+    Returns the number of chunks successfully rehydrated.
+    """
+    import re
+
+    from lxml import etree
+
+    from .cache import STAGE_WATERFALL
+
+    _MARKER_RE = re.compile(r"^===PARAGRAPH\s+\d+===\s*$", re.MULTILINE)
+
+    # Matches a `&` that does NOT start a valid XML entity
+    _BARE_AMP_RE = re.compile(
+        r"&(?!(?:amp|lt|gt|quot|apos|#\d+|#x[0-9a-fA-F]+);)"
+    )
+
+    # Build chunk lookup: id -> Chunk
+    chunk_by_id = {c.id: c for c in chunk_set.chunks}
+
+    # Get all chunk IDs that have translations
+    all_chunk_ids = list(chunk_by_id.keys())
+
+    # Resolve the final stage for each chunk via waterfall
+    resolved_stages = cache.resolve_stages_bulk(all_chunk_ids)
+
+    # Only rehydrate chunks whose resolved stage is NOT 'translate'
+    # (translate stage was already applied in-memory by the Translator).
+    # Actually, we should rehydrate ALL chunks to be safe — the reflect
+    # pass also writes to cache but updates in-memory trees differently.
+    # The safest approach: rehydrate everything from the resolved stage.
+    chunks_to_rehydrate = [
+        cid for cid, stage in resolved_stages.items()
+        if stage != "translate"
+    ]
+
+    if not chunks_to_rehydrate:
+        return 0
+
+    # Batch-fetch stages for chunks that need rehydration
+    all_stages_map = cache.get_stages_for_chunks_bulk(chunks_to_rehydrate)
+
+    rehydrated = 0
+    for cid in chunks_to_rehydrate:
+        chunk = chunk_by_id.get(cid)
+        if not chunk:
+            continue
+
+        resolved_stage = resolved_stages.get(cid)
+        if not resolved_stage:
+            continue
+
+        # Try the resolved stage first, then fall back to earlier stages
+        stages = all_stages_map.get(cid, [])
+        stage_content: dict[str, str] = {}
+        for s in stages:
+            if s.stage in STAGE_WATERFALL:
+                stage_content[s.stage] = s.content
+
+        # Build ordered list of stages to try: resolved first, then
+        # earlier stages in reverse waterfall order
+        stages_to_try: list[str] = [resolved_stage]
+        resolved_idx = (
+            STAGE_WATERFALL.index(resolved_stage)
+            if resolved_stage in STAGE_WATERFALL
+            else len(STAGE_WATERFALL)
+        )
+        for stage in reversed(STAGE_WATERFALL[:resolved_idx]):
+            if stage != "translate" and stage in stage_content:
+                stages_to_try.append(stage)
+
+        expected = len(chunk.paragraph_indexes)
+        chapter = chunk_set.book.chapters[chunk.chapter_index]
+        applied = False
+
+        for try_stage in stages_to_try:
+            content = stage_content.get(try_stage)
+            if content is None:
+                continue
+
+            # Parse paragraph markers
+            text = content.strip()
+            if text.startswith("```"):
+                lines = text.splitlines()
+                if lines[0].startswith("```"):
+                    lines = lines[1:]
+                if lines and lines[-1].startswith("```"):
+                    lines = lines[:-1]
+                text = "\n".join(lines)
+
+            matches = list(_MARKER_RE.finditer(text))
+            if not matches:
+                continue
+
+            candidate: list[str] = []
+            for i, m in enumerate(matches):
+                start = m.end()
+                end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+                candidate.append(text[start:end].strip())
+
+            if len(candidate) != expected:
+                continue
+
+            # Validate ALL fragments parse as XML before mutating
+            parsed_elements: list[tuple[int, etree._Element]] = []
+            all_ok = True
+
+            for para_idx, frag_str in zip(
+                chunk.paragraph_indexes, candidate, strict=True
+            ):
+                frag_str = _BARE_AMP_RE.sub("&amp;", frag_str)
+                try:
+                    new_el = etree.fromstring(frag_str)
+                except etree.XMLSyntaxError:
+                    all_ok = False
+                    break
+
+                old_el = chapter.paragraphs[para_idx]
+                original_tag = old_el.tag
+                if isinstance(original_tag, str) and "}" in original_tag:
+                    ns_uri = original_tag.split("}", 1)[0].lstrip("{")
+                    for sub in new_el.iter():
+                        if isinstance(sub.tag, str) and "}" not in sub.tag:
+                            sub.tag = f"{{{ns_uri}}}{sub.tag}"
+
+                parsed_elements.append((para_idx, new_el))
+
+            if not all_ok or len(parsed_elements) != len(candidate):
+                # This stage failed XML validation — try earlier stage
+                continue
+
+            # All fragments validated — perform tree mutations
+            for para_idx, new_el in parsed_elements:
+                old_el = chapter.paragraphs[para_idx]
+                new_el.tail = old_el.tail
+                parent = old_el.getparent()
+                if parent is not None:
+                    parent.replace(old_el, new_el)
+                    chapter.paragraphs[para_idx] = new_el
+
+            applied = True
+            break
+
+        if applied:
+            rehydrated += 1
+
+    return rehydrated
 
 
 def normalize_judge_map(

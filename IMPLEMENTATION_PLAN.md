@@ -331,6 +331,8 @@ Judge на Haiku 4.5 — ~$0.11 на книгу.
 
 ### Итерация 5 — Proofread / Style / Verify
 
+**Статус: ✅ ВЫПОЛНЕНО (11 мая 2026)**
+
 **Цель.** Три отдельных прохода post-translate для финального качества.
 Все проходы хранятся в кэше как отдельные stage, участвуют в waterfall
 сборки, могут быть откачены через `btrans prefer`.
@@ -353,6 +355,22 @@ Judge на Haiku 4.5 — ~$0.11 на книгу.
 
 **Сборка:** `btrans assemble book.epub --from proofread` даёт EPUB
 после корректуры но до стилистики. Полезно для A/B сравнения этапов.
+
+**Реализация (11 мая 2026):**
+
+- Новый модуль: `src/booktranslator/postprocess.py` — класс
+  `PostProcessor` с поддержкой кэширования, параллелизма, и
+  хранения результатов как отдельных stage в waterfall.
+- Три промпта: `prompts/proofread.md`, `prompts/style.md`,
+  `prompts/verify.md`.
+- Три standalone CLI-команды: `btrans proofread`, `btrans style`,
+  `btrans verify`.
+- Интеграция в `btrans translate`: автоматически запускаются после
+  reflect (если не отключены через `--no-proofread` и т.д.).
+- Хелперы в `pipeline_helpers.py`: `collect_waterfall_translations()`
+  и `collect_waterfall_paragraphs()` для получения текста из
+  предыдущего stage по waterfall.
+- Тесты: `tests/test_postprocess.py` (30 тестов).
 
 ### Итерация 4.5 — Maintenance CLI (`btrans status` / `prefer` / `assemble`)
 

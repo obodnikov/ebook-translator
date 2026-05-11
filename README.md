@@ -4,9 +4,9 @@
 > OpenRouter. Сохраняет вёрстку, ведёт глоссарий уровня книги и серии
 > для консистентности имён, кэширует переводы на уровне chunk-а.
 
-Статус: v0.2. Работает end-to-end с автоматической оценкой качества
-(`glossary → promote → translate → judge → reflect`). Оператор ведёт
-процесс руками. См. [`IMPLEMENTATION_PLAN.md`](IMPLEMENTATION_PLAN.md).
+Статус: v0.3. Работает end-to-end с полным pipeline качества
+(`glossary → promote → translate → judge → reflect → proofread → style → verify`).
+Оператор ведёт процесс руками. См. [`IMPLEMENTATION_PLAN.md`](IMPLEMENTATION_PLAN.md).
 
 ---
 
@@ -236,12 +236,20 @@ btrans translate path/to/book.epub -j 8
   проходят рефлексию по методу Andrew Ng — критика → повторный
   перевод с учётом замечаний. Оригинальный перевод сохраняется,
   улучшенный записывается как отдельный stage.
+- **Proofread** (если не `--no-proofread`): Haiku 4.5 исправляет
+  грамматику, пунктуацию и опечатки. Не трогает стиль.
+- **Style** (если не `--no-style`): Sonnet 4.6 убирает кальки,
+  канцелярит, улучшает авторский голос. Не меняет смысл.
+- **Verify** (если не `--no-verify`): Sonnet 4.6 сверяет перевод
+  с оригиналом — ищет пропуски, искажения, нарушения глоссария.
 - Собирается новый EPUB: `books/extracted/<slug>-ru.epub` рядом с
   оригиналом (путь можно переопределить через `--out`).
 
 Время на ~100K слов / 60 chunks: 15–25 минут при `-j 8`
-(translate ~12 мин + judge ~1 мин + reflect ~3 мин).
-Стоимость: ~$5–7 (translate ~$4–5, judge ~$0.11, reflect ~$0.5–1).
+(translate ~12 мин + judge ~1 мин + reflect ~3 мин +
+proofread ~2 мин + style ~5 мин + verify ~5 мин).
+Стоимость: ~$8–12 (translate ~$4–5, judge ~$0.11, reflect ~$0.5–1,
+proofread ~$0.3, style ~$1.5, verify ~$1.5).
 
 Повторный запуск той же команды — мгновенно из SQLite-кэша
 (`work/<book-slug>/cache.sqlite`), LLM не зовётся.
@@ -269,6 +277,14 @@ btrans translate ... --reflect-all
 
 # Порог рефлексии: переделывать chunks с оценкой ≤ 2 (вместо ≤ 3)
 btrans translate ... --reflect-threshold 2
+
+# Пропустить отдельные post-processing проходы
+btrans translate ... --no-proofread
+btrans translate ... --no-style
+btrans translate ... --no-verify
+
+# Только перевод + judge + reflect, без post-processing
+btrans translate ... --no-proofread --no-style --no-verify
 ```
 
 ### Шаг 6: открыть готовый EPUB
@@ -321,6 +337,29 @@ btrans reflect ... --all
 btrans reflect ... --threshold 2
 ```
 
+### Proofread / Style / Verify отдельно от translate
+
+Каждый проход можно запустить отдельно. Каждый берёт вход из
+предыдущего stage по waterfall (verify читает style, style читает
+proofread, proofread читает reflect/translate):
+
+```bash
+# Корректура: грамматика, пунктуация, опечатки (Haiku 4.5)
+btrans proofread books/extracted/broken-homes-ben-aaronovitch.epub \
+  --series rivers-of-london -j 8
+
+# Стилистика: кальки, канцелярит, авторский голос (Sonnet 4.6)
+btrans style books/extracted/broken-homes-ben-aaronovitch.epub \
+  --series rivers-of-london -j 4
+
+# Верификация: сверка с оригиналом, пропуски, искажения (Sonnet 4.6)
+btrans verify books/extracted/broken-homes-ben-aaronovitch.epub \
+  --series rivers-of-london -j 4
+```
+
+Результаты хранятся как отдельные stage в кэше. Ничего не
+перезаписывается — можно откатить через `btrans prefer`.
+
 ### Управление сборкой (prefer / assemble)
 
 ```bash
@@ -330,12 +369,17 @@ btrans prefer ch03_c02 translate --reason "reflect ухудшил диалог"
 # Выбрать reflect-вариант для chunk (если waterfall не тот)
 btrans prefer ch12_c01 reflect --reason "reflect лучше"
 
+# Выбрать proofread-вариант (до стилистики)
+btrans prefer ch05_c01 proofread --reason "style испортил диалог"
+
 # Сбросить предпочтение (вернуться к waterfall)
 btrans prefer ch03_c02 --reset
 
 # Собрать EPUB из конкретного stage (игнорируя waterfall)
 btrans assemble work/broken-homes/ --from translate --epub book.epub --out first-pass.epub
 btrans assemble work/broken-homes/ --from reflect --epub book.epub --out reflected.epub
+btrans assemble work/broken-homes/ --from proofread --epub book.epub --out proofread.epub
+btrans assemble work/broken-homes/ --from style --epub book.epub --out styled.epub
 ```
 
 ### Посмотреть series glossary
@@ -423,11 +467,11 @@ sqlite3 work/broken-homes/cache.sqlite \
 
 ## Что сейчас не умеем
 
-- **Автоматическая вычитка** (proofread / style / verify) — итерация
-  5 по плану. Judge + Reflect уже работают (итерация 4 ✅).
 - **Pause-точки + Telegram** — отложено
   ([см. `IMPLEMENTATION_PLAN.md`, §4bis](IMPLEMENTATION_PLAN.md)).
   Pipeline из 3 команд оператор ведёт руками, ~1 час wall-clock.
+- **Relevancy-фильтр глоссария** — итерация 6 по плану. Сейчас
+  весь глоссарий серии идёт в каждый chunk (~15–20K токенов).
 - **Оценка стоимости до запуска** (`btrans estimate`) — v1.1.
 - **HU → RU** — v1.2.
 - **Сноски для читателя из глоссария** (`reader_note`) — v1.3.
@@ -453,7 +497,10 @@ ebook-translator/
 │   ├── glossary_extract.md
 │   ├── translate.md
 │   ├── judge.md
-│   └── reflect.md
+│   ├── reflect.md
+│   ├── proofread.md
+│   ├── style.md
+│   └── verify.md
 ├── src/booktranslator/      # код пакета
 ├── tools/split_epub.py      # standalone-скрипт для антологий
 ├── books/                   # gitignored: EPUB-файлы

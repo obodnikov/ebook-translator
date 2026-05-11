@@ -36,8 +36,10 @@ from .pipeline_helpers import (
     build_reflect_input,
     collect_chunk_originals,
     collect_stage_translations,
+    collect_waterfall_paragraphs,
     create_provider,
     normalize_judge_map,
+    rehydrate_book_from_waterfall,
     save_chunker_params,
     verify_chunker_params,
 )
@@ -409,6 +411,18 @@ def translate(
         False, "--reflect-all",
         help="Reflect all chunks regardless of score.",
     ),
+    no_proofread: bool = typer.Option(
+        False, "--no-proofread",
+        help="Skip the proofread pass.",
+    ),
+    no_style: bool = typer.Option(
+        False, "--no-style",
+        help="Skip the style pass.",
+    ),
+    no_verify: bool = typer.Option(
+        False, "--no-verify",
+        help="Skip the verify pass.",
+    ),
 ) -> None:
     """Translate an EPUB into the target language."""
     cfg = load_config(config_path if config_path.exists() else None)
@@ -766,7 +780,136 @@ def translate(
                     f"{reflect_stats.chunks_total}"
                 )
 
+    # ------------------------------------------------------------------
+    # Post-processing passes: proofread, style, verify
+    # ------------------------------------------------------------------
+    from .postprocess import PostProcessor
+
+    # Build paragraph count map for waterfall parsing
+    paragraph_counts = {
+        chunk.id: len(chunk.paragraph_indexes)
+        for chunk in chunk_set.chunks
+    }
+
+    # Current chunk IDs from the chunk_set — anchors all postprocess
+    # operations to the current book/chunker config, preventing stale
+    # cache entries from being processed.
+    current_chunk_ids = [chunk.id for chunk in chunk_set.chunks]
+
+    # Intersect with what's actually in cache (translated)
+    cached_translate_ids = set(cache.get_all_chunk_ids_for_stage("translate"))
+    valid_chunk_ids = [
+        cid for cid in current_chunk_ids if cid in cached_translate_ids
+    ]
+
+    pp_stats_list: list[tuple[str, object]] = []
+
+    # Determine which stages to run based on config and CLI flags
+    stages_to_run: list[tuple[str, Path, str]] = []
+    if cfg.stages.proofread and not no_proofread:
+        stages_to_run.append(("proofread", Path("prompts/proofread.md"), cfg.models.proofread))
+    if cfg.stages.style and not no_style:
+        stages_to_run.append(("style", Path("prompts/style.md"), cfg.models.style))
+    if cfg.stages.verify and not no_verify:
+        stages_to_run.append(("verify", Path("prompts/verify.md"), cfg.models.verify))
+
+    for pp_stage, pp_prompt_path, pp_model in stages_to_run:
+        # Collect waterfall input for this stage using scoped IDs
+        waterfall_paragraphs = collect_waterfall_paragraphs(
+            cache, valid_chunk_ids, pp_stage, paragraph_counts
+        )
+
+        if not waterfall_paragraphs:
+            console.print(
+                f"\n[yellow]No parseable translations for {pp_stage} pass; skipping.[/yellow]"
+            )
+            continue
+
+        # For verify, also need originals
+        chunks_data_pp = []
+        originals_for_verify: dict[str, str] | None = None
+        if pp_stage == "verify":
+            originals_for_verify = collect_chunk_originals(
+                chunk_set, list(waterfall_paragraphs.keys())
+            )
+
+        for cid, paragraphs in sorted(waterfall_paragraphs.items()):
+            entry: dict = {
+                "chunk_id": cid,
+                "translated_paragraphs": paragraphs,
+            }
+            if pp_stage == "verify" and originals_for_verify:
+                entry["original_text"] = originals_for_verify.get(cid, "")
+            chunks_data_pp.append(entry)
+
+        console.print(
+            f"\n[dim]Running {pp_stage} on {len(chunks_data_pp)} chunks "
+            f"with {pp_model}...[/dim]\n"
+        )
+
+        processor = PostProcessor(
+            provider=provider,
+            prompt_path=pp_prompt_path,
+            cache=cache,
+            glossary=glossary,
+            stage=pp_stage,
+            model=pp_model,
+            source_lang=cfg.source_lang,
+            target_lang=cfg.target_lang,
+        )
+
+        pp_parallelism = min(
+            parallelism or cfg.translate.parallelism, 8
+        ) or 4
+
+        with Progress(
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            MofNCompleteColumn(),
+            TimeElapsedColumn(),
+            console=console,
+        ) as progress:
+            pptask = progress.add_task(pp_stage, total=len(chunks_data_pp))
+
+            def _make_pp_progress_cb(task_id, stage_name):
+                def on_pp_progress(done, total, cid, pstats):
+                    progress.update(
+                        task_id,
+                        completed=done,
+                        description=(
+                            f"{stage_name} | cached {pstats.chunks_cached} "
+                            f"new {pstats.chunks_processed} "
+                            f"failed {pstats.chunks_failed}"
+                        ),
+                    )
+                return on_pp_progress
+
+            pp_stats = processor.process_chunks(
+                chunks_data_pp,
+                on_progress=_make_pp_progress_cb(pptask, pp_stage),
+                parallelism=pp_parallelism,
+            )
+
+        pp_stats_list.append((pp_stage, pp_stats))
+        console.print(
+            f"  Changed: {pp_stats.chunks_changed}/{pp_stats.chunks_total}  |  "
+            f"Unchanged: {pp_stats.chunks_unchanged}/{pp_stats.chunks_total}"
+        )
+
     out_path = out or _default_output_path(epub, cfg.target_lang)
+
+    # Rehydrate in-memory trees from the final waterfall stage.
+    # The Translator only updates trees with translate-stage content;
+    # reflect/proofread/style/verify write to cache but not to the tree.
+    # This step ensures the EPUB contains the latest post-processed text.
+    from .pipeline_helpers import rehydrate_book_from_waterfall
+    if pp_stats_list or reflect_stats:
+        rehydrated = rehydrate_book_from_waterfall(cache, chunk_set)
+        if rehydrated:
+            console.print(
+                f"[dim]Rehydrated {rehydrated} chunks from post-processing.[/dim]"
+            )
+
     modified = [ch for ch in book.chapters if ch.paragraphs]
     write_translated_epub(
         source_path=epub,
@@ -792,6 +935,11 @@ def translate(
         summary_parts.append(
             f"Reflect: {reflect_stats.chunks_improved} improved, "
             f"{reflect_stats.chunks_unchanged} unchanged."
+        )
+    for pp_stage_name, pp_st in pp_stats_list:
+        summary_parts.append(
+            f"{pp_stage_name.capitalize()}: {pp_st.chunks_changed} changed, "
+            f"{pp_st.chunks_unchanged} unchanged."
         )
 
     console.print(
@@ -1165,6 +1313,324 @@ def reflect_cmd(
         f"[dim]Tokens: {reflect_stats.input_tokens:,} in, "
         f"{reflect_stats.output_tokens:,} out.[/dim]"
     )
+
+
+# ---------------------------------------------------------------------------
+# proofread (standalone)
+# ---------------------------------------------------------------------------
+
+
+@app.command("proofread")
+def proofread_cmd(
+    epub: Path = typer.Argument(..., exists=True, dir_okay=False, help="Source EPUB."),
+    series: str | None = typer.Option(
+        None, "--series", "-s",
+        help="Series slug for glossary context.",
+    ),
+    glossary_path: Path | None = typer.Option(
+        None, "--glossary", "-g",
+        exists=True, dir_okay=False,
+        help="Path to a single-book glossary.json.",
+    ),
+    config_path: Path = typer.Option(
+        DEFAULT_CONFIG, "--config", "-c", help="YAML config file.",
+    ),
+    work_dir: Path = typer.Option(
+        DEFAULT_WORK_DIR, "--work", "-w", help="Base directory for artifacts.",
+    ),
+    model: str | None = typer.Option(
+        None, "--model", "-m",
+        help="Override the proofread model.",
+    ),
+    parallelism: int | None = typer.Option(
+        None, "--parallelism", "-j",
+        help="Number of chunks to process concurrently.",
+    ),
+) -> None:
+    """Run the proofread pass: fix grammar, punctuation, typos.
+
+    Reads from the latest available stage (waterfall) and stores
+    results as stage='proofread'.
+    """
+    _run_postprocess_cmd(
+        stage="proofread",
+        prompt_path=Path("prompts/proofread.md"),
+        epub=epub,
+        series=series,
+        glossary_path=glossary_path,
+        config_path=config_path,
+        work_dir=work_dir,
+        model_override=model,
+        parallelism=parallelism,
+    )
+
+
+# ---------------------------------------------------------------------------
+# style (standalone)
+# ---------------------------------------------------------------------------
+
+
+@app.command("style")
+def style_cmd(
+    epub: Path = typer.Argument(..., exists=True, dir_okay=False, help="Source EPUB."),
+    series: str | None = typer.Option(
+        None, "--series", "-s",
+        help="Series slug for glossary context.",
+    ),
+    glossary_path: Path | None = typer.Option(
+        None, "--glossary", "-g",
+        exists=True, dir_okay=False,
+        help="Path to a single-book glossary.json.",
+    ),
+    config_path: Path = typer.Option(
+        DEFAULT_CONFIG, "--config", "-c", help="YAML config file.",
+    ),
+    work_dir: Path = typer.Option(
+        DEFAULT_WORK_DIR, "--work", "-w", help="Base directory for artifacts.",
+    ),
+    model: str | None = typer.Option(
+        None, "--model", "-m",
+        help="Override the style model.",
+    ),
+    parallelism: int | None = typer.Option(
+        None, "--parallelism", "-j",
+        help="Number of chunks to process concurrently.",
+    ),
+) -> None:
+    """Run the style pass: fix calques, bureaucratic language, improve voice.
+
+    Reads from the latest available stage (waterfall) and stores
+    results as stage='style'.
+    """
+    _run_postprocess_cmd(
+        stage="style",
+        prompt_path=Path("prompts/style.md"),
+        epub=epub,
+        series=series,
+        glossary_path=glossary_path,
+        config_path=config_path,
+        work_dir=work_dir,
+        model_override=model,
+        parallelism=parallelism,
+    )
+
+
+# ---------------------------------------------------------------------------
+# verify (standalone)
+# ---------------------------------------------------------------------------
+
+
+@app.command("verify")
+def verify_cmd(
+    epub: Path = typer.Argument(..., exists=True, dir_okay=False, help="Source EPUB."),
+    series: str | None = typer.Option(
+        None, "--series", "-s",
+        help="Series slug for glossary context.",
+    ),
+    glossary_path: Path | None = typer.Option(
+        None, "--glossary", "-g",
+        exists=True, dir_okay=False,
+        help="Path to a single-book glossary.json.",
+    ),
+    config_path: Path = typer.Option(
+        DEFAULT_CONFIG, "--config", "-c", help="YAML config file.",
+    ),
+    work_dir: Path = typer.Option(
+        DEFAULT_WORK_DIR, "--work", "-w", help="Base directory for artifacts.",
+    ),
+    model: str | None = typer.Option(
+        None, "--model", "-m",
+        help="Override the verify model.",
+    ),
+    parallelism: int | None = typer.Option(
+        None, "--parallelism", "-j",
+        help="Number of chunks to process concurrently.",
+    ),
+) -> None:
+    """Run the verify pass: check accuracy against original, fix omissions.
+
+    Reads from the latest available stage (waterfall) and stores
+    results as stage='verify'. Requires the original EPUB for comparison.
+    """
+    _run_postprocess_cmd(
+        stage="verify",
+        prompt_path=Path("prompts/verify.md"),
+        epub=epub,
+        series=series,
+        glossary_path=glossary_path,
+        config_path=config_path,
+        work_dir=work_dir,
+        model_override=model,
+        parallelism=parallelism,
+    )
+
+
+# ---------------------------------------------------------------------------
+# shared postprocess runner
+# ---------------------------------------------------------------------------
+
+
+def _run_postprocess_cmd(
+    stage: str,
+    prompt_path: Path,
+    epub: Path,
+    series: str | None,
+    glossary_path: Path | None,
+    config_path: Path,
+    work_dir: Path,
+    model_override: str | None,
+    parallelism: int | None,
+) -> None:
+    """Shared implementation for proofread/style/verify standalone commands."""
+    from .pipeline_helpers import (
+        collect_chunk_originals,
+        collect_waterfall_paragraphs,
+        verify_chunker_params,
+    )
+    from .postprocess import PostProcessor
+
+    cfg = load_config(config_path if config_path.exists() else None)
+
+    console.print(f"[bold]Reading EPUB:[/bold] {epub}")
+    book = read_book_structured(epub)
+    console.print(f"[bold]Book:[/bold] {book.meta.title}")
+
+    glossary = _resolve_glossary(series, glossary_path, work_dir, cfg, book)
+
+    wd = WorkDir.for_book(work_dir, book.meta.title)
+    cache = Cache(wd.cache_path)
+
+    try:
+        # Verify translated chunks exist
+        translate_ids = cache.get_all_chunk_ids_for_stage("translate")
+        if not translate_ids:
+            console.print(
+                "[red]No translated chunks found. Run translate first.[/red]"
+            )
+            raise typer.Exit(code=1)
+
+        # Verify chunker config
+        try:
+            verify_chunker_params(
+                cache, cfg.chunker.target_words, cfg.chunker.overlap_paragraphs
+            )
+        except ChunkerConfigMismatchError as e:
+            console.print(f"[red]Error:[/red] {e}")
+            raise typer.Exit(code=1) from e
+
+        # Build chunk set for paragraph counts and originals
+        chunk_set = chunk_book(
+            book,
+            target_words=cfg.chunker.target_words,
+            overlap_paragraphs=cfg.chunker.overlap_paragraphs,
+        )
+
+        # Build paragraph count map
+        paragraph_counts = {
+            chunk.id: len(chunk.paragraph_indexes)
+            for chunk in chunk_set.chunks
+        }
+
+        # Scope to current chunk_set IDs intersected with cache
+        current_chunk_ids = [chunk.id for chunk in chunk_set.chunks]
+        translate_id_set = set(translate_ids)
+        valid_chunk_ids = [
+            cid for cid in current_chunk_ids if cid in translate_id_set
+        ]
+
+        # Collect waterfall translations parsed into paragraphs
+        waterfall_paragraphs = collect_waterfall_paragraphs(
+            cache, valid_chunk_ids, stage, paragraph_counts
+        )
+
+        if not waterfall_paragraphs:
+            console.print(
+                f"[yellow]No chunks with parseable translations for {stage} pass.[/yellow]"
+            )
+            return
+
+        # For verify stage, also collect originals
+        originals_map: dict[str, str] | None = None
+        if stage == "verify":
+            originals_map_raw = collect_chunk_originals(
+                chunk_set, list(waterfall_paragraphs.keys())
+            )
+            originals_map = originals_map_raw
+
+        # Build chunks_data for PostProcessor
+        chunks_data = []
+        for cid, paragraphs in sorted(waterfall_paragraphs.items()):
+            entry: dict = {
+                "chunk_id": cid,
+                "translated_paragraphs": paragraphs,
+            }
+            if stage == "verify" and originals_map:
+                entry["original_text"] = originals_map.get(cid, "")
+            chunks_data.append(entry)
+
+        console.print(
+            f"[bold]Stage:[/bold] {stage}\n"
+            f"[bold]Chunks:[/bold] {len(chunks_data)}"
+        )
+
+        # Resolve model
+        model_map = {
+            "proofread": cfg.models.proofread,
+            "style": cfg.models.style,
+            "verify": cfg.models.verify,
+        }
+        chosen_model = model_override or model_map.get(stage, cfg.models.translate)
+        console.print(f"[bold]Model:[/bold] {chosen_model}")
+
+        processor = PostProcessor(
+            provider=create_provider(),
+            prompt_path=prompt_path,
+            cache=cache,
+            glossary=glossary,
+            stage=stage,
+            model=chosen_model,
+            source_lang=cfg.source_lang,
+            target_lang=cfg.target_lang,
+        )
+
+        effective_parallelism = parallelism or 4
+
+        with Progress(
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            MofNCompleteColumn(),
+            TimeElapsedColumn(),
+            console=console,
+        ) as progress:
+            ptask = progress.add_task(stage, total=len(chunks_data))
+
+            def on_progress(done, total, cid, pstats):
+                progress.update(
+                    ptask,
+                    completed=done,
+                    description=(
+                        f"{stage} | cached {pstats.chunks_cached} "
+                        f"new {pstats.chunks_processed} "
+                        f"failed {pstats.chunks_failed}"
+                    ),
+                )
+
+            pp_stats = processor.process_chunks(
+                chunks_data,
+                on_progress=on_progress,
+                parallelism=effective_parallelism,
+            )
+
+        console.print(
+            f"\n[bold]{stage.capitalize()} results:[/bold]\n"
+            f"  Changed: {pp_stats.chunks_changed}/{pp_stats.chunks_total}\n"
+            f"  Unchanged: {pp_stats.chunks_unchanged}/{pp_stats.chunks_total}\n"
+            f"  Failed: {pp_stats.chunks_failed}/{pp_stats.chunks_total}\n"
+            f"[dim]Tokens: {pp_stats.input_tokens:,} in, "
+            f"{pp_stats.output_tokens:,} out.[/dim]"
+        )
+    finally:
+        cache.close()
 
 
 # ---------------------------------------------------------------------------
