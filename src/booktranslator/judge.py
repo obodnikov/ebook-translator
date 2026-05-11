@@ -112,11 +112,17 @@ class Judge:
 
         try:
             data = json.loads(text)
-        except json.JSONDecodeError as e:
-            raise ValueError(
-                f"Judge response is not valid JSON: {e}. "
-                f"First 200 chars: {text[:200]!r}"
-            ) from e
+        except json.JSONDecodeError:
+            # Model sometimes appends explanation after valid JSON.
+            # Try to extract the first JSON object using raw_decode.
+            decoder = json.JSONDecoder()
+            try:
+                data, _ = decoder.raw_decode(text)
+            except json.JSONDecodeError as e2:
+                raise ValueError(
+                    f"Judge response is not valid JSON: {e2}. "
+                    f"First 200 chars: {text[:200]!r}"
+                ) from e2
 
         raw_score = data.get("score")
         if raw_score is None:

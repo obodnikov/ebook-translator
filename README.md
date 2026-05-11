@@ -245,11 +245,15 @@ btrans translate path/to/book.epub -j 8
 - Собирается новый EPUB: `books/extracted/<slug>-ru.epub` рядом с
   оригиналом (путь можно переопределить через `--out`).
 
-Время на ~100K слов / 60 chunks: 15–25 минут при `-j 8`
-(translate ~12 мин + judge ~1 мин + reflect ~3 мин +
-proofread ~2 мин + style ~5 мин + verify ~5 мин).
-Стоимость: ~$8–12 (translate ~$4–5, judge ~$0.11, reflect ~$0.5–1,
-proofread ~$0.3, style ~$1.5, verify ~$1.5).
+Время на ~115K слов / 102 chunks: ~50 минут при `-j 8`
+(translate ~16 мин + judge ~0.5 мин + proofread ~8 мин +
+style ~13 мин + verify ~13 мин).
+Стоимость: ~$20–25 на книгу ~115K слов (полный pipeline с glossary).
+Разбивка по моделям (реальный прогон "Shroud", 102 chunks):
+- Claude Sonnet 4.6: ~$21 (glossary + translate + style + verify)
+- Claude Haiku 4.5: ~$3 (judge + proofread)
+- Итого: ~$24
+Для книги ~60K слов / 60 chunks — пропорционально ~$12–14.
 
 Повторный запуск той же команды — мгновенно из SQLite-кэша
 (`work/<book-slug>/cache.sqlite`), LLM не зовётся.
