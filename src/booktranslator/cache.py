@@ -340,12 +340,30 @@ class Cache:
             "SELECT chunk_id, content FROM cache WHERE stage = 'judge'"
         ).fetchall()
         results = []
+        decoder = json.JSONDecoder()
         for chunk_id, content in rows:
             # Judge content is JSON: {score: N, issues: [...]}
+            # Model often wraps in code fences and/or appends explanation.
+            parsed: dict[str, Any]
+            text = (content or "").strip()
+
+            # Strip code fences if present
+            if text.startswith("```"):
+                lines = text.splitlines()
+                if lines[0].startswith("```"):
+                    lines = lines[1:]
+                if lines and lines[-1].startswith("```"):
+                    lines = lines[:-1]
+                text = "\n".join(lines).strip()
+
             try:
-                parsed = json.loads(content)
+                parsed = json.loads(text)
             except (json.JSONDecodeError, TypeError):
-                parsed = {"score": 0, "issues": ["parse error"]}
+                # Trailing text after valid JSON — use raw_decode
+                try:
+                    parsed, _ = decoder.raw_decode(text)
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    parsed = {"score": 0, "issues": ["parse error"]}
             parsed["chunk_id"] = chunk_id or ""
             results.append(parsed)
         return results

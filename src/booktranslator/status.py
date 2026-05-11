@@ -195,3 +195,91 @@ def get_chunk_diff(cache: Cache, chunk_id: str, stages_filter: list[str] | None 
         }
         for s in all_stages
     ]
+
+
+# ------------------------------------------------------------------
+# Grid report: chunk × stage matrix with changed/unchanged info
+# ------------------------------------------------------------------
+
+# Waterfall order for grid columns (judge is metadata-only, not in waterfall)
+_GRID_STAGES = ["translate", "proofread", "style", "verify"]
+_GRID_STAGES_WITH_REFLECT = ["translate", "reflect", "proofread", "style", "verify"]
+
+
+@dataclass
+class GridCell:
+    """Status of one chunk in one stage."""
+    present: bool
+    changed: bool | None  # None if not applicable (e.g. translate has no "previous")
+
+
+@dataclass
+class GridRow:
+    chunk_id: str
+    judge_score: int | None
+    cells: dict[str, GridCell]  # stage -> GridCell
+
+
+def build_grid(cache: Cache) -> list[GridRow]:
+    """Build the chunk × stage grid with changed/unchanged detection."""
+    import json as _json
+
+    translate_ids = cache.get_all_chunk_ids_for_stage("translate")
+    if not translate_ids:
+        return []
+
+    # Determine if reflect stage is used at all
+    reflect_ids = set(cache.get_all_chunk_ids_for_stage("reflect"))
+    stages = _GRID_STAGES_WITH_REFLECT if reflect_ids else _GRID_STAGES
+
+    # Bulk-fetch all stages for all chunks
+    all_chunk_stages = cache.get_stages_for_chunks_bulk(sorted(translate_ids))
+
+    # Get judge scores
+    judge_scores: dict[str, int] = {}
+    decoder = _json.JSONDecoder()
+    judge_rows = cache.get_judge_scores()
+    for jr in judge_rows:
+        cid = jr.get("chunk_id", "")
+        score = jr.get("score", 0)
+        try:
+            judge_scores[cid] = int(score)
+        except (TypeError, ValueError):
+            judge_scores[cid] = 0
+
+    rows: list[GridRow] = []
+    for chunk_id in sorted(translate_ids):
+        chunk_stages_list = all_chunk_stages.get(chunk_id, [])
+        # Build {stage: content} map
+        stage_content: dict[str, str] = {}
+        for info in chunk_stages_list:
+            if info.stage in stages or info.stage == "judge":
+                stage_content[info.stage] = info.content
+
+        cells: dict[str, GridCell] = {}
+        for i, stage in enumerate(stages):
+            if stage not in stage_content:
+                cells[stage] = GridCell(present=False, changed=None)
+            elif stage == "translate":
+                # translate is always "changed" (it's the base)
+                cells[stage] = GridCell(present=True, changed=None)
+            else:
+                # Compare with the previous stage in waterfall that exists
+                prev_content = None
+                for prev_stage in reversed(stages[:i]):
+                    if prev_stage in stage_content:
+                        prev_content = stage_content[prev_stage]
+                        break
+                if prev_content is None:
+                    cells[stage] = GridCell(present=True, changed=None)
+                else:
+                    changed = stage_content[stage].strip() != prev_content.strip()
+                    cells[stage] = GridCell(present=True, changed=changed)
+
+        rows.append(GridRow(
+            chunk_id=chunk_id,
+            judge_score=judge_scores.get(chunk_id),
+            cells=cells,
+        ))
+
+    return rows

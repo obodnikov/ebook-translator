@@ -1715,6 +1715,10 @@ def status_overview(
         False, "--assembly-map",
         help="Show which stage each chunk will use at assembly.",
     ),
+    grid: bool = typer.Option(
+        False, "--grid",
+        help="Show chunk × stage matrix with changed/unchanged status.",
+    ),
 ) -> None:
     """Inspect the translation state of a book."""
     from .status import (
@@ -1730,7 +1734,7 @@ def status_overview(
 
     cache = Cache(cache_path)
     try:
-        _run_status(cache, work_path, scores, below, diff, stages_filter, assembly_map)
+        _run_status(cache, work_path, scores, below, diff, stages_filter, assembly_map, grid)
     finally:
         cache.close()
 
@@ -1743,15 +1747,17 @@ def _run_status(
     diff: str | None,
     stages_filter: str | None,
     assembly_map: bool,
+    grid: bool,
 ) -> None:
     """Inner logic for status command (cache is managed by caller)."""
     from .status import (
+        build_grid,
         build_status_report,
         get_chunk_diff,
         get_scores,
     )
 
-    # --diff mode: show passes for a specific chunk
+    # --diff mode: show diffs between stages for a specific chunk
     if diff:
         filter_list = stages_filter.split(",") if stages_filter else None
         entries = get_chunk_diff(cache, diff, filter_list)
@@ -1759,18 +1765,139 @@ def _run_status(
             console.print(f"[yellow]No cached entries for chunk {diff!r}[/yellow]")
             return
 
-        console.print(f"\n[bold]Chunk:[/bold] {diff}")
-        console.print(f"[dim]Available stages: {', '.join(e['stage'] for e in entries)}[/dim]\n")
+        # Filter to waterfall stages only (skip judge which is metadata)
+        waterfall_entries = [e for e in entries if e["stage"] != "judge"]
 
-        for entry in entries:
-            console.print(f"[bold cyan]─── {entry['stage']} ───[/bold cyan] "
-                          f"[dim]({entry['model']}, {entry['created_at']})[/dim]")
-            # Show first ~800 chars of content for readability
-            content = entry["content"]
-            if len(content) > 800:
-                content = content[:800] + "\n[dim]... (truncated, use btrans cache export for full)[/dim]"
-            console.print(content)
+        console.print(f"\n[bold]Chunk:[/bold] {diff}")
+        console.print(f"[dim]Stages: {', '.join(e['stage'] for e in waterfall_entries)}[/dim]\n")
+
+        if len(waterfall_entries) == 0:
+            console.print("[yellow]No waterfall stages found.[/yellow]")
+            return
+
+        # Show first stage (translate) as-is, then diffs between consecutive stages
+        import difflib
+
+        first = waterfall_entries[0]
+        console.print(f"[bold cyan]─── {first['stage']} ───[/bold cyan] "
+                      f"[dim]({first['model']}, {first['created_at']})[/dim]")
+        console.print(first["content"])
+        console.print()
+
+        for i in range(1, len(waterfall_entries)):
+            prev = waterfall_entries[i - 1]
+            curr = waterfall_entries[i]
+
+            prev_lines = prev["content"].splitlines(keepends=True)
+            curr_lines = curr["content"].splitlines(keepends=True)
+
+            diff_lines = list(difflib.unified_diff(
+                prev_lines, curr_lines,
+                fromfile=prev["stage"], tofile=curr["stage"],
+                lineterm="",
+            ))
+
+            console.print(f"[bold cyan]─── {curr['stage']} ───[/bold cyan] "
+                          f"[dim]({curr['model']}, {curr['created_at']})[/dim]")
+
+            if not diff_lines:
+                console.print("[dim]  (no changes)[/dim]")
+            else:
+                for line in diff_lines:
+                    line = line.rstrip("\n")
+                    if line.startswith("+++") or line.startswith("---"):
+                        console.print(f"[dim]{line}[/dim]")
+                    elif line.startswith("@@"):
+                        console.print(f"[blue]{line}[/blue]")
+                    elif line.startswith("+"):
+                        console.print(f"[green]{line}[/green]")
+                    elif line.startswith("-"):
+                        console.print(f"[red]{line}[/red]")
+                    else:
+                        console.print(f"[dim]{line}[/dim]")
             console.print()
+        return
+
+    # --grid mode: chunk × stage matrix
+    if grid:
+        grid_rows = build_grid(cache)
+        if not grid_rows:
+            console.print("[yellow]No translated chunks in cache.[/yellow]")
+            return
+
+        # Determine which stages are present
+        all_stages_present = set()
+        for row in grid_rows:
+            for stage, cell in row.cells.items():
+                if cell.present:
+                    all_stages_present.add(stage)
+
+        # Column order
+        from .status import _GRID_STAGES_WITH_REFLECT, _GRID_STAGES
+        stages_order = _GRID_STAGES_WITH_REFLECT if "reflect" in all_stages_present else _GRID_STAGES
+
+        table = Table(
+            title="Chunk × Stage grid",
+            show_header=True,
+            show_lines=False,
+        )
+        table.add_column("Chunk", style="cyan")
+        table.add_column("★", justify="center", width=2)
+        for stage in stages_order:
+            table.add_column(stage[:5], justify="center", width=5)
+        table.add_column("Source", style="dim")
+
+        # Summary counters
+        stage_changed: dict[str, int] = {s: 0 for s in stages_order}
+        stage_unchanged: dict[str, int] = {s: 0 for s in stages_order}
+
+        for row in grid_rows:
+            score_str = ""
+            if row.judge_score is not None:
+                if row.judge_score >= 4:
+                    score_str = f"[green]{row.judge_score}[/green]"
+                elif row.judge_score == 3:
+                    score_str = f"[yellow]{row.judge_score}[/yellow]"
+                elif row.judge_score > 0:
+                    score_str = f"[red]{row.judge_score}[/red]"
+                else:
+                    score_str = "[dim]?[/dim]"
+
+            cells_str: list[str] = []
+            # Track the effective source for this chunk
+            effective_source = "translate"
+            for stage in stages_order:
+                cell = row.cells.get(stage)
+                if cell is None or not cell.present:
+                    cells_str.append("[dim]—[/dim]")
+                elif cell.changed is None:
+                    # translate (base) — always present
+                    cells_str.append("[bold]✓[/bold]")
+                    effective_source = stage
+                elif cell.changed:
+                    cells_str.append("[green]Δ[/green]")
+                    effective_source = stage
+                    stage_changed[stage] += 1
+                else:
+                    cells_str.append("[dim]=[/dim]")
+                    stage_unchanged[stage] += 1
+
+            table.add_row(row.chunk_id, score_str, *cells_str, effective_source)
+
+        console.print(table)
+
+        # Summary line
+        total = len(grid_rows)
+        summary_parts = []
+        for stage in stages_order:
+            if stage == "translate":
+                continue
+            c = stage_changed.get(stage, 0)
+            u = stage_unchanged.get(stage, 0)
+            if c + u > 0:
+                summary_parts.append(f"{stage}: {c}Δ {u}=")
+        console.print(f"\n[dim]Legend: ✓=base  Δ=changed  =[dim]=unchanged  —=not run[/dim]")
+        console.print(f"[dim]Totals ({total} chunks): {' | '.join(summary_parts)}[/dim]\n")
         return
 
     # --scores mode
