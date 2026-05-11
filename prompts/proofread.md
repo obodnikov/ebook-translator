@@ -1,8 +1,8 @@
 ---
-version: 1
+version: 2
 model: anthropic/claude-haiku-4.5
 temperature: 0.2
-max_tokens: 12000
+max_tokens: 8000
 ---
 
 # System
@@ -29,16 +29,29 @@ You will receive a translated text as XHTML paragraphs (marked
 - Do NOT add or remove content.
 - Preserve ALL XHTML tags exactly as they are. Do not add, remove,
   or reorder any tags or attributes.
-- If the text has no errors, output it unchanged.
 
-## Output format
+## Output format — DELTA MODE
 
-Your response MUST contain exactly as many `===PARAGRAPH N===` sections
-as the input. For every paragraph, output the marker line followed by
-the corrected XHTML fragment on its own lines.
+If the text has NO errors at all, respond with exactly:
+```
+NO_CHANGES
+```
 
-No preamble. No commentary. No explanations. No code fences. Start
-directly with `===PARAGRAPH 1===`.
+If there ARE errors to fix, respond with ONLY the corrected paragraphs
+in this JSON format:
+```json
+[
+  {"p": 3, "text": "<p ...>corrected paragraph 3 here</p>"},
+  {"p": 7, "text": "<p ...>corrected paragraph 7 here</p>"}
+]
+```
+
+Rules for delta output:
+- Include ONLY paragraphs that you actually changed.
+- `p` is the 1-based paragraph number from the input markers.
+- `text` is the full corrected XHTML of that paragraph.
+- Do NOT include unchanged paragraphs.
+- No preamble. No commentary. No explanations outside the JSON.
 
 # User
 

@@ -8,10 +8,16 @@ Waterfall input order:
   - proofread reads from: reflect > translate
   - style reads from: proofread > reflect > translate
   - verify reads from: style > proofread > reflect > translate
+
+Delta mode (v2 prompts):
+  The model returns only changed paragraphs as JSON patches or
+  NO_CHANGES, drastically reducing output tokens. The full text is
+  reconstructed before caching so downstream stages work unchanged.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import threading
@@ -161,6 +167,190 @@ class PostProcessor:
             )
         return fragments
 
+    def _parse_delta_response(
+        self, raw_text: str, input_paragraphs: list[str]
+    ) -> tuple[list[str], bool]:
+        """Parse a delta-mode response (NO_CHANGES or JSON patches).
+
+        Returns:
+            (output_paragraphs, changed) — the full list of paragraphs
+            with patches applied, and whether anything changed.
+
+        Raises ValueError if the response can't be parsed as delta.
+        """
+        text = raw_text.strip()
+
+        # Strip code fences if present
+        if text.startswith("```"):
+            lines = text.splitlines()
+            if lines[0].startswith("```"):
+                lines = lines[1:]
+            if lines and lines[-1].startswith("```"):
+                lines = lines[:-1]
+            text = "\n".join(lines).strip()
+
+        # Check for NO_CHANGES
+        if text.upper().replace("_", "").replace(" ", "") == "NOCHANGES":
+            return list(input_paragraphs), False
+
+        # Parse JSON array of patches
+        # First, try to find JSON array in the text (model may prepend reasoning)
+        json_start = text.find("[")
+        if json_start > 0:
+            # There's text before the JSON — try parsing from the [ onwards
+            text_from_bracket = text[json_start:]
+            try:
+                patches = json.loads(text_from_bracket)
+                if isinstance(patches, list):
+                    logger.debug(
+                        "Found JSON array at offset %d (skipped %d chars of preamble)",
+                        json_start, json_start,
+                    )
+                    return self._apply_patches(patches, input_paragraphs)
+            except json.JSONDecodeError:
+                pass
+
+        try:
+            patches = json.loads(text)
+        except json.JSONDecodeError:
+            # Try raw_decode in case of trailing text
+            decoder = json.JSONDecoder()
+            try:
+                patches, _ = decoder.raw_decode(text)
+            except (json.JSONDecodeError, ValueError):
+                # Last resort: try to salvage truncated JSON array.
+                # If the response was cut off mid-entry, try closing it.
+                # Also try from the first [ if there's preamble text
+                salvage_text = text
+                if json_start > 0:
+                    salvage_text = text[json_start:]
+                salvaged = self._try_salvage_truncated_json(salvage_text)
+                if salvaged is not None:
+                    patches = salvaged
+                else:
+                    raise ValueError(
+                        f"Delta response is not valid JSON or NO_CHANGES. "
+                        f"First 200 chars: {text[:200]!r}"
+                    )
+
+        if not isinstance(patches, list):
+            raise ValueError(
+                f"Delta response is not a JSON array. Got: {type(patches).__name__}"
+            )
+
+        return self._apply_patches(patches, input_paragraphs)
+
+    def _apply_patches(
+        self, patches: list, input_paragraphs: list[str]
+    ) -> tuple[list[str], bool]:
+        """Apply a list of patch dicts to input paragraphs.
+
+        Returns (output_paragraphs, changed).
+        """
+        if not isinstance(patches, list):
+            raise ValueError(
+                f"Delta response is not a JSON array. Got: {type(patches).__name__}"
+            )
+
+        if len(patches) == 0:
+            return list(input_paragraphs), False
+
+        # Apply patches
+        output = list(input_paragraphs)
+        n = len(input_paragraphs)
+        for patch in patches:
+            if not isinstance(patch, dict):
+                raise ValueError(f"Patch entry is not an object: {patch!r}")
+            p_idx = patch.get("p")
+            p_text = patch.get("text")
+            if p_idx is None or p_text is None:
+                raise ValueError(
+                    f"Patch missing 'p' or 'text': {patch!r}"
+                )
+            # p is 1-based
+            idx = int(p_idx) - 1
+            if idx < 0 or idx >= n:
+                raise ValueError(
+                    f"Patch paragraph index {p_idx} out of range 1..{n}"
+                )
+            output[idx] = str(p_text).strip()
+
+        return output, True
+
+    def _is_delta_response(self, text: str) -> bool:
+        """Heuristic: does this response look like delta format?
+
+        Delta responses are either NO_CHANGES or start with [ (JSON array).
+        Legacy responses contain ===PARAGRAPH markers.
+        """
+        stripped = text.strip()
+        # Strip code fences for detection
+        if stripped.startswith("```"):
+            lines = stripped.splitlines()
+            if lines[0].startswith("```"):
+                lines = lines[1:]
+            if lines and lines[-1].startswith("```"):
+                lines = lines[:-1]
+            stripped = "\n".join(lines).strip()
+
+        if stripped.upper().replace("_", "").replace(" ", "") == "NOCHANGES":
+            return True
+        if stripped.startswith("["):
+            return True
+        # If it has paragraph markers, it's legacy full-text format
+        if _PARAGRAPH_MARKER_RE.search(stripped):
+            return False
+        # Ambiguous — try delta
+        return True
+
+    def _reconstruct_full_text(self, paragraphs: list[str]) -> str:
+        """Rebuild the full ===PARAGRAPH N=== format for cache storage."""
+        parts = []
+        for i, p in enumerate(paragraphs, 1):
+            parts.append(f"===PARAGRAPH {i}===")
+            parts.append(p)
+        return "\n".join(parts)
+
+    @staticmethod
+    def _try_salvage_truncated_json(text: str) -> list[dict] | None:
+        """Try to recover patches from a truncated JSON array.
+
+        If the model hit max_tokens mid-response, the JSON array may be
+        cut off. We try to find the last complete object and parse up to
+        there.
+
+        Returns the list of complete patch objects, or None if salvage fails.
+        """
+        # Find the last complete "}" that could end a patch object
+        # Strategy: progressively trim from the end until we get valid JSON
+        text = text.rstrip()
+
+        # Must start with [
+        if not text.startswith("["):
+            return None
+
+        # Try closing the array at each } from the end
+        last_brace = text.rfind("}")
+        while last_brace > 0:
+            candidate = text[:last_brace + 1] + "]"
+            try:
+                result = json.loads(candidate)
+                if isinstance(result, list) and all(
+                    isinstance(p, dict) and "p" in p and "text" in p
+                    for p in result
+                ):
+                    logger.info(
+                        "Salvaged %d patches from truncated JSON "
+                        "(%d/%d chars used)",
+                        len(result), last_brace + 1, len(text),
+                    )
+                    return result
+            except json.JSONDecodeError:
+                pass
+            last_brace = text.rfind("}", 0, last_brace)
+
+        return None
+
     def process_chunk(
         self,
         chunk_id: str,
@@ -208,28 +398,66 @@ class PostProcessor:
             )
             raw_text = result.text
             with self._lock:
-                self.cache.put(
-                    key=cache_key,
-                    stage=self.stage,
-                    model=self.model,
-                    prompt_version=self.prompt.version,
-                    content=raw_text,
-                    input_tokens=result.input_tokens,
-                    output_tokens=result.output_tokens,
-                    meta={"chunk_id": chunk_id},
-                )
                 stats.chunks_processed += 1
                 stats.input_tokens += result.input_tokens
                 stats.output_tokens += result.output_tokens
 
-        # Parse and validate paragraph count
+        # Parse response: detect delta vs legacy full-text format
         expected = len(translated_paragraphs)
-        _fragments = self._parse_response(raw_text, expected)
 
-        # Determine if content changed
-        input_joined = "\n".join(translated_paragraphs).strip()
-        output_joined = "\n".join(_fragments).strip()
-        changed = input_joined != output_joined
+        if self._is_delta_response(raw_text):
+            # Delta mode: parse patches and reconstruct full text
+            try:
+                output_paragraphs, changed = self._parse_delta_response(
+                    raw_text, translated_paragraphs
+                )
+            except ValueError:
+                # Delta parse failed — log raw response length for debugging
+                logger.debug(
+                    "%s chunk delta parse failed, raw response %d chars "
+                    "(max_tokens=%s). Last 100: %r",
+                    self.stage, len(raw_text),
+                    self.prompt.max_tokens, raw_text[-100:],
+                )
+                raise
+            # Store reconstructed full text in cache (not the raw delta)
+            # so downstream stages can read it as normal ===PARAGRAPH=== format
+            full_text = self._reconstruct_full_text(output_paragraphs)
+            if cached is None:
+                with self._lock:
+                    self.cache.put(
+                        key=cache_key,
+                        stage=self.stage,
+                        model=self.model,
+                        prompt_version=self.prompt.version,
+                        content=full_text,
+                        input_tokens=result.input_tokens,
+                        output_tokens=result.output_tokens,
+                        meta={"chunk_id": chunk_id, "delta": True},
+                    )
+        else:
+            # Legacy full-text format: parse paragraph markers
+            _fragments = self._parse_response(raw_text, expected)
+            output_paragraphs = _fragments
+
+            # Determine if content changed
+            input_joined = "\n".join(translated_paragraphs).strip()
+            output_joined = "\n".join(_fragments).strip()
+            changed = input_joined != output_joined
+
+            # Store raw text in cache (legacy format, already has markers)
+            if cached is None:
+                with self._lock:
+                    self.cache.put(
+                        key=cache_key,
+                        stage=self.stage,
+                        model=self.model,
+                        prompt_version=self.prompt.version,
+                        content=raw_text,
+                        input_tokens=result.input_tokens,
+                        output_tokens=result.output_tokens,
+                        meta={"chunk_id": chunk_id},
+                    )
 
         with self._lock:
             if changed:
@@ -241,7 +469,7 @@ class PostProcessor:
             chunk_id=chunk_id,
             stage=self.stage,
             changed=changed,
-            content=raw_text,
+            content=self._reconstruct_full_text(output_paragraphs) if self._is_delta_response(raw_text) else raw_text,
         )
         with self._lock:
             stats.results.append(pp_result)

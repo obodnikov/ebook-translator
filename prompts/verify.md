@@ -1,8 +1,8 @@
 ---
-version: 1
+version: 2
 model: anthropic/claude-sonnet-4.6
 temperature: 0.2
-max_tokens: 12000
+max_tokens: 8000
 ---
 
 # System
@@ -33,7 +33,6 @@ Check and fix ONLY:
 - Do NOT fix grammar or punctuation (that's the proofreader's job).
 - Preserve ALL XHTML tags exactly as they are. Do not add, remove,
   or reorder any tags or attributes.
-- If the translation is accurate, output it unchanged.
 - Be conservative: only change what is clearly wrong in terms of
   meaning or completeness.
 
@@ -41,14 +40,34 @@ Check and fix ONLY:
 
 {{ glossary_block }}
 
-## Output format
+## Output format — DELTA MODE
 
-Your response MUST contain exactly as many `===PARAGRAPH N===` sections
-as the input TRANSLATION block. For every paragraph, output the marker
-line followed by the verified/corrected XHTML fragment on its own lines.
+CRITICAL: Your response must be ONLY one of the two formats below.
+Do NOT include any reasoning, analysis, or commentary. Do NOT explain
+your thought process. Output ONLY the result.
 
-No preamble. No commentary. No explanations. No code fences. Start
-directly with `===PARAGRAPH 1===`.
+If the translation is fully accurate and needs NO corrections, respond
+with exactly:
+```
+NO_CHANGES
+```
+
+If there ARE accuracy issues to fix, respond with ONLY the corrected
+paragraphs in this JSON format:
+```json
+[
+  {"p": 3, "text": "<p ...>corrected paragraph 3 here</p>"},
+  {"p": 7, "text": "<p ...>corrected paragraph 7 here</p>"}
+]
+```
+
+Rules for delta output:
+- Include ONLY paragraphs that you actually changed.
+- `p` is the 1-based paragraph number from the input markers.
+- `text` is the full corrected XHTML of that paragraph.
+- Do NOT include unchanged paragraphs.
+- No preamble. No reasoning. No commentary. No explanations.
+- Your ENTIRE response must be either `NO_CHANGES` or a JSON array.
 
 # User
 

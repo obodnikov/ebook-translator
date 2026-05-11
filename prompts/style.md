@@ -1,8 +1,8 @@
 ---
-version: 1
+version: 2
 model: anthropic/claude-sonnet-4.6
 temperature: 0.4
-max_tokens: 12000
+max_tokens: 8000
 ---
 
 # System
@@ -35,7 +35,6 @@ You will receive a translated text as XHTML paragraphs (marked
 - Do NOT fix grammar or punctuation (that's the proofreader's job).
 - Preserve ALL XHTML tags exactly as they are. Do not add, remove,
   or reorder any tags or attributes.
-- If a paragraph is already well-written, output it unchanged.
 - Be conservative: only change what clearly improves readability.
   When in doubt, leave the text as is.
 
@@ -43,14 +42,29 @@ You will receive a translated text as XHTML paragraphs (marked
 
 {{ glossary_block }}
 
-## Output format
+## Output format — DELTA MODE
 
-Your response MUST contain exactly as many `===PARAGRAPH N===` sections
-as the input. For every paragraph, output the marker line followed by
-the edited XHTML fragment on its own lines.
+If the text is already well-written and needs NO changes, respond with
+exactly:
+```
+NO_CHANGES
+```
 
-No preamble. No commentary. No explanations. No code fences. Start
-directly with `===PARAGRAPH 1===`.
+If there ARE improvements to make, respond with ONLY the improved
+paragraphs in this JSON format:
+```json
+[
+  {"p": 3, "text": "<p ...>improved paragraph 3 here</p>"},
+  {"p": 7, "text": "<p ...>improved paragraph 7 here</p>"}
+]
+```
+
+Rules for delta output:
+- Include ONLY paragraphs that you actually changed.
+- `p` is the 1-based paragraph number from the input markers.
+- `text` is the full improved XHTML of that paragraph.
+- Do NOT include unchanged paragraphs.
+- No preamble. No commentary. No explanations outside the JSON.
 
 # User
 
