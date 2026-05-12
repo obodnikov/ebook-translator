@@ -5,8 +5,8 @@
 > ведёт словарь терминов на уровне книги и серии для единообразия имён,
 > кэширует переводы на уровне фрагмента.
 
-Статус: версия 0.3. Работает от начала до конца с полным конвейером качества
-(`glossary → promote → translate → judge → reflect → proofread → style → verify`).
+Статус: версия 0.4. Работает от начала до конца с полным конвейером качества
+(`glossary → promote → translate → judge → reflect → proofread → style → verify → assemble с reader notes`).
 Оператор ведёт процесс вручную. Подробности — в [`IMPLEMENTATION_PLAN.md`](IMPLEMENTATION_PLAN.md).
 
 ---
@@ -481,6 +481,70 @@ btrans assemble work/broken-homes/ --from proofread --epub book.epub --out proof
 btrans assemble work/broken-homes/ --from style --epub book.epub --out styled.epub
 ```
 
+### Читательские сноски из словаря (reader notes)
+
+При сборке EPUB можно автоматически добавить подстрочные сноски
+(EPUB footnotes) для терминов из словаря. Сноски формируются из
+поля `notes` записей словаря — никаких вызовов языковой модели,
+чисто детерминистическая пост-обработка.
+
+**Зачем:** русскому читателю британского криминально-мистического
+романа непонятны без контекста полицейские аббревиатуры (DCI, TSG),
+латинские заклинания (vestigium, forma), отсылки к поп-культуре.
+Официальные переводы решают это сносками — у нас та же информация
+уже есть в словаре.
+
+**Как работает:**
+1. Фильтруются записи словаря по типу (по умолчанию `concept` и `term`)
+   и наличию поля `notes`.
+2. Для каждой главы (в порядке spine) ищется `translation` в тексте.
+3. Первое вхождение (по scope) оборачивается в EPUB footnote-ref,
+   текст `notes` добавляется как `<aside epub:type="footnote">`.
+
+**Использование:**
+
+```bash
+# Сборка с читательскими сносками (книга в серии)
+btrans assemble work/broken-homes/ \
+  --epub books/extracted/broken-homes-ben-aaronovitch.epub \
+  --notes --series rivers-of-london
+
+# Сборка с читательскими сносками (отдельная книга)
+btrans assemble work/broken-homes/ \
+  --epub books/extracted/broken-homes-ben-aaronovitch.epub \
+  --notes --glossary work/broken-homes/glossary.json
+
+# Указать типы терминов для аннотирования
+btrans assemble work/broken-homes/ \
+  --epub books/extracted/broken-homes-ben-aaronovitch.epub \
+  --notes --series rivers-of-london \
+  --note-types concept,term,place
+
+# Без сносок (явно)
+btrans assemble work/broken-homes/ \
+  --epub books/extracted/broken-homes-ben-aaronovitch.epub \
+  --no-notes --series rivers-of-london
+```
+
+**Настройки** (`configs/default.yaml`):
+
+```yaml
+reader_notes:
+  enabled: false          # по умолчанию выключено, включается через --notes
+  types: [concept, term]  # какие типы терминов аннотировать
+  scope: first-in-book    # first-in-book | first-in-chapter | all
+```
+
+**Особенности:**
+- Для коротких терминов (≤4 символов) — строгое совпадение по границам
+  слова (чтобы «art» не совпало с «article»).
+- Для длинных терминов — допускаются суффиксы (русская морфология:
+  «вестигиум» совпадёт с «вестигиуме»).
+- Сноски не вставляются внутрь существующих ссылок (`<a>`) или
+  уже размеченных сносок — XHTML остаётся валидным.
+- `--notes` и `--no-notes` перекрывают значение из конфига.
+- `--series` и `--glossary` взаимоисключающие (как в `translate`).
+
 ### Посмотреть словарь серии
 
 ```bash
@@ -573,7 +637,9 @@ sqlite3 work/broken-homes/cache.sqlite \
   весь словарь серии идёт в каждый фрагмент (~15–20 тысяч токенов).
 - **Оценка стоимости до запуска** (`btrans estimate`) — версия 1.1.
 - **Перевод с венгерского на русский** — версия 1.2.
-- **Сноски для читателя из словаря** (`reader_note`) — версия 1.3.
+- **Перевод текста сносок на целевой язык** — версия 1.4. Сейчас
+  сноски из словаря вставляются на английском (поле `notes`).
+  Планируется батчевый перевод через Haiku (~$0.01 на серию).
 - **Венгерский и любые другие языковые пары** — версия 2.0.
 - **Снятие защиты от копирования (DRM)** — и не будем. Используйте Calibre + DeDRM отдельно
   на легально приобретённых книгах.
