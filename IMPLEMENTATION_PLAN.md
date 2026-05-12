@@ -519,15 +519,73 @@ Telegram-клиент, документация, тесты). ROI на теку�
 
 ### v1.3 — Reader notes from glossary
 
-- Поле `reader_note` в `SeriesGlossaryEntry`.
-- По умолчанию комментируем только `type=concept` (заклинания Ааронович:
-  vestigium, forma, sequestration...), scope `first-in-chapter`.
-- Конфиг `reader_notes.types: [concept]` расширяется до `term` (для DCI,
-  TSG) или `place` (для the Folly).
-- Per-entry `comment_override: "always" | "never" | null`.
-- Генерация: либо вручную, либо `prompts/notes_generate.md`.
-- Реализация — вариант A: инжектим в промпт перевода и просим модель
-  обернуть первое упоминание в EPUB footnote-ref.
+**Цель.** Автоматически добавлять читательские подстрочные сноски (EPUB
+footnotes) в финальный EPUB на основе глоссария серии. Без новых полей
+в модели — используем существующие `type`, `notes`, `translation`.
+
+**Почему не вариант A (инжекция в промпт перевода).** Перевод идёт
+chunk-ами параллельно (`-j 8`). Модель не знает, в каком chunk-е термин
+встречается впервые. Невозможно гарантировать "первое упоминание".
+
+**Реализация — вариант C (детерминистическая пост-обработка при сборке):**
+
+1. Перевод идёт как обычно, без сносок.
+2. На этапе `btrans assemble` (когда весь текст готов и порядок глав
+   известен):
+   - Фильтруем series glossary: `type in config.reader_notes.types`
+     AND `notes` не пустой.
+   - Для каждой главы (в порядке spine) ищем `entry.translation` в
+     тексте (точный substring match, case-insensitive).
+   - Первое вхождение (по `scope`) оборачиваем в
+     `<a epub:type="noteref" href="#note-N">[N]</a>`.
+   - В конец главы добавляем
+     `<aside epub:type="footnote" id="note-N"><p>notes text</p></aside>`.
+3. Текст сноски = поле `notes` из glossary (пока на английском, см. v1.4).
+
+**Конфиг** (`default.yaml`):
+
+```yaml
+reader_notes:
+  enabled: false
+  types: [concept, term]
+  scope: first-in-chapter  # first-in-chapter | first-in-book | all
+```
+
+**CLI:**
+
+```bash
+btrans assemble WORKDIR --notes                    # включить сноски
+btrans assemble WORKDIR --no-notes                 # без сносок (дефолт)
+btrans assemble WORKDIR --notes --note-types concept,term,place
+```
+
+**Плюсы:**
+- Детерминистический — никакой LLM, результат воспроизводим.
+- Работает с параллельным переводом — сноски ставятся после.
+- Нулевая стоимость API.
+- Откатываемо — `--no-notes` собирает чистый EPUB.
+- Не требует изменений в модели данных.
+
+**Ограничения:**
+- Точный match по `translation` может не найти склонённую форму
+  ("вестигиума", "Найтингейлу"). Для `concept` это менее критично —
+  латинские термины обычно не склоняются. Для `person`/`place`
+  морфология проблема, но они не в дефолтном фильтре.
+- `notes` сейчас на английском. Для русского читателя информативно,
+  но не идеально (см. v1.4).
+
+**Эстимейт.** ~4–6 часов (логика match + EPUB footnote injection +
+CLI-флаги + тесты).
+
+### v1.4 — Перевод notes на target_lang
+
+- Батчевый перевод поля `notes` для записей с `type in [concept, term]`
+  через Haiku — одним запросом все notes разом.
+- Результат сохраняется в отдельное поле или отдельный файл
+  `notes_translated.json` (чтобы не трогать series glossary).
+- `btrans assemble --notes` использует переведённые notes если доступны,
+  иначе fallback на оригинальные.
+- Стоимость: ~$0.01–0.02 на серию (50–100 notes × ~20 слов каждый).
 
 ### v2.0 — Any → Any
 
