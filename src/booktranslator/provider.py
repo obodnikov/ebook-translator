@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import base64
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from openai import OpenAI
 from tenacity import (
@@ -25,6 +26,17 @@ class CompletionResult:
     total_tokens: int
     model: str
     raw: dict
+
+
+@dataclass
+class ImageGenerationResult:
+    """Result of an image generation/edit call."""
+
+    image_bytes: bytes
+    mime_type: str
+    text: str  # any accompanying text from the model
+    model: str
+    raw: dict = field(default_factory=dict)
 
 
 class OpenRouterProvider:
@@ -52,6 +64,9 @@ class OpenRouterProvider:
             default_headers["X-OpenRouter-Title"] = (
                 app_name or os.environ["OPENROUTER_APP_NAME"]
             )
+
+        self._api_key = key
+        self._extra_headers = default_headers.copy()
 
         self.client = OpenAI(
             base_url=OPENROUTER_BASE_URL,
@@ -107,4 +122,167 @@ class OpenRouterProvider:
             total_tokens=total_tokens,
             model=response.model or model,
             raw=response.model_dump() if hasattr(response, "model_dump") else {},
+        )
+
+    @retry(
+        reraise=True,
+        retry=retry_if_exception_type((TimeoutError, ConnectionError, OSError)),
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=3, min=5, max=120),
+    )
+    def generate_image(
+        self,
+        model: str,
+        prompt: str,
+        *,
+        input_image: bytes | None = None,
+        input_mime_type: str = "image/jpeg",
+        aspect_ratio: str = "2:3",
+        image_size: str = "1K",
+    ) -> ImageGenerationResult:
+        """Generate or edit an image via OpenRouter's image generation API.
+
+        Uses the chat completions endpoint with modalities=["image", "text"]
+        as documented by OpenRouter.
+
+        Retries only on transient failures (timeouts, connection errors, 429,
+        5xx). Fails fast on permanent errors (400, 401, 403, 404).
+
+        Args:
+            model: OpenRouter model ID (e.g. google/gemini-3.1-flash-image-preview).
+            prompt: Text prompt describing the desired image/edit.
+            input_image: Optional source image bytes for editing.
+            input_mime_type: MIME type of the input image.
+            aspect_ratio: Output aspect ratio (default 2:3 for book covers).
+            image_size: Output resolution (1K, 2K, 4K).
+
+        Returns:
+            ImageGenerationResult with the generated image bytes.
+        """
+        import httpx
+
+        # Build the message content
+        content: list[dict] = []
+
+        if input_image is not None:
+            b64_data = base64.b64encode(input_image).decode("ascii")
+            content.append({
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:{input_mime_type};base64,{b64_data}",
+                },
+            })
+
+        content.append({"type": "text", "text": prompt})
+
+        messages = [{"role": "user", "content": content}]
+
+        # OpenRouter image generation uses a custom payload structure
+        payload: dict = {
+            "model": model,
+            "messages": messages,
+            "modalities": ["image", "text"],
+            "image_config": {
+                "aspect_ratio": aspect_ratio,
+                "image_size": image_size,
+            },
+        }
+
+        # Use httpx directly since the OpenAI SDK doesn't natively support
+        # the modalities + image_config parameters for image generation.
+        headers = {
+            "Authorization": f"Bearer {self._api_key}",
+            "Content-Type": "application/json",
+        }
+        # Propagate extra headers (referer, app name)
+        if self._extra_headers:
+            headers.update(self._extra_headers)
+
+        with httpx.Client(timeout=180.0) as http:
+            resp = http.post(
+                f"{OPENROUTER_BASE_URL}/chat/completions",
+                json=payload,
+                headers=headers,
+            )
+            # Distinguish transient vs permanent HTTP errors.
+            # Transient (429, 5xx): will be retried by tenacity decorator.
+            # Permanent (400, 401, 403, 404): fail fast with clear message.
+            if resp.status_code == 429 or resp.status_code >= 500:
+                raise TimeoutError(
+                    f"Transient HTTP {resp.status_code} from OpenRouter "
+                    f"(will retry): {resp.text[:200]}"
+                )
+            if resp.status_code >= 400:
+                raise RuntimeError(
+                    f"HTTP {resp.status_code} from OpenRouter "
+                    f"(non-retryable): {resp.text[:500]}"
+                )
+            data = resp.json()
+
+        # Parse the response — images come in choices[0].message.images
+        choice = data.get("choices", [{}])[0]
+        message = choice.get("message", {})
+        images = message.get("images", [])
+        text_content = message.get("content", "")
+
+        if not images:
+            raise RuntimeError(
+                f"No images returned from {model}. "
+                f"Response: {data.get('error', text_content or 'empty')}"
+            )
+
+        # First image — extract base64 data URL
+        image_url = images[0].get("image_url", {}).get("url", "")
+        if not image_url.startswith("data:"):
+            raise RuntimeError(
+                f"Unexpected image URL format from {model}: "
+                f"{image_url[:80]}..."
+            )
+
+        # Parse data URL: data:<mime>;base64,<data>
+        try:
+            header, b64_payload = image_url.split(",", 1)
+        except ValueError:
+            raise RuntimeError(
+                f"Malformed data URL from {model}: missing comma separator"
+            )
+
+        try:
+            mime = header.split(":")[1].split(";")[0]
+        except (IndexError, ValueError):
+            raise RuntimeError(
+                f"Malformed data URL header from {model}: {header[:80]}"
+            )
+
+        # Validate MIME is an image type
+        if not mime.startswith("image/"):
+            raise RuntimeError(
+                f"Non-image MIME type returned from {model}: {mime}. "
+                f"Expected image/* format."
+            )
+
+        # Decode base64 payload with explicit error handling
+        if not b64_payload:
+            raise RuntimeError(
+                f"Empty image payload returned from {model}"
+            )
+
+        try:
+            image_bytes = base64.b64decode(b64_payload)
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to decode base64 image from {model}: {e}"
+            ) from e
+
+        if not image_bytes:
+            raise RuntimeError(
+                f"Decoded image is empty (0 bytes) from {model}"
+            )
+
+        return ImageGenerationResult(
+            image_bytes=image_bytes,
+            mime_type=mime,
+            text=text_content or "",
+            model=data.get("model", model),
+            raw=data,
         )

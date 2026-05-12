@@ -313,13 +313,15 @@ book-translator/
 │   ├── judge.md                # scoring перевода 1–5
 │   ├── proofread.md            # корректура
 │   ├── style.md                # стилистическая правка
-│   └── verify.md               # сверка с оригиналом
+│   ├── verify.md               # сверка с оригиналом
+│   └── cover_translate.md      # перевод текста на обложке (image model)
 │
 ├── src/booktranslator/
 │   ├── __init__.py
 │   ├── cli.py                  # Typer или Click: btrans translate/glossary/estimate
 │   ├── config.py               # загрузка YAML, merge с CLI-флагами, pydantic
 │   ├── epub_io.py              # read/write EPUB, сохранение структуры
+│   ├── cover.py                # обложка: поиск, замена, AI-перевод текста
 │   ├── chunker.py              # разбивка глав на chunks по параграфам
 │   ├── glossary.py             # extract, merge, validate, apply
 │   ├── translator.py           # оркестрация перевода одного chunk
@@ -327,7 +329,7 @@ book-translator/
 │   ├── judge.py                # LLM-as-judge для scoring
 │   ├── cache.py                # SQLite: chunk_hash → translated_text
 │   ├── pipeline.py             # главная машина состояний, pause/resume
-│   ├── provider.py             # OpenRouter client (OpenAI-compatible SDK)
+│   ├── provider.py             # OpenRouter client (OpenAI-compatible SDK + image gen)
 │   ├── prompts.py              # загрузка .md с Jinja2, frontmatter parsing
 │   ├── notifier.py             # Telegram-уведомления
 │   ├── state.py                # работа с work/<book>/ и состоянием pipeline
@@ -478,9 +480,84 @@ class OpenRouterProvider:
         # Использует openai SDK с base_url=https://openrouter.ai/api/v1
         # Retry с экспоненциальным backoff на 429, 500, 502, 503.
         # Логирует стоимость в work/<book>/log.jsonl.
+
+    def generate_image(
+        self,
+        model: str,
+        prompt: str,
+        *,
+        input_image: bytes | None = None,
+        input_mime_type: str = "image/jpeg",
+        aspect_ratio: str = "2:3",
+        image_size: str = "1K",
+    ) -> ImageGenerationResult:
+        # Генерация/редактирование изображений через OpenRouter.
+        # Использует httpx напрямую (OpenAI SDK не поддерживает
+        # modalities + image_config).
+        # Входное изображение передаётся как base64 data URL.
+        # Выходное изображение приходит в choices[0].message.images[].
 ```
 
 Единственный провайдер. Разные модели — через поле `model` (например `anthropic/claude-sonnet-4.6`, `openai/gpt-5.4-mini`).
+
+### `cover.py`
+
+```python
+@dataclass
+class CoverInfo:
+    archive_path: str   # путь внутри zip (e.g. "OEBPS/images/cover.jpg")
+    media_type: str     # MIME (e.g. "image/jpeg")
+    raw_bytes: bytes    # байты оригинальной обложки
+
+def find_cover_in_epub(epub_path: Path) -> CoverInfo | None:
+    # Находит обложку в EPUB. Стратегии (по приоритету):
+    # 1. EPUB2: <meta name="cover" content="ITEM_ID"/> → manifest item
+    # 2. EPUB3: manifest item с properties="cover-image"
+    # 3. Эвристика: первый image/* с "cover" в id или href
+
+def replace_cover(source_epub, dest_epub, new_image, new_media_type) -> CoverInfo:
+    # Заменяет обложку в EPUB на новые байты.
+    # Создаёт новый EPUB, оригинал не трогает.
+
+def translate_cover(source_epub, dest_epub, provider, *, model, ...) -> ImageGenerationResult:
+    # AI-перевод текста на обложке.
+    # 1. Извлекает обложку из EPUB.
+    # 2. Отправляет в image model через provider.generate_image().
+    # 3. Заменяет обложку в новом EPUB.
+```
+
+**Два режима работы:**
+
+- **Replace** (`btrans cover replace`): простая замена обложки на файл пользователя.
+- **Translate** (`btrans cover translate`): ИИ-модель получает оригинальную обложку
+  и промпт с инструкцией перевести весь текст на целевой язык.
+
+**Модели для перевода обложки (через OpenRouter):**
+
+| Модель | ID | Цена | Качество текста |
+|--------|----|------|-----------------|
+| Nano Banana 2 (по умолчанию) | `google/gemini-3.1-flash-image-preview` | ~$0.03 | Отличное |
+| GPT-5.4 Image 2 | `openai/gpt-5.4-image-2` | ~$0.15 | Хорошее |
+
+**Что модель делает хорошо:**
+- Сохраняет цветовую палитру и композицию.
+- Подбирает визуально похожий стиль шрифта (serif/sans-serif, bold/light).
+- Сохраняет позиционирование текста.
+- Переводит весь видимый текст.
+
+**Ограничения:**
+- Точный шрифт не воспроизводится — модель подбирает визуально похожий.
+- Русский текст длиннее английского — модель может уменьшить шрифт.
+- Результат — «профессиональная адаптация», не pixel-perfect копия.
+- Для декоративных шрифтов или текста, вписанного в иллюстрацию,
+  результат может быть неидеальным.
+
+**Параметр `--title`** необязателен:
+- Если указан — модель использует конкретный перевод названия.
+- Если не указан — модель переводит всё автоматически (может перевести
+  буквально, что не всегда удачно для художественной литературы).
+
+**Параметр `--target-lang`** обязателен — модель должна знать целевой язык.
 
 ### `cache.py`
 
@@ -554,6 +631,7 @@ models:
   proofread:  anthropic/claude-haiku-4.5
   style:      anthropic/claude-sonnet-4.6
   verify:     anthropic/claude-sonnet-4.6
+  cover:      google/gemini-3.1-flash-image-preview
 
 reflection:
   trigger_score: 3       # reflect если judge <= 3
@@ -779,6 +857,7 @@ def render_prompt(prompt: Prompt, context: dict) -> tuple[str, str]: ...
 | Proofread | `anthropic/claude-haiku-4.5` | Грамматика/пунктуация не требует фронтира |
 | Style | `anthropic/claude-sonnet-4.6` | Тонкое чувство языка |
 | Verify | `anthropic/claude-sonnet-4.6` | Bilingual контекст |
+| Cover | `google/gemini-3.1-flash-image-preview` | Лучший рендеринг текста на изображениях, поддержка кириллицы, дёшево |
 
 ### Preset `premium`
 

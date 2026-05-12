@@ -61,8 +61,10 @@ app = typer.Typer(
 )
 glossary_app = typer.Typer(help="Glossary extraction and curation.")
 series_app = typer.Typer(help="Series-level curated glossary management.")
+cover_app = typer.Typer(help="Cover image replacement and translation.")
 app.add_typer(glossary_app, name="glossary")
 app.add_typer(series_app, name="series")
+app.add_typer(cover_app, name="cover")
 
 console = Console()
 
@@ -2225,6 +2227,161 @@ def assemble_cmd(
         )
     finally:
         cache.close()
+
+
+# ---------------------------------------------------------------------------
+# cover replace
+# ---------------------------------------------------------------------------
+
+
+@cover_app.command("replace")
+def cover_replace(
+    epub: Path = typer.Argument(..., exists=True, dir_okay=False, help="Source EPUB."),
+    image: Path = typer.Option(
+        ..., "--image", "-i", exists=True, dir_okay=False,
+        help="Path to the new cover image (jpg/png/webp).",
+    ),
+    out: Path | None = typer.Option(
+        None, "--out", "-o",
+        help="Output EPUB path (default: <source>-cover.epub).",
+    ),
+) -> None:
+    """Replace the cover image in an EPUB with a custom image file."""
+    from .cover import find_cover_in_epub, replace_cover_from_file
+
+    cover = find_cover_in_epub(epub)
+    if cover is None:
+        console.print("[red]No cover image found in this EPUB.[/red]")
+        raise typer.Exit(code=1)
+
+    console.print(
+        f"[bold]Found cover:[/bold] {cover.archive_path} "
+        f"({cover.media_type}, {len(cover.raw_bytes):,} bytes)"
+    )
+
+    dest = out or epub.with_stem(f"{epub.stem}-cover")
+    replace_cover_from_file(epub, dest, image)
+
+    console.print(f"[green]Cover replaced.[/green] Output: {dest}")
+
+
+# ---------------------------------------------------------------------------
+# cover translate
+# ---------------------------------------------------------------------------
+
+
+@cover_app.command("translate")
+def cover_translate_cmd(
+    epub: Path = typer.Argument(..., exists=True, dir_okay=False, help="Source EPUB."),
+    title: str | None = typer.Option(
+        None, "--title", "-t",
+        help="Translated book title (optional — if omitted, the model translates all text automatically).",
+    ),
+    author: str | None = typer.Option(
+        None, "--author", "-a",
+        help="Author name for the cover (default: keep original).",
+    ),
+    model: str | None = typer.Option(
+        None, "--model", "-m",
+        help="Override the cover model (default from config).",
+    ),
+    config_path: Path = typer.Option(
+        DEFAULT_CONFIG, "--config", "-c", help="YAML config file.",
+    ),
+    out: Path | None = typer.Option(
+        None, "--out", "-o",
+        help="Output EPUB path (default: <source>-cover-translated.epub).",
+    ),
+    target_lang: str = typer.Option(
+        ..., "--target-lang",
+        help="Target language name for the prompt (e.g. Russian, German).",
+    ),
+    aspect_ratio: str = typer.Option(
+        "2:3", "--aspect-ratio",
+        help="Output aspect ratio (default: 2:3 for book covers).",
+    ),
+    image_size: str = typer.Option(
+        "1K", "--image-size",
+        help="Output resolution: 1K, 2K, or 4K.",
+    ),
+) -> None:
+    """Translate the cover image text using an AI image model.
+
+    Extracts the cover from the EPUB, sends it to an image generation model
+    (via OpenRouter) with a prompt to replace English text with the target
+    language translation, then writes the result into a new EPUB.
+
+    If --title is provided, the model uses that exact translation for the
+    book title. If omitted, the model translates all visible text on the
+    cover automatically (useful when you don't have a specific translation).
+
+    Examples:
+        btrans cover translate book.epub --target-lang Russian
+        btrans cover translate book.epub --target-lang Russian --title "Реки Лондона"
+        btrans cover translate book.epub --target-lang Russian --title "Реки Лондона" --author "Бен Ааронович"
+        btrans cover translate book.epub --target-lang Russian --model openai/gpt-5.4-image-2
+    """
+    from .cover import find_cover_in_epub, translate_cover
+
+    # Fail fast if user explicitly provided a config path that doesn't exist.
+    # The default (configs/default.yaml) may not exist in all setups — that's
+    # fine, we fall back to built-in defaults. But an explicit path is an error.
+    if config_path != DEFAULT_CONFIG and not config_path.exists():
+        console.print(
+            f"[red]Config file not found: {config_path}[/red]\n"
+            f"[dim]Remove --config to use built-in defaults, or fix the path.[/dim]"
+        )
+        raise typer.Exit(code=1)
+    cfg = load_config(config_path if config_path.exists() else None)
+
+    cover = find_cover_in_epub(epub)
+    if cover is None:
+        console.print("[red]No cover image found in this EPUB.[/red]")
+        raise typer.Exit(code=1)
+
+    console.print(
+        f"[bold]Found cover:[/bold] {cover.archive_path} "
+        f"({cover.media_type}, {len(cover.raw_bytes):,} bytes)"
+    )
+
+    chosen_model = model or cfg.models.cover
+
+    console.print(
+        f"[bold]Model:[/bold]   {chosen_model}\n"
+        f"[bold]Title:[/bold]   {title or '(auto-translate by model)'}\n"
+        f"[bold]Author:[/bold]  {author or '(keep original)'}\n"
+        f"[bold]Language:[/bold] {target_lang}\n"
+        f"[bold]Size:[/bold]    {image_size} @ {aspect_ratio}"
+    )
+    console.print("[dim]Generating translated cover...[/dim]")
+
+    provider = create_provider()
+    dest = out or epub.with_stem(f"{epub.stem}-cover-translated")
+
+    try:
+        result = translate_cover(
+            source_epub=epub,
+            dest_epub=dest,
+            provider=provider,
+            model=chosen_model,
+            title_translation=title,
+            author_name=author,
+            target_lang=target_lang,
+            aspect_ratio=aspect_ratio,
+            image_size=image_size,
+        )
+    except Exception as e:
+        console.print(f"[red]Cover translation failed:[/red] {e}")
+        raise typer.Exit(code=1) from e
+
+    console.print(
+        f"[green]Cover translated successfully.[/green]\n"
+        f"  Output: {dest}\n"
+        f"  Model used: {result.model}\n"
+        f"  Image: {result.mime_type}, {len(result.image_bytes):,} bytes"
+    )
+    if result.text:
+        console.print(f"  [dim]Model note: {result.text[:200]}[/dim]")
 
 
 # ---------------------------------------------------------------------------

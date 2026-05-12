@@ -21,6 +21,7 @@ class ModelsConfig(BaseModel):
     proofread: str = "anthropic/claude-haiku-4.5"
     style: str = "anthropic/claude-sonnet-4.6"
     verify: str = "anthropic/claude-sonnet-4.6"
+    cover: str = "google/gemini-3.1-flash-image-preview"
 
 
 class ChunkerConfig(BaseModel):

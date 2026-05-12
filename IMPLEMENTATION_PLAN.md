@@ -459,6 +459,79 @@ Total cost: $5.31
 
 ---
 
+### Итерация 7 — Cover Translation
+
+**Статус: ✅ ВЫПОЛНЕНО (12 мая 2026)**
+
+**Цель.** Дать возможность менять обложку переведённой книги: либо
+заменить на пользовательскую картинку, либо "перевести" текст на
+обложке с помощью AI image model.
+
+#### Два режима
+
+**1. Replace** — простая замена обложки на файл:
+```bash
+btrans cover replace book.epub --image cover-ru.jpg
+btrans cover replace book.epub --image cover-ru.jpg --out book-ru.epub
+```
+
+**2. Translate** — AI-перевод текста на обложке:
+```bash
+btrans cover translate book.epub --title "Реки Лондона"
+btrans cover translate book.epub --title "Реки Лондона" --author "Бен Ааронович"
+btrans cover translate book.epub --title "Реки Лондона" --model openai/gpt-5.4-image-2
+btrans cover translate book.epub --title "Реки Лондона" --image-size 2K
+```
+
+#### Модели (через OpenRouter)
+
+| Модель | ID | Цена/image | Скорость | Качество текста |
+|--------|----|-----------|----------|-----------------|
+| **Nano Banana 2** (default) | `google/gemini-3.1-flash-image-preview` | ~$0.02–0.05 | ~10 сек | Отличное |
+| GPT-5.4 Image 2 | `openai/gpt-5.4-image-2` | ~$0.10–0.25 | ~40 сек | Хорошее |
+| FLUX.2 Pro | `black-forest-labs/flux.2-pro` | ~$0.03–0.05 | ~5 сек | Хорошее для текста |
+
+Default: `google/gemini-3.1-flash-image-preview` — лучший баланс
+цена/качество/скорость, отличный рендеринг кириллицы.
+
+#### Конфиг
+
+```yaml
+models:
+  cover: google/gemini-3.1-flash-image-preview
+```
+
+Override через CLI: `--model openai/gpt-5.4-image-2`.
+
+#### Реализация
+
+- **`src/booktranslator/cover.py`** — модуль для работы с обложками:
+  - `find_cover_in_epub()` — находит cover image в EPUB (EPUB2 meta,
+    EPUB3 properties, heuristic fallback).
+  - `replace_cover()` / `replace_cover_from_file()` — замена обложки.
+  - `translate_cover()` — AI-перевод через OpenRouter image generation.
+- **`src/booktranslator/provider.py`** — новый метод `generate_image()`
+  для image generation через OpenRouter (httpx, modalities=["image","text"],
+  image_config с aspect_ratio и image_size).
+- **`prompts/cover_translate.md`** — промпт для перевода обложки.
+- **CLI:** `btrans cover replace` и `btrans cover translate`.
+- **Модель:** поле `cover` в `ModelsConfig`.
+
+#### Как работает image generation через OpenRouter
+
+OpenRouter поддерживает image generation через стандартный
+`/chat/completions` endpoint с параметрами:
+- `modalities: ["image", "text"]`
+- `image_config: { aspect_ratio: "2:3", image_size: "1K" }`
+- Input image передаётся как `image_url` в content (base64 data URL).
+- Output image приходит в `choices[0].message.images[0].image_url.url`
+  как base64 data URL.
+
+Используется `httpx` напрямую (OpenAI SDK не поддерживает `modalities`
+и `image_config` параметры).
+
+---
+
 ## 4bis. Отложено до появления внешнего триггера
 
 ### Pause-points + Telegram (ранее "Итерация 6")
