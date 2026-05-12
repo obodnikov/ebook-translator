@@ -61,6 +61,12 @@ class NotificationsConfig(BaseModel):
     provider: Literal["telegram", "none"] = "telegram"
 
 
+class ReaderNotesConfig(BaseModel):
+    enabled: bool = False
+    types: list[str] = Field(default_factory=lambda: ["concept", "term"])
+    scope: Literal["first-in-chapter", "first-in-book", "all"] = "first-in-book"
+
+
 class CostConfig(BaseModel):
     hard_limit_usd: float = 50.0
 
@@ -76,6 +82,7 @@ class Config(BaseModel):
     stages: StagesConfig = Field(default_factory=StagesConfig)
     retry: RetryConfig = Field(default_factory=RetryConfig)
     notifications: NotificationsConfig = Field(default_factory=NotificationsConfig)
+    reader_notes: ReaderNotesConfig = Field(default_factory=ReaderNotesConfig)
     cost: CostConfig = Field(default_factory=CostConfig)
 
 

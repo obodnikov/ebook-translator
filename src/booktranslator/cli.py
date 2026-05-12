@@ -906,7 +906,7 @@ def translate(
     # This step ensures the EPUB contains the latest post-processed text.
     from .pipeline_helpers import rehydrate_book_from_waterfall
     if pp_stats_list or reflect_stats:
-        rehydrated = rehydrate_book_from_waterfall(cache, chunk_set)
+        rehydrated, _ = rehydrate_book_from_waterfall(cache, chunk_set)
         if rehydrated:
             console.print(
                 f"[dim]Rehydrated {rehydrated} chunks from post-processing.[/dim]"
@@ -2128,7 +2128,32 @@ def assemble_cmd(
     ),
     epub: Path | None = typer.Option(
         None, "--epub", "-e", exists=True, dir_okay=False,
-        help="Source EPUB (for structure). Auto-detected from state if possible.",
+        help="Source EPUB (for structure).",
+    ),
+    notes: bool | None = typer.Option(
+        None, "--notes/--no-notes",
+        help="Inject reader footnotes from glossary (overrides config).",
+    ),
+    note_types: str | None = typer.Option(
+        None, "--note-types",
+        help="Comma-separated glossary types to annotate (e.g. concept,term,place).",
+    ),
+    series: str | None = typer.Option(
+        None, "--series", "-s",
+        help="Series slug (for reader notes glossary source).",
+    ),
+    glossary_path: Path | None = typer.Option(
+        None, "--glossary", "-g",
+        exists=True, dir_okay=False,
+        help="Path to a book-level glossary.json (for reader notes). "
+             "Mutually exclusive with --series.",
+    ),
+    config_path: Path = typer.Option(
+        DEFAULT_CONFIG, "--config", "-c", help="YAML config file.",
+    ),
+    work_dir: Path = typer.Option(
+        DEFAULT_WORK_DIR, "--work", "-w",
+        help="Base directory for artifacts (used for series lookup).",
     ),
 ) -> None:
     """Assemble an EPUB from cached translations using waterfall or --from.
@@ -2140,7 +2165,28 @@ def assemble_cmd(
     Without --from: waterfall mode. Each chunk uses the latest available
     stage (verify > style > proofread > reflect > translate), respecting
     any per-chunk preferences set via 'btrans prefer'.
+
+    With --notes: inject reader footnotes from the glossary into the
+    assembled EPUB. Provide glossary via --series or --glossary.
     """
+    # Fail fast if user explicitly provided a non-default config that doesn't exist
+    if config_path != DEFAULT_CONFIG and not config_path.exists():
+        console.print(
+            f"[red]Config file not found:[/red] {config_path}\n"
+            f"[dim]Check the path or omit --config to use defaults.[/dim]"
+        )
+        raise typer.Exit(code=1)
+
+    if series and glossary_path:
+        console.print(
+            "[red]--series and --glossary are mutually exclusive.[/red]\n"
+            "[dim]Use --series for books in a curated series, "
+            "--glossary for a standalone book.[/dim]"
+        )
+        raise typer.Exit(code=1)
+
+    cfg = load_config(config_path if config_path.exists() else None)
+
     cache_path = work_path / "cache.sqlite"
     if not cache_path.exists():
         console.print(f"[red]No cache.sqlite in {work_path}[/red]")
@@ -2150,6 +2196,13 @@ def assemble_cmd(
         console.print(
             f"[red]Invalid stage {from_stage!r}. "
             f"Valid: {', '.join(STAGE_WATERFALL)}[/red]"
+        )
+        raise typer.Exit(code=1)
+
+    if not epub:
+        console.print(
+            "[red]--epub is required for assembly.[/red]\n"
+            "[dim]Provide the source EPUB so structure can be preserved.[/dim]"
         )
         raise typer.Exit(code=1)
 
@@ -2208,23 +2261,156 @@ def assemble_cmd(
                     f"[dim](legacy data — will use translate stage)[/dim]"
                 )
 
-        # For now, print what would happen. Full EPUB assembly requires
-        # the source EPUB and the structured book — that integration comes
-        # when we wire this into the existing write_translated_epub flow.
-        if not epub:
-            console.print(
-                "\n[yellow]Note:[/yellow] Full EPUB assembly requires --epub "
-                "(source EPUB for structure).\n"
-                "[dim]This command currently shows the assembly plan. "
-                "Full assembly will be wired in iteration 4.[/dim]"
-            )
-            return
+        # --- Full EPUB assembly ---
+        console.print(f"\n[dim]Source EPUB: {epub}[/dim]")
 
-        console.print(
-            f"\n[dim]Source EPUB: {epub}[/dim]\n"
-            f"[dim]Output: {out or '(default)'}[/dim]\n"
-            "[yellow]Full assembly integration pending (iteration 4).[/yellow]"
+        # Read the structured book and chunk it.
+        # Use chunker params from cache metadata (set during translation)
+        # to ensure chunk IDs match what's in cache.
+        book = read_book_structured(epub)
+
+        cached_chunker = cache.get_meta("chunker_params")
+        if cached_chunker:
+            chunk_target_words = cached_chunker.get(
+                "target_words", cfg.chunker.target_words
+            )
+            chunk_overlap = cached_chunker.get(
+                "overlap_paragraphs", cfg.chunker.overlap_paragraphs
+            )
+            if (chunk_target_words != cfg.chunker.target_words
+                    or chunk_overlap != cfg.chunker.overlap_paragraphs):
+                console.print(
+                    f"[dim]Using chunker params from cache: "
+                    f"target_words={chunk_target_words}, "
+                    f"overlap={chunk_overlap} "
+                    f"(differs from config)[/dim]"
+                )
+        else:
+            chunk_target_words = cfg.chunker.target_words
+            chunk_overlap = cfg.chunker.overlap_paragraphs
+
+        chunk_set = chunk_book(
+            book,
+            target_words=chunk_target_words,
+            overlap_paragraphs=chunk_overlap,
         )
+
+        # Rehydrate trees from cache (waterfall or forced stage).
+        # In assemble flow the book is loaded fresh from EPUB, so ALL chunks
+        # need rehydration — including those resolved to 'translate'.
+        rehydrated, failed_ids = rehydrate_book_from_waterfall(
+            cache, chunk_set, forced_stage=from_stage,
+            rehydrate_all=True,
+        )
+
+        total_expected = len(chunk_set.chunks)
+        console.print(
+            f"[dim]Rehydrated {rehydrated}/{total_expected} chunks "
+            f"from cache.[/dim]"
+        )
+
+        # Check for incomplete rehydration
+        if failed_ids:
+            if from_stage:
+                console.print(
+                    f"\n[red]Error:[/red] {len(failed_ids)} chunk(s) could not be "
+                    f"rehydrated from stage {from_stage!r}:\n"
+                    f"[dim]  {', '.join(sorted(failed_ids)[:10])}"
+                    f"{'...' if len(failed_ids) > 10 else ''}[/dim]\n"
+                    f"\n[dim]The output EPUB would contain untranslated content. "
+                    f"Aborting.[/dim]"
+                )
+            else:
+                console.print(
+                    f"\n[red]Error:[/red] {len(failed_ids)} chunk(s) have no "
+                    f"translated content in cache:\n"
+                    f"[dim]  {', '.join(sorted(failed_ids)[:10])}"
+                    f"{'...' if len(failed_ids) > 10 else ''}[/dim]\n"
+                    f"\n[dim]Run 'btrans translate' first to populate the cache, "
+                    f"or check that chunker settings match.[/dim]"
+                )
+            raise typer.Exit(code=1)
+
+        # --- Reader notes injection ---
+        notes_enabled = notes if notes is not None else cfg.reader_notes.enabled
+        note_stats = None
+
+        if notes_enabled:
+            from .reader_notes import (
+                GlossaryLoadError,
+                inject_reader_notes,
+                load_notes_glossary,
+                resolve_notes_config,
+            )
+
+            try:
+                glossary = load_notes_glossary(
+                    series_slug=series,
+                    glossary_path=glossary_path,
+                    work_dir=work_dir,
+                    book_title=book.meta.title,
+                    book_author=book.meta.author,
+                    source_lang=cfg.source_lang,
+                    target_lang=cfg.target_lang,
+                )
+            except GlossaryLoadError as e:
+                console.print(f"[red]Error loading glossary:[/red] {e}")
+                raise typer.Exit(code=1)
+
+            if glossary is None and series:
+                console.print(
+                    f"[yellow]Warning:[/yellow] Series {series!r} not found. "
+                    f"Skipping reader notes."
+                )
+            elif glossary is None and not series and not glossary_path:
+                console.print(
+                    "[yellow]Warning:[/yellow] --notes requires --series or "
+                    "--glossary. Skipping reader notes."
+                )
+
+            if glossary:
+                if glossary_path:
+                    console.print(
+                        f"[dim]Glossary for notes: {len(glossary.entries)} entries "
+                        f"from {glossary_path.name}[/dim]"
+                    )
+
+                notes_config = resolve_notes_config(
+                    cfg.reader_notes, note_types_override=note_types
+                )
+                note_stats = inject_reader_notes(
+                    chapters=book.chapters,
+                    glossary=glossary,
+                    config=notes_config,
+                )
+                if note_stats.notes_injected > 0:
+                    console.print(
+                        f"[bold]Reader notes:[/bold] {note_stats.notes_injected} "
+                        f"footnotes injected across "
+                        f"{note_stats.chapters_modified} chapters "
+                        f"(from {note_stats.total_candidates} candidates)"
+                    )
+                else:
+                    console.print(
+                        f"[dim]Reader notes: 0 matches found "
+                        f"({note_stats.total_candidates} candidates checked).[/dim]"
+                    )
+
+        # Write the assembled EPUB
+        out_path = out or _default_output_path(epub, cfg.target_lang)
+        modified = [ch for ch in book.chapters if ch.paragraphs]
+        write_translated_epub(
+            source_path=epub,
+            dest_path=out_path,
+            modified_chapters=modified,
+            new_language=cfg.target_lang,
+        )
+
+        console.print(f"\n[green]Assembled EPUB:[/green] {out_path}")
+        if note_stats and note_stats.notes_injected > 0:
+            console.print(
+                f"[dim]  Reader notes: {note_stats.notes_injected} footnotes[/dim]"
+            )
     finally:
         cache.close()
 

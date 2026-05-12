@@ -411,7 +411,9 @@ def _parse_waterfall_content(
 def rehydrate_book_from_waterfall(
     cache: Cache,
     chunk_set: ChunkSet,
-) -> int:
+    forced_stage: str | None = None,
+    rehydrate_all: bool = False,
+) -> tuple[int, list[str]]:
     """Update in-memory book trees with the latest waterfall content.
 
     After post-processing passes write results to cache, the in-memory
@@ -420,7 +422,22 @@ def rehydrate_book_from_waterfall(
     fragments, and splices them back into the chapter trees so that
     write_translated_epub() produces the correct output.
 
-    Returns the number of chunks successfully rehydrated.
+    Parameters
+    ----------
+    forced_stage : str | None
+        If set, use ONLY this stage for all chunks (strict mode).
+        Ignores waterfall resolution and preferences.
+    rehydrate_all : bool
+        If True, rehydrate ALL chunks including those resolved to
+        'translate'. Use this when the book trees are freshly loaded
+        (e.g. in assemble flow) and don't have any translations yet.
+
+    Returns
+    -------
+    tuple[int, list[str]]
+        (rehydrated_count, failed_chunk_ids). In non-strict mode,
+        failed_chunk_ids is always empty. In strict mode (forced_stage),
+        it contains IDs of chunks that could not be rehydrated.
     """
     import re
 
@@ -441,26 +458,33 @@ def rehydrate_book_from_waterfall(
     # Get all chunk IDs that have translations
     all_chunk_ids = list(chunk_by_id.keys())
 
-    # Resolve the final stage for each chunk via waterfall
-    resolved_stages = cache.resolve_stages_bulk(all_chunk_ids)
-
-    # Only rehydrate chunks whose resolved stage is NOT 'translate'
-    # (translate stage was already applied in-memory by the Translator).
-    # Actually, we should rehydrate ALL chunks to be safe — the reflect
-    # pass also writes to cache but updates in-memory trees differently.
-    # The safest approach: rehydrate everything from the resolved stage.
-    chunks_to_rehydrate = [
-        cid for cid, stage in resolved_stages.items()
-        if stage != "translate"
-    ]
+    # Resolve the final stage for each chunk via waterfall (or forced)
+    if forced_stage:
+        # Strict mode: use only the forced stage for all chunks
+        resolved_stages = {cid: forced_stage for cid in all_chunk_ids}
+        # Rehydrate ALL chunks (even translate) since we're assembling fresh
+        chunks_to_rehydrate = list(all_chunk_ids)
+    else:
+        resolved_stages = cache.resolve_stages_bulk(all_chunk_ids)
+        if rehydrate_all:
+            # Assembly flow: book loaded fresh, ALL chunks need rehydration
+            chunks_to_rehydrate = list(all_chunk_ids)
+        else:
+            # Translate flow: in-memory trees already have translate content,
+            # only rehydrate chunks with later stages.
+            chunks_to_rehydrate = [
+                cid for cid, stage in resolved_stages.items()
+                if stage != "translate"
+            ]
 
     if not chunks_to_rehydrate:
-        return 0
+        return 0, []
 
     # Batch-fetch stages for chunks that need rehydration
     all_stages_map = cache.get_stages_for_chunks_bulk(chunks_to_rehydrate)
 
     rehydrated = 0
+    _rehydrated_set: set[str] = set()
     for cid in chunks_to_rehydrate:
         chunk = chunk_by_id.get(cid)
         if not chunk:
@@ -477,17 +501,21 @@ def rehydrate_book_from_waterfall(
             if s.stage in STAGE_WATERFALL:
                 stage_content[s.stage] = s.content
 
-        # Build ordered list of stages to try: resolved first, then
-        # earlier stages in reverse waterfall order
-        stages_to_try: list[str] = [resolved_stage]
-        resolved_idx = (
-            STAGE_WATERFALL.index(resolved_stage)
-            if resolved_stage in STAGE_WATERFALL
-            else len(STAGE_WATERFALL)
-        )
-        for stage in reversed(STAGE_WATERFALL[:resolved_idx]):
-            if stage != "translate" and stage in stage_content:
-                stages_to_try.append(stage)
+        # Build ordered list of stages to try
+        if forced_stage:
+            # Strict mode: only try the forced stage, no fallback
+            stages_to_try: list[str] = [forced_stage]
+        else:
+            # Waterfall: resolved first, then earlier stages
+            stages_to_try: list[str] = [resolved_stage]
+            resolved_idx = (
+                STAGE_WATERFALL.index(resolved_stage)
+                if resolved_stage in STAGE_WATERFALL
+                else len(STAGE_WATERFALL)
+            )
+            for stage in reversed(STAGE_WATERFALL[:resolved_idx]):
+                if stage != "translate" and stage in stage_content:
+                    stages_to_try.append(stage)
 
         expected = len(chunk.paragraph_indexes)
         chapter = chunk_set.book.chapters[chunk.chapter_index]
@@ -563,8 +591,17 @@ def rehydrate_book_from_waterfall(
 
         if applied:
             rehydrated += 1
+            _rehydrated_set.add(cid)
 
-    return rehydrated
+    if forced_stage or rehydrate_all:
+        # Report chunks that failed to rehydrate
+        failed_ids = [
+            cid for cid in chunks_to_rehydrate
+            if cid not in _rehydrated_set
+        ]
+        return rehydrated, failed_ids
+
+    return rehydrated, []
 
 
 def normalize_judge_map(

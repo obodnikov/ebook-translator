@@ -869,7 +869,7 @@ class TestRehydrateBookFromWaterfall:
             meta={"chunk_id": "ch01_c01"},
         )
 
-        rehydrated = rehydrate_book_from_waterfall(cache, chunk_set)
+        rehydrated, _ = rehydrate_book_from_waterfall(cache, chunk_set)
 
         assert rehydrated == 1
         # Check that in-memory paragraphs were updated
@@ -892,7 +892,7 @@ class TestRehydrateBookFromWaterfall:
             meta={"chunk_id": "ch01_c01"},
         )
 
-        rehydrated = rehydrate_book_from_waterfall(cache, chunk_set)
+        rehydrated, _ = rehydrate_book_from_waterfall(cache, chunk_set)
         assert rehydrated == 0
 
     def test_handles_verify_as_highest_stage(self, cache: Cache):
@@ -921,7 +921,7 @@ class TestRehydrateBookFromWaterfall:
             meta={"chunk_id": "ch01_c01"},
         )
 
-        rehydrated = rehydrate_book_from_waterfall(cache, chunk_set)
+        rehydrated, _ = rehydrate_book_from_waterfall(cache, chunk_set)
 
         assert rehydrated == 1
         from lxml import etree
@@ -946,7 +946,7 @@ class TestRehydrateBookFromWaterfall:
             meta={"chunk_id": "ch01_c01"},
         )
 
-        rehydrated = rehydrate_book_from_waterfall(cache, chunk_set)
+        rehydrated, _ = rehydrate_book_from_waterfall(cache, chunk_set)
         # Should fall back to translate (which is stage='translate', skipped)
         # Since resolved stage is proofread but it's invalid, and reflect
         # doesn't exist, there's nothing valid to rehydrate from
@@ -977,7 +977,7 @@ class TestRehydrateBookFromWaterfall:
             meta={"chunk_id": "ch01_c01"},
         )
 
-        rehydrated = rehydrate_book_from_waterfall(cache, chunk_set)
+        rehydrated, _ = rehydrate_book_from_waterfall(cache, chunk_set)
 
         # Should fall back to reflect (valid, earlier stage)
         assert rehydrated == 1
@@ -1010,7 +1010,7 @@ class TestRehydrateBookFromWaterfall:
             meta={"chunk_id": "ch01_c01"},
         )
 
-        rehydrated = rehydrate_book_from_waterfall(cache, chunk_set)
+        rehydrated, _ = rehydrate_book_from_waterfall(cache, chunk_set)
 
         # Should fall back to reflect
         assert rehydrated == 1
@@ -1037,7 +1037,7 @@ class TestRehydrateBookFromWaterfall:
             meta={"chunk_id": "ch01_c01"},
         )
 
-        rehydrated = rehydrate_book_from_waterfall(cache, chunk_set)
+        rehydrated, _ = rehydrate_book_from_waterfall(cache, chunk_set)
 
         # Should NOT rehydrate — atomic: all-or-nothing
         assert rehydrated == 0
@@ -1080,7 +1080,7 @@ class TestRehydrateBookFromWaterfall:
             meta={"chunk_id": "ch01_c01"},
         )
 
-        rehydrated = rehydrate_book_from_waterfall(cache, chunk_set)
+        rehydrated, _ = rehydrate_book_from_waterfall(cache, chunk_set)
 
         # Only ch01_c01 should be rehydrated, not ch99_c99
         assert rehydrated == 1
@@ -1104,7 +1104,7 @@ class TestRehydrateBookFromWaterfall:
         # Set preference to translate — should NOT rehydrate
         cache.set_preference("ch01_c01", "translate")
 
-        rehydrated = rehydrate_book_from_waterfall(cache, chunk_set)
+        rehydrated, _ = rehydrate_book_from_waterfall(cache, chunk_set)
         assert rehydrated == 0
 
 

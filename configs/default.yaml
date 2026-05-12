@@ -40,3 +40,8 @@ notifications:
 
 cost:
   hard_limit_usd: 50.0
+
+reader_notes:
+  enabled: false
+  types: [concept, term]
+  scope: first-in-book  # first-in-chapter | first-in-book | all
