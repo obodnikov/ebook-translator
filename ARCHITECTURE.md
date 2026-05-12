@@ -528,6 +528,7 @@ def translate_cover(source_epub, dest_epub, provider, *, model, ...) -> ImageGen
 
 **Два режима работы:**
 
+- **Extract** (`btrans cover extract`): извлечение обложки из EPUB в файл.
 - **Replace** (`btrans cover replace`): простая замена обложки на файл пользователя.
 - **Translate** (`btrans cover translate`): ИИ-модель получает оригинальную обложку
   и промпт с инструкцией перевести весь текст на целевой язык.

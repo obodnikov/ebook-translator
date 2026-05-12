@@ -867,3 +867,138 @@ class TestManifestUpdate:
                 assert item.get("media-type") == "image/jpeg"
             elif item.get("id") == "real":
                 assert item.get("media-type") == "image/png"
+
+
+# ---------------------------------------------------------------------------
+# Tests: cover extract CLI and _mime_to_extension
+# ---------------------------------------------------------------------------
+
+
+class TestMimeToExtension:
+    def test_known_types(self):
+        from booktranslator.cli import _mime_to_extension
+        assert _mime_to_extension("image/jpeg") == ".jpg"
+        assert _mime_to_extension("image/png") == ".png"
+        assert _mime_to_extension("image/webp") == ".webp"
+        assert _mime_to_extension("IMAGE/JPEG") == ".jpg"
+
+    def test_unknown_type_returns_jpg(self):
+        from booktranslator.cli import _mime_to_extension
+        assert _mime_to_extension("image/x-unknown") == ".jpg"
+
+    def test_none_returns_jpg(self):
+        from booktranslator.cli import _mime_to_extension
+        assert _mime_to_extension(None) == ".jpg"
+
+    def test_empty_string_returns_jpg(self):
+        from booktranslator.cli import _mime_to_extension
+        assert _mime_to_extension("") == ".jpg"
+
+    def test_mime_with_parameters(self):
+        from booktranslator.cli import _mime_to_extension
+        assert _mime_to_extension("image/png; charset=binary") == ".png"
+        assert _mime_to_extension("image/jpeg; quality=high") == ".jpg"
+
+    def test_svg(self):
+        from booktranslator.cli import _mime_to_extension
+        assert _mime_to_extension("image/svg+xml") == ".svg"
+
+
+class TestCoverExtractCLI:
+    def test_extract_success_default_output(self, tmp_path: Path):
+        """Extract should save cover with auto-generated filename."""
+        from typer.testing import CliRunner
+        from booktranslator.cli import app
+        import os
+
+        cover_data = b"\xff\xd8\xff\xe0" + b"COVER_JPEG" + b"\x00" * 90
+        epub = _make_epub2_with_cover(tmp_path, cover_data)
+
+        runner = CliRunner()
+        result = runner.invoke(app, ["cover", "extract", str(epub)])
+
+        assert result.exit_code == 0
+        assert "Cover extracted" in result.output
+
+        expected_out = epub.with_stem(f"{epub.stem}-cover").with_suffix(".jpg")
+        assert expected_out.exists()
+        assert expected_out.read_bytes() == cover_data
+
+    def test_extract_no_cover_exits_1(self, tmp_path: Path):
+        """Extract on EPUB without cover should exit with code 1."""
+        from typer.testing import CliRunner
+        from booktranslator.cli import app
+
+        epub = _make_epub_no_cover(tmp_path)
+
+        runner = CliRunner()
+        result = runner.invoke(app, ["cover", "extract", str(epub)])
+
+        assert result.exit_code == 1
+        assert "No cover image found" in result.output
+
+    def test_extract_out_is_directory_exits_2(self, tmp_path: Path):
+        """--out pointing to a directory should exit with code 2."""
+        from typer.testing import CliRunner
+        from booktranslator.cli import app
+
+        cover_data = b"\xff\xd8\xff\xe0" + b"\x00" * 100
+        epub = _make_epub2_with_cover(tmp_path, cover_data)
+        out_dir = tmp_path / "some_dir"
+        out_dir.mkdir()
+
+        runner = CliRunner()
+        result = runner.invoke(app, ["cover", "extract", str(epub), "--out", str(out_dir)])
+
+        assert result.exit_code == 2
+        assert "directory" in result.output.lower()
+
+    def test_extract_custom_out_path(self, tmp_path: Path):
+        """--out should save to the specified path."""
+        from typer.testing import CliRunner
+        from booktranslator.cli import app
+
+        cover_data = b"\x89PNG\r\n\x1a\n" + b"PNG_COVER" + b"\x00" * 91
+        epub = _make_epub3_with_cover(tmp_path, cover_data)
+        out_file = tmp_path / "output" / "my-cover.png"
+
+        runner = CliRunner()
+        result = runner.invoke(app, ["cover", "extract", str(epub), "--out", str(out_file)])
+
+        assert result.exit_code == 0
+        assert out_file.exists()
+        assert out_file.read_bytes() == cover_data
+
+    def test_extract_existing_file_without_force_fails(self, tmp_path: Path):
+        """Existing output file without --force should fail."""
+        from typer.testing import CliRunner
+        from booktranslator.cli import app
+
+        cover_data = b"\xff\xd8\xff\xe0" + b"\x00" * 100
+        epub = _make_epub2_with_cover(tmp_path, cover_data)
+        out_file = tmp_path / "existing.jpg"
+        out_file.write_bytes(b"OLD_DATA")
+
+        runner = CliRunner()
+        result = runner.invoke(app, ["cover", "extract", str(epub), "--out", str(out_file)])
+
+        assert result.exit_code == 1
+        assert "already exists" in result.output
+        # Original file should be untouched
+        assert out_file.read_bytes() == b"OLD_DATA"
+
+    def test_extract_existing_file_with_force_overwrites(self, tmp_path: Path):
+        """Existing output file with --force should be overwritten."""
+        from typer.testing import CliRunner
+        from booktranslator.cli import app
+
+        cover_data = b"\xff\xd8\xff\xe0" + b"NEW_COVER" + b"\x00" * 91
+        epub = _make_epub2_with_cover(tmp_path, cover_data)
+        out_file = tmp_path / "existing.jpg"
+        out_file.write_bytes(b"OLD_DATA")
+
+        runner = CliRunner()
+        result = runner.invoke(app, ["cover", "extract", str(epub), "--out", str(out_file), "--force"])
+
+        assert result.exit_code == 0
+        assert out_file.read_bytes() == cover_data

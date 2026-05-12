@@ -2230,6 +2230,93 @@ def assemble_cmd(
 
 
 # ---------------------------------------------------------------------------
+# cover extract
+# ---------------------------------------------------------------------------
+
+
+@cover_app.command("extract")
+def cover_extract_cmd(
+    epub: Path = typer.Argument(..., exists=True, dir_okay=False, help="Source EPUB."),
+    out: Path | None = typer.Option(
+        None, "--out", "-o",
+        help="Output image path (default: <epub-stem>-cover.<ext>).",
+    ),
+    force: bool = typer.Option(
+        False, "--force", "-f",
+        help="Overwrite output file if it already exists.",
+    ),
+) -> None:
+    """Extract the cover image from an EPUB to a file.
+
+    Saves the cover image in its original format (JPEG, PNG, etc.).
+
+    Examples:
+        btrans cover extract book.epub
+        btrans cover extract book.epub --out my-cover.jpg
+        btrans cover extract book.epub --out my-cover.jpg --force
+    """
+    from .cover import find_cover_in_epub
+
+    cover = find_cover_in_epub(epub)
+    if cover is None:
+        console.print("[red]No cover image found in this EPUB.[/red]")
+        raise typer.Exit(code=1)
+
+    # Determine output path
+    if out is None:
+        ext = _mime_to_extension(cover.media_type)
+        out = epub.with_stem(f"{epub.stem}-cover").with_suffix(ext)
+
+    # Validate output path
+    if out.is_dir():
+        console.print(
+            f"[red]--out path is a directory: {out}[/red]\n"
+            f"[dim]Provide a file path, not a directory.[/dim]"
+        )
+        raise typer.Exit(code=2)
+
+    if out.exists() and not force:
+        console.print(
+            f"[red]Output file already exists: {out}[/red]\n"
+            f"[dim]Use --force to overwrite.[/dim]"
+        )
+        raise typer.Exit(code=1)
+
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_bytes(cover.raw_bytes)
+
+    console.print(
+        f"[green]Cover extracted.[/green]\n"
+        f"  Source: {cover.archive_path} ({cover.media_type})\n"
+        f"  Size: {len(cover.raw_bytes):,} bytes\n"
+        f"  Saved to: {out}"
+    )
+
+
+def _mime_to_extension(mime: str | None) -> str:
+    """Convert image MIME type to file extension.
+
+    Returns a safe default (.jpg) for None, empty, or unknown MIME types.
+    Handles MIME strings with parameters (e.g. "image/png; charset=binary").
+    """
+    if not mime:
+        return ".jpg"
+    # Strip parameters and normalize
+    normalized = mime.split(";", 1)[0].strip().lower()
+    _MAP = {
+        "image/jpeg": ".jpg",
+        "image/jpg": ".jpg",
+        "image/png": ".png",
+        "image/webp": ".webp",
+        "image/gif": ".gif",
+        "image/bmp": ".bmp",
+        "image/tiff": ".tiff",
+        "image/svg+xml": ".svg",
+    }
+    return _MAP.get(normalized, ".jpg")
+
+
+# ---------------------------------------------------------------------------
 # cover replace
 # ---------------------------------------------------------------------------
 
