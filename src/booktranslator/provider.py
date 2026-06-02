@@ -1,4 +1,4 @@
-"""OpenRouter LLM provider via the OpenAI-compatible SDK."""
+"""OpenAI-compatible LLM provider with configurable endpoint."""
 
 from __future__ import annotations
 
@@ -14,8 +14,7 @@ from tenacity import (
     wait_exponential,
 )
 
-
-OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+DEFAULT_BASE_URL = "https://openrouter.ai/api/v1"
 
 
 @dataclass
@@ -40,36 +39,39 @@ class ImageGenerationResult:
 
 
 class OpenRouterProvider:
-    """Thin wrapper around the OpenAI SDK pointed at OpenRouter."""
+    """Thin wrapper around the OpenAI SDK pointed at any OpenAI-compatible endpoint."""
 
     def __init__(
         self,
         api_key: str | None = None,
+        base_url: str | None = None,
         app_name: str | None = None,
         site_url: str | None = None,
+        api_key_env: str = "OPENROUTER_API_KEY",
+        extra_headers: dict[str, str] | None = None,
     ):
-        key = api_key or os.environ.get("OPENROUTER_API_KEY")
+        key = api_key or os.environ.get(api_key_env)
         if not key:
             raise RuntimeError(
-                "OPENROUTER_API_KEY is not set. "
-                "Add it to your .env file or environment."
+                f"{api_key_env} is not set. Add it to your .env file or environment."
             )
+
+        resolved_base_url = base_url or DEFAULT_BASE_URL
 
         default_headers: dict[str, str] = {}
+        if extra_headers:
+            default_headers.update(extra_headers)
         if site_url or os.environ.get("OPENROUTER_SITE_URL"):
-            default_headers["HTTP-Referer"] = (
-                site_url or os.environ["OPENROUTER_SITE_URL"]
-            )
+            default_headers["HTTP-Referer"] = site_url or os.environ["OPENROUTER_SITE_URL"]
         if app_name or os.environ.get("OPENROUTER_APP_NAME"):
-            default_headers["X-OpenRouter-Title"] = (
-                app_name or os.environ["OPENROUTER_APP_NAME"]
-            )
+            default_headers["X-OpenRouter-Title"] = app_name or os.environ["OPENROUTER_APP_NAME"]
 
         self._api_key = key
+        self._base_url = resolved_base_url
         self._extra_headers = default_headers.copy()
 
         self.client = OpenAI(
-            base_url=OPENROUTER_BASE_URL,
+            base_url=resolved_base_url,
             api_key=key,
             default_headers=default_headers or None,
         )
@@ -166,12 +168,14 @@ class OpenRouterProvider:
 
         if input_image is not None:
             b64_data = base64.b64encode(input_image).decode("ascii")
-            content.append({
-                "type": "image_url",
-                "image_url": {
-                    "url": f"data:{input_mime_type};base64,{b64_data}",
-                },
-            })
+            content.append(
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:{input_mime_type};base64,{b64_data}",
+                    },
+                }
+            )
 
         content.append({"type": "text", "text": prompt})
 
@@ -200,7 +204,7 @@ class OpenRouterProvider:
 
         with httpx.Client(timeout=180.0) as http:
             resp = http.post(
-                f"{OPENROUTER_BASE_URL}/chat/completions",
+                f"{self._base_url}/chat/completions",
                 json=payload,
                 headers=headers,
             )
@@ -214,8 +218,7 @@ class OpenRouterProvider:
                 )
             if resp.status_code >= 400:
                 raise RuntimeError(
-                    f"HTTP {resp.status_code} from OpenRouter "
-                    f"(non-retryable): {resp.text[:500]}"
+                    f"HTTP {resp.status_code} from OpenRouter (non-retryable): {resp.text[:500]}"
                 )
             data = resp.json()
 
@@ -234,50 +237,36 @@ class OpenRouterProvider:
         # First image — extract base64 data URL
         image_url = images[0].get("image_url", {}).get("url", "")
         if not image_url.startswith("data:"):
-            raise RuntimeError(
-                f"Unexpected image URL format from {model}: "
-                f"{image_url[:80]}..."
-            )
+            raise RuntimeError(f"Unexpected image URL format from {model}: {image_url[:80]}...")
 
         # Parse data URL: data:<mime>;base64,<data>
         try:
             header, b64_payload = image_url.split(",", 1)
-        except ValueError:
-            raise RuntimeError(
-                f"Malformed data URL from {model}: missing comma separator"
-            )
+        except ValueError as e:
+            raise RuntimeError(f"Malformed data URL from {model}: missing comma separator") from e
 
         try:
             mime = header.split(":")[1].split(";")[0]
-        except (IndexError, ValueError):
-            raise RuntimeError(
-                f"Malformed data URL header from {model}: {header[:80]}"
-            )
+        except (IndexError, ValueError) as e:
+            raise RuntimeError(f"Malformed data URL header from {model}: {header[:80]}") from e
 
         # Validate MIME is an image type
         if not mime.startswith("image/"):
             raise RuntimeError(
-                f"Non-image MIME type returned from {model}: {mime}. "
-                f"Expected image/* format."
+                f"Non-image MIME type returned from {model}: {mime}. Expected image/* format."
             )
 
         # Decode base64 payload with explicit error handling
         if not b64_payload:
-            raise RuntimeError(
-                f"Empty image payload returned from {model}"
-            )
+            raise RuntimeError(f"Empty image payload returned from {model}")
 
         try:
             image_bytes = base64.b64decode(b64_payload)
         except Exception as e:
-            raise RuntimeError(
-                f"Failed to decode base64 image from {model}: {e}"
-            ) from e
+            raise RuntimeError(f"Failed to decode base64 image from {model}: {e}") from e
 
         if not image_bytes:
-            raise RuntimeError(
-                f"Decoded image is empty (0 bytes) from {model}"
-            )
+            raise RuntimeError(f"Decoded image is empty (0 bytes) from {model}")
 
         return ImageGenerationResult(
             image_bytes=image_bytes,
