@@ -34,5 +34,5 @@ Thumbs.db
 
 # OwnCloud
 .owncloudsync.log
-.sync_journal.db
-.sync_journal.db-wal
+.sync_journal.*
+
