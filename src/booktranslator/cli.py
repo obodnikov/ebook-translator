@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import click
 import typer
 from dotenv import load_dotenv
 from rich.console import Console
@@ -465,6 +466,57 @@ def translate(
         "--no-verify",
         help="Skip the verify pass.",
     ),
+    notes: bool | None = typer.Option(
+        None,
+        "--notes/--no-notes",
+        help="Inject reader footnotes from glossary (overrides config.reader_notes.enabled).",
+    ),
+    note_types: str | None = typer.Option(
+        None,
+        "--note-types",
+        help="Comma-separated glossary types to annotate (e.g. concept,term,place).",
+    ),
+    cover: bool = typer.Option(
+        False,
+        "--cover/--no-cover",
+        help="Translate the cover image using the image provider (opt-in, costs money).",
+    ),
+    cover_title: str | None = typer.Option(
+        None,
+        "--cover-title",
+        help="Exact translated title for the cover (optional).",
+    ),
+    cover_author: str | None = typer.Option(
+        None,
+        "--cover-author",
+        help="Author name for the cover (optional).",
+    ),
+    cover_model: str | None = typer.Option(
+        None,
+        "--cover-model",
+        help="Override the image model for cover translation (default: cfg.models.cover).",
+    ),
+    cover_target_lang: str | None = typer.Option(
+        None,
+        "--cover-target-lang",
+        help=(
+            "Override target language name for cover prompt "
+            "(default: auto-derived from target_lang). "
+            "Required when target_lang is not a recognised ISO 639-1 code."
+        ),
+    ),
+    cover_aspect_ratio: str = typer.Option(
+        "2:3",
+        "--cover-aspect-ratio",
+        help="Cover image aspect ratio. Supported: 1:1, 2:3, 3:2, 3:4, 4:3, 9:16, 16:9.",
+        click_type=click.Choice(["1:1", "2:3", "3:2", "3:4", "4:3", "9:16", "16:9"]),
+    ),
+    cover_image_size: str = typer.Option(
+        "1K",
+        "--cover-image-size",
+        help="Cover image resolution: 1K, 2K, or 4K.",
+        click_type=click.Choice(["1K", "2K", "4K"]),
+    ),
 ) -> None:
     """Translate an EPUB into the target language."""
     cfg = load_config(config_path if config_path.exists() else None)
@@ -472,6 +524,29 @@ def translate(
     if reflect_threshold is not None and not 1 <= reflect_threshold <= 5:
         console.print("[red]--reflect-threshold must be between 1 and 5.[/red]")
         raise typer.Exit(code=1)
+
+    # Validate --cover preconditions up front (fail-fast): a bad cover flag
+    # must not cost the user a full paid translation run before it's rejected.
+    # (--cover-aspect-ratio / --cover-image-size are validated at parse time via
+    # click.Choice.) Resolved values are reused by the cover block after write.
+    cover_model_resolved: str | None = None
+    cover_lang_resolved: str | None = None
+    if cover:
+        cover_model_resolved = cover_model or cfg.models.cover
+        if not cover_model_resolved:
+            console.print(
+                "[red]--cover requires a model.[/red]\n"
+                "[dim]Set models.cover in config or pass --cover-model.[/dim]"
+            )
+            raise typer.Exit(code=1)
+        cover_lang_resolved = cover_target_lang or cfg.resolved_target_lang_name()
+        if not cover_lang_resolved:
+            console.print(
+                "[red]--cover requires a target language name.[/red]\n"
+                "[dim]Set target_lang_name in config, or pass --cover-target-lang "
+                "(e.g. --cover-target-lang Russian).[/dim]"
+            )
+            raise typer.Exit(code=1)
 
     console.print(f"[bold]Reading EPUB:[/bold] {epub}")
     book = read_book_structured(epub)
@@ -482,7 +557,7 @@ def translate(
         f"[bold]Words:[/bold]    ~{book.meta.word_count:,}"
     )
 
-    glossary = None
+    glossary: SeriesGlossary | None = None  # always initialized; conditionally populated below
     if series and glossary_path:
         console.print(
             "[red]--series and --glossary are mutually exclusive.[/red]\n"
@@ -910,6 +985,35 @@ def translate(
         if rehydrated:
             console.print(f"[dim]Rehydrated {rehydrated} chunks from post-processing.[/dim]")
 
+    # --- Reader notes injection (after rehydrate, before write) ---
+    from .reader_notes import GlossaryLoadError, inject_notes_for_cli
+
+    # Explicit intent = user passed reader-notes-specific flags (--notes or --note-types).
+    # --series/--glossary are for translation consistency and do NOT imply notes intent.
+    _notes_explicit = notes is True or note_types is not None
+    try:
+        inject_notes_for_cli(
+            console=console,
+            chapters=book.chapters,
+            cfg=cfg,
+            notes_flag=notes,
+            note_types=note_types,
+            series=series,
+            glossary_path=glossary_path,
+            work_dir=work_dir,
+            book_title=book.meta.title,
+            book_author=book.meta.author,
+            preloaded_glossary=glossary,
+            explicit=_notes_explicit,
+        )
+    except GlossaryLoadError as e:
+        if _notes_explicit:
+            console.print(f"[red]Error loading glossary for reader notes:[/red] {e}")
+            raise typer.Exit(code=1) from e
+        console.print(
+            f"[yellow]Warning: could not load glossary for reader notes (skipping):[/yellow] {e}"
+        )
+
     modified = [ch for ch in book.chapters if ch.paragraphs]
     write_translated_epub(
         source_path=epub,
@@ -917,6 +1021,43 @@ def translate(
         modified_chapters=modified,
         new_language=cfg.target_lang,
     )
+
+    # --- Cover translation (after write, file→file, best-effort) ---
+    # Preconditions (model, target-lang, aspect-ratio) were validated up front.
+    if cover:
+        import os
+        import tempfile
+
+        from .cover import translate_cover
+
+        tmp: Path | None = None
+        try:
+            _image_provider = create_image_provider(cfg)
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            fd, tmp_name = tempfile.mkstemp(suffix=".epub", dir=out_path.parent)
+            os.close(fd)
+            tmp = Path(tmp_name)
+            cover_result = translate_cover(
+                source_epub=out_path,
+                dest_epub=tmp,
+                provider=_image_provider,
+                model=cover_model_resolved,
+                title_translation=cover_title,
+                author_name=cover_author,
+                target_lang=cover_lang_resolved,
+                aspect_ratio=cover_aspect_ratio,
+                image_size=cover_image_size,
+            )
+            os.replace(tmp, out_path)
+            console.print(
+                f"[green]Cover translated.[/green] {cover_result.mime_type}, "
+                f"{len(cover_result.image_bytes):,} bytes"
+            )
+        except Exception as e:  # noqa: BLE001 — best-effort, EPUB already written
+            if tmp is not None:
+                tmp.unlink(missing_ok=True)
+            console.print(f"[yellow]Cover translation failed (EPUB kept):[/yellow] {e}")
+
     wd.mark_stage(state, Stage.DONE)
     cache.close()
 
@@ -2417,68 +2558,28 @@ def assemble_cmd(
             raise typer.Exit(code=1)
 
         # --- Reader notes injection ---
-        notes_enabled = notes if notes is not None else cfg.reader_notes.enabled
-        note_stats = None
+        from .reader_notes import GlossaryLoadError, inject_notes_for_cli
 
-        if notes_enabled:
-            from .reader_notes import (
-                GlossaryLoadError,
-                inject_reader_notes,
-                load_notes_glossary,
-                resolve_notes_config,
+        # explicit = user passed notes-specific flags; otherwise silent skip on missing glossary
+        _assemble_notes_explicit = notes is True or note_types is not None
+        try:
+            note_stats = inject_notes_for_cli(
+                console=console,
+                chapters=book.chapters,
+                cfg=cfg,
+                notes_flag=notes,
+                note_types=note_types,
+                series=series,
+                glossary_path=glossary_path,
+                work_dir=work_dir,
+                book_title=book.meta.title,
+                book_author=book.meta.author,
+                preloaded_glossary=None,
+                explicit=_assemble_notes_explicit,
             )
-
-            try:
-                glossary = load_notes_glossary(
-                    series_slug=series,
-                    glossary_path=glossary_path,
-                    work_dir=work_dir,
-                    book_title=book.meta.title,
-                    book_author=book.meta.author,
-                    source_lang=cfg.source_lang,
-                    target_lang=cfg.target_lang,
-                )
-            except GlossaryLoadError as e:
-                console.print(f"[red]Error loading glossary:[/red] {e}")
-                raise typer.Exit(code=1) from e
-
-            if glossary is None and series:
-                console.print(
-                    f"[yellow]Warning:[/yellow] Series {series!r} not found. Skipping reader notes."
-                )
-            elif glossary is None and not series and not glossary_path:
-                console.print(
-                    "[yellow]Warning:[/yellow] --notes requires --series or "
-                    "--glossary. Skipping reader notes."
-                )
-
-            if glossary:
-                if glossary_path:
-                    console.print(
-                        f"[dim]Glossary for notes: {len(glossary.entries)} entries "
-                        f"from {glossary_path.name}[/dim]"
-                    )
-
-                notes_config = resolve_notes_config(
-                    cfg.reader_notes, note_types_override=note_types
-                )
-                note_stats = inject_reader_notes(
-                    chapters=book.chapters,
-                    glossary=glossary,
-                    config=notes_config,
-                )
-                if note_stats.notes_injected > 0:
-                    console.print(
-                        f"[bold]Reader notes:[/bold] {note_stats.notes_injected} "
-                        f"footnotes injected across "
-                        f"{note_stats.chapters_modified} chapters "
-                        f"(from {note_stats.total_candidates} candidates)"
-                    )
-                else:
-                    console.print(
-                        f"[dim]Reader notes: 0 matches found "
-                        f"({note_stats.total_candidates} candidates checked).[/dim]"
-                    )
+        except GlossaryLoadError as e:
+            console.print(f"[red]Error loading glossary:[/red] {e}")
+            raise typer.Exit(code=1) from e
 
         # Write the assembled EPUB
         out_path = out or _default_output_path(epub, cfg.target_lang)

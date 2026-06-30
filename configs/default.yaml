@@ -1,5 +1,6 @@
 source_lang: en
 target_lang: ru
+# target_lang_name: Russian  # auto-derived from target_lang if omitted
 
 providers:
   text:
@@ -50,6 +51,6 @@ cost:
   hard_limit_usd: 50.0
 
 reader_notes:
-  enabled: false
+  enabled: true
   types: [concept, term]
   scope: first-in-book  # first-in-chapter | first-in-book | all

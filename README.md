@@ -123,6 +123,7 @@ OPENROUTER_API_KEY=sk-or-v1-...
 | `btrans judge` | text |
 | `btrans reflect` | text |
 | `btrans proofread` / `style` / `verify` | text |
+| `btrans translate --cover` | **image** (опционально, opt-in) |
 | `btrans cover translate` | **image** |
 | `btrans cover replace` / `extract` | — (не вызывает LLM) |
 
@@ -343,10 +344,13 @@ btrans translate path/to/book.epub -j 8
   с оригиналом — ищет пропуски, искажения, нарушения словаря.
 - Собирается новый EPUB: `books/extracted/<slug>-ru.epub` рядом с
   оригиналом (путь можно переопределить через `--out`).
-- **Читательские сноски не добавляются** — команда `translate` собирает
-  EPUB без них. Для сносок нужен отдельный вызов
-  `btrans assemble --notes` (см. раздел «Читательские сноски из словаря»
-  ниже).
+- **Читательские сноски** вставляются автоматически, если в конфиге
+  `reader_notes.enabled: true` (по умолчанию) и передан `--series` или
+  `--glossary`. Отключить: `--no-notes`.
+- **Перевод обложки** (opt-in, платно): флаг `--cover` запускает
+  image-провайдер после сборки EPUB. По умолчанию выключен.
+  Standalone-команды `btrans cover translate` / `btrans assemble --notes`
+  остаются доступны для точечной работы.
 
 Время на ~115 тысяч слов / 102 фрагмента: около 50 минут при `-j 8`
 (перевод ~16 мин + оценка ~0.5 мин + корректура ~8 мин +
@@ -640,10 +644,14 @@ btrans assemble work/broken-homes/ \
 
 ```yaml
 reader_notes:
-  enabled: false          # по умолчанию выключено, включается через --notes
+  enabled: true           # по умолчанию включено (отключить: --no-notes)
   types: [concept, term]  # какие типы терминов аннотировать
   scope: first-in-book    # first-in-book | first-in-chapter | all
 ```
+
+> ⚠️ **Новый дефолт:** `enabled: true` работает и в `assemble`, и в
+> `translate`. Если глоссарий не передан (`--series`/`--glossary`) —
+> сноски просто пропускаются с предупреждением.
 
 **Особенности:**
 - Для коротких терминов (≤4 символов) — строгое совпадение по границам
@@ -654,6 +662,26 @@ reader_notes:
   уже размеченных сносок — XHTML остаётся валидным.
 - `--notes` и `--no-notes` перекрывают значение из конфига.
 - `--series` и `--glossary` взаимоисключающие (как в `translate`).
+- Сноски встроены в `btrans translate` (передайте `--series`/`--glossary`).
+  `btrans assemble --notes` остаётся для точечной сборки из кэша.
+
+**Флаги обложки в `btrans translate`:**
+
+```bash
+# Перевести обложку после сборки (opt-in)
+btrans translate book.epub --series rivers-of-london --cover
+
+# С явным переводом названия и имени автора
+btrans translate book.epub --series rivers-of-london \
+  --cover --cover-title "Реки Лондона" --cover-author "Бен Ааронович"
+
+# Другой язык или модель
+btrans translate book.epub --series rivers-of-london \
+  --cover --cover-target-lang German --cover-model openai/gpt-5.4-image-2
+```
+
+Если image-провайдер недоступен или вернул ошибку — `translate` завершается
+успешно, переведённый EPUB сохраняется, обложка пропускается с предупреждением.
 
 ### Посмотреть словарь серии
 
