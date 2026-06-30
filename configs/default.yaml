@@ -1,6 +1,14 @@
 source_lang: en
 target_lang: ru
 
+providers:
+  text:
+    base_url: "https://openrouter.ai/api/v1"
+    api_key_env: "OPENROUTER_API_KEY"
+  image:
+    base_url: "https://openrouter.ai/api/v1"
+    api_key_env: "OPENROUTER_API_KEY"
+
 chunker:
   target_words: 2000
   overlap_paragraphs: 1

@@ -25,7 +25,7 @@ from rich.progress import (
 )
 from rich.table import Table
 
-from .cache import Cache, STAGE_WATERFALL
+from .cache import STAGE_WATERFALL, Cache
 from .chunker import chunk_book
 from .config import load_config
 from .epub_io import read_book, read_book_structured, write_translated_epub
@@ -37,6 +37,7 @@ from .pipeline_helpers import (
     collect_chunk_originals,
     collect_stage_translations,
     collect_waterfall_paragraphs,
+    create_image_provider,
     create_provider,
     normalize_judge_map,
     rehydrate_book_from_waterfall,
@@ -83,21 +84,33 @@ TRANSLATE_PROMPT = Path("prompts/translate.md")
 def glossary_extract(
     epub: Path = typer.Argument(..., exists=True, dir_okay=False, help="Source EPUB."),
     series: str | None = typer.Option(
-        None, "--series", "-s",
+        None,
+        "--series",
+        "-s",
         help="Series slug: load known terms from its curated glossary.",
     ),
     config_path: Path = typer.Option(
-        DEFAULT_CONFIG, "--config", "-c", help="YAML config file.",
+        DEFAULT_CONFIG,
+        "--config",
+        "-c",
+        help="YAML config file.",
     ),
     work_dir: Path = typer.Option(
-        DEFAULT_WORK_DIR, "--work", "-w", help="Base directory for artifacts.",
+        DEFAULT_WORK_DIR,
+        "--work",
+        "-w",
+        help="Base directory for artifacts.",
     ),
     model: str | None = typer.Option(
-        None, "--model", "-m",
+        None,
+        "--model",
+        "-m",
         help="Override the glossary model (e.g. anthropic/claude-sonnet-4.6).",
     ),
     force: bool = typer.Option(
-        False, "--force", help="Ignore cache and call the LLM again.",
+        False,
+        "--force",
+        help="Ignore cache and call the LLM again.",
     ),
 ) -> None:
     """Extract the glossary of proper names and invented terms from an EPUB."""
@@ -128,8 +141,7 @@ def glossary_extract(
         series_glossary = load_series_glossary(series_wd.glossary_path)
         known_terms = render_for_prompt(series_glossary)
         console.print(
-            f"[bold]Series:[/bold]  {series} "
-            f"({len(series_glossary.entries)} known terms)"
+            f"[bold]Series:[/bold]  {series} ({len(series_glossary.entries)} known terms)"
         )
 
     wd = WorkDir.for_book(work_dir, book.meta.title)
@@ -143,7 +155,7 @@ def glossary_extract(
         cache.conn.execute("DELETE FROM cache WHERE stage = 'glossary'")
         cache.conn.commit()
 
-    provider = create_provider()
+    provider = create_provider(cfg)
     chosen_model = model or cfg.models.glossary
     console.print(f"[bold]Model:[/bold]   {chosen_model}")
     console.print("[dim]Sending full book to the LLM...[/dim]")
@@ -198,10 +210,7 @@ def _print_glossary_summary(glossary_obj: Glossary, result) -> None:
     console.print(table)
 
     if result is not None:
-        console.print(
-            f"[dim]Tokens: {result.input_tokens} in, "
-            f"{result.output_tokens} out[/dim]"
-        )
+        console.print(f"[dim]Tokens: {result.input_tokens} in, {result.output_tokens} out[/dim]")
     else:
         console.print("[dim]Served from cache (no tokens used)[/dim]")
 
@@ -214,19 +223,26 @@ def _print_glossary_summary(glossary_obj: Glossary, result) -> None:
 @glossary_app.command("promote")
 def glossary_promote(
     book_work_dir: Path = typer.Argument(
-        ..., exists=True, file_okay=False,
+        ...,
+        exists=True,
+        file_okay=False,
         help="Book workdir (e.g. work/rivers-of-london).",
     ),
     series: str = typer.Option(
-        ..., "--series", "-s",
+        ...,
+        "--series",
+        "-s",
         help="Series slug to promote into.",
     ),
     work_root: Path = typer.Option(
-        DEFAULT_WORK_DIR, "--work", "-w",
+        DEFAULT_WORK_DIR,
+        "--work",
+        "-w",
         help="Base directory for artifacts.",
     ),
     all_entries: bool = typer.Option(
-        False, "--all",
+        False,
+        "--all",
         help="Promote ALL entries, not only approved_by_human ones.",
     ),
 ) -> None:
@@ -235,9 +251,7 @@ def glossary_promote(
     if not glossary_path.is_file():
         console.print(f"[red]No glossary.json in {book_work_dir}[/red]")
         raise typer.Exit(code=1)
-    book_glossary = Glossary.model_validate(
-        json.loads(glossary_path.read_text(encoding="utf-8"))
-    )
+    book_glossary = Glossary.model_validate(json.loads(glossary_path.read_text(encoding="utf-8")))
 
     series_wd = SeriesWorkDir.for_series(work_root, series)
     if not series_wd.exists():
@@ -250,7 +264,9 @@ def glossary_promote(
     series_glossary = load_series_glossary(series_wd.glossary_path)
 
     updated_series, report = promote(
-        series_glossary, book_glossary, require_approved=not all_entries,
+        series_glossary,
+        book_glossary,
+        require_approved=not all_entries,
     )
     save_series_glossary(updated_series, series_wd.glossary_path)
 
@@ -264,8 +280,7 @@ def glossary_promote(
 
     if report.conflicts:
         console.print(
-            "\n[yellow]Conflicts[/yellow] "
-            "(series value kept, book value shown for review):"
+            "\n[yellow]Conflicts[/yellow] (series value kept, book value shown for review):"
         )
         for original, series_val, book_val in report.conflicts[:20]:
             console.print(f"  {original!r}: series={series_val!r} book={book_val!r}")
@@ -284,7 +299,9 @@ def series_init(
     title: str = typer.Option(..., "--title", "-t", help="Series title."),
     author: str = typer.Option(..., "--author", "-a", help="Series author."),
     work_root: Path = typer.Option(
-        DEFAULT_WORK_DIR, "--work", "-w",
+        DEFAULT_WORK_DIR,
+        "--work",
+        "-w",
         help="Base directory for artifacts.",
     ),
 ) -> None:
@@ -365,64 +382,87 @@ def series_show(
 def translate(
     epub: Path = typer.Argument(..., exists=True, dir_okay=False, help="Source EPUB."),
     series: str | None = typer.Option(
-        None, "--series", "-s",
+        None,
+        "--series",
+        "-s",
         help="Series slug: use its curated glossary for consistency.",
     ),
     glossary_path: Path | None = typer.Option(
-        None, "--glossary", "-g",
-        exists=True, dir_okay=False,
-        help="Path to a single-book glossary.json. "
-             "Mutually exclusive with --series.",
+        None,
+        "--glossary",
+        "-g",
+        exists=True,
+        dir_okay=False,
+        help="Path to a single-book glossary.json. Mutually exclusive with --series.",
     ),
     config_path: Path = typer.Option(
-        DEFAULT_CONFIG, "--config", "-c", help="YAML config file.",
+        DEFAULT_CONFIG,
+        "--config",
+        "-c",
+        help="YAML config file.",
     ),
     work_dir: Path = typer.Option(
-        DEFAULT_WORK_DIR, "--work", "-w", help="Base directory for artifacts.",
+        DEFAULT_WORK_DIR,
+        "--work",
+        "-w",
+        help="Base directory for artifacts.",
     ),
     model: str | None = typer.Option(
-        None, "--model", "-m",
+        None,
+        "--model",
+        "-m",
         help="Override the translate model.",
     ),
     out: Path | None = typer.Option(
-        None, "--out", "-o",
+        None,
+        "--out",
+        "-o",
         help="Output EPUB path (default: <source>-ru.epub).",
     ),
     limit_chunks: int | None = typer.Option(
-        None, "--limit-chunks",
+        None,
+        "--limit-chunks",
         help="Translate only the first N chunks (for quick tests).",
     ),
     parallelism: int | None = typer.Option(
-        None, "--parallelism", "-j",
-        help="Number of chunks to translate concurrently "
-             "(overrides config.translate.parallelism).",
+        None,
+        "--parallelism",
+        "-j",
+        help="Number of chunks to translate concurrently (overrides config.translate.parallelism).",
     ),
     no_judge: bool = typer.Option(
-        False, "--no-judge",
+        False,
+        "--no-judge",
         help="Skip judge + reflect passes entirely.",
     ),
     no_reflect: bool = typer.Option(
-        False, "--no-reflect",
+        False,
+        "--no-reflect",
         help="Run judge (for stats) but skip reflect.",
     ),
     reflect_threshold: int | None = typer.Option(
-        None, "--reflect-threshold",
+        None,
+        "--reflect-threshold",
         help="Override reflection.trigger_score (reflect chunks scoring ≤ N).",
     ),
     reflect_all: bool = typer.Option(
-        False, "--reflect-all",
+        False,
+        "--reflect-all",
         help="Reflect all chunks regardless of score.",
     ),
     no_proofread: bool = typer.Option(
-        False, "--no-proofread",
+        False,
+        "--no-proofread",
         help="Skip the proofread pass.",
     ),
     no_style: bool = typer.Option(
-        False, "--no-style",
+        False,
+        "--no-style",
         help="Skip the style pass.",
     ),
     no_verify: bool = typer.Option(
-        False, "--no-verify",
+        False,
+        "--no-verify",
         help="Skip the verify pass.",
     ),
 ) -> None:
@@ -430,9 +470,7 @@ def translate(
     cfg = load_config(config_path if config_path.exists() else None)
 
     if reflect_threshold is not None and not 1 <= reflect_threshold <= 5:
-        console.print(
-            "[red]--reflect-threshold must be between 1 and 5.[/red]"
-        )
+        console.print("[red]--reflect-threshold must be between 1 and 5.[/red]")
         raise typer.Exit(code=1)
 
     console.print(f"[bold]Reading EPUB:[/bold] {epub}")
@@ -459,9 +497,7 @@ def translate(
             console.print(f"[red]Series {series!r} not found.[/red]")
             raise typer.Exit(code=1)
         glossary = load_series_glossary(swd.glossary_path)
-        console.print(
-            f"[bold]Series:[/bold]   {series} ({len(glossary.entries)} terms)"
-        )
+        console.print(f"[bold]Series:[/bold]   {series} ({len(glossary.entries)} terms)")
     elif glossary_path:
         # Load a book-level Glossary and adapt it to the SeriesGlossary
         # shape the Translator expects. We take ALL entries (the operator
@@ -494,8 +530,7 @@ def translate(
         )
     else:
         console.print(
-            "[yellow]No --series or --glossary given; "
-            "translating without a glossary.[/yellow]"
+            "[yellow]No --series or --glossary given; translating without a glossary.[/yellow]"
         )
 
     wd = WorkDir.for_book(work_dir, book.meta.title)
@@ -519,22 +554,18 @@ def translate(
 
     effective_parallelism = parallelism if parallelism is not None else cfg.translate.parallelism
     if effective_parallelism > 1:
-        console.print(
-            f"[bold]Parallelism:[/bold] {effective_parallelism} chunks"
-        )
+        console.print(f"[bold]Parallelism:[/bold] {effective_parallelism} chunks")
 
     cache = Cache(wd.cache_path)
     # Persist chunker params so judge/reflect can verify consistency.
     # Fails fast if existing params differ (prevents mixed-cache state).
     try:
-        save_chunker_params(
-            cache, cfg.chunker.target_words, cfg.chunker.overlap_paragraphs
-        )
+        save_chunker_params(cache, cfg.chunker.target_words, cfg.chunker.overlap_paragraphs)
     except ChunkerConfigMismatchError as e:
         console.print(f"[red]Error:[/red] {e}")
         cache.close()
         raise typer.Exit(code=1) from e
-    provider = create_provider()
+    provider = create_provider(cfg)
     chosen_model = model or cfg.models.translate
     console.print(f"[bold]Model:[/bold]    {chosen_model}")
     console.print("[dim]Translating chunks...[/dim]\n")
@@ -594,22 +625,15 @@ def translate(
         # Collect original and translated texts
         translate_ids = cache.get_all_chunk_ids_for_stage("translate")
         if translate_ids:
-            chunk_originals = collect_chunk_originals(
-                chunk_set, translate_ids
-            )
-            chunk_translations = collect_stage_translations(
-                cache, translate_ids, stage="translate"
-            )
+            chunk_originals = collect_chunk_originals(chunk_set, translate_ids)
+            chunk_translations = collect_stage_translations(cache, translate_ids, stage="translate")
 
             # Only judge chunks that have both original and translation
-            judgeable_ids = (
-                set(chunk_originals.keys()) & set(chunk_translations.keys())
-            )
+            judgeable_ids = set(chunk_originals.keys()) & set(chunk_translations.keys())
             if judgeable_ids:
                 judge_model = cfg.models.judge
                 console.print(
-                    f"\n[dim]Judging {len(judgeable_ids)} chunks "
-                    f"with {judge_model}...[/dim]\n"
+                    f"\n[dim]Judging {len(judgeable_ids)} chunks with {judge_model}...[/dim]\n"
                 )
 
                 judge = Judge(
@@ -622,9 +646,7 @@ def translate(
                     target_lang=cfg.target_lang,
                 )
 
-                judge_parallelism = (
-                    min(parallelism or cfg.translate.parallelism, 8) or 4
-                )
+                judge_parallelism = min(parallelism or cfg.translate.parallelism, 8) or 4
 
                 with Progress(
                     TextColumn("[progress.description]{task.description}"),
@@ -633,9 +655,7 @@ def translate(
                     TimeElapsedColumn(),
                     console=console,
                 ) as progress:
-                    jtask = progress.add_task(
-                        "judging", total=len(judgeable_ids)
-                    )
+                    jtask = progress.add_task("judging", total=len(judgeable_ids))
 
                     def on_judge_progress(done, total, cid, jstats):
                         progress.update(
@@ -649,10 +669,8 @@ def translate(
                         )
 
                     judge_stats = judge.judge_chunks(
-                        {k: v for k, v in chunk_originals.items()
-                         if k in judgeable_ids},
-                        {k: v for k, v in chunk_translations.items()
-                         if k in judgeable_ids},
+                        {k: v for k, v in chunk_originals.items() if k in judgeable_ids},
+                        {k: v for k, v in chunk_translations.items() if k in judgeable_ids},
                         on_progress=on_judge_progress,
                         parallelism=judge_parallelism,
                     )
@@ -663,25 +681,18 @@ def translate(
                     for r in judge_stats.results:
                         dist[r.score] = dist.get(r.score, 0) + 1
                     dist_str = "  ".join(
-                        f"★{k}: {v}"
-                        for k, v in sorted(dist.items(), reverse=True)
+                        f"★{k}: {v}" for k, v in sorted(dist.items(), reverse=True)
                     )
-                    console.print(
-                        f"[bold]Judge scores:[/bold] {dist_str}"
-                    )
+                    console.print(f"[bold]Judge scores:[/bold] {dist_str}")
 
                     threshold = (
                         reflect_threshold
                         if reflect_threshold is not None
                         else cfg.reflection.trigger_score
                     )
-                    needs_reflect = [
-                        r for r in judge_stats.results
-                        if r.score <= threshold
-                    ]
+                    needs_reflect = [r for r in judge_stats.results if r.score <= threshold]
                     console.print(
-                        f"  Chunks needing reflection: "
-                        f"{len(needs_reflect)} (score ≤ {threshold})"
+                        f"  Chunks needing reflection: {len(needs_reflect)} (score ≤ {threshold})"
                     )
 
     # ------------------------------------------------------------------
@@ -694,17 +705,13 @@ def translate(
         REFLECT_PROMPT = Path("prompts/reflect.md")
 
         threshold = (
-            reflect_threshold
-            if reflect_threshold is not None
-            else cfg.reflection.trigger_score
+            reflect_threshold if reflect_threshold is not None else cfg.reflection.trigger_score
         )
 
         if reflect_all:
             chunks_to_reflect_results = judge_stats.results
         else:
-            chunks_to_reflect_results = [
-                r for r in judge_stats.results if r.score <= threshold
-            ]
+            chunks_to_reflect_results = [r for r in judge_stats.results if r.score <= threshold]
 
         if chunks_to_reflect_results:
             reflect_model = cfg.models.reflect
@@ -726,25 +733,24 @@ def translate(
             )
 
             # Build reflect input using shared helper (O(n), not O(n²))
-            judge_by_id = normalize_judge_map([
-                {"chunk_id": r.chunk_id, "score": r.score, "issues": r.issues}
-                for r in chunks_to_reflect_results
-            ])
+            judge_by_id = normalize_judge_map(
+                [
+                    {"chunk_id": r.chunk_id, "score": r.score, "issues": r.issues}
+                    for r in chunks_to_reflect_results
+                ]
+            )
             chunks_to_reflect_data = build_reflect_input(
-                chunk_set, cache,
+                chunk_set,
+                cache,
                 {r.chunk_id for r in chunks_to_reflect_results},
                 judge_by_id,
             )
 
             if chunks_to_reflect_data:
-                reflect_parallelism = (
-                    min(parallelism or cfg.translate.parallelism, 4) or 2
-                )
+                reflect_parallelism = min(parallelism or cfg.translate.parallelism, 4) or 2
 
                 with Progress(
-                    TextColumn(
-                        "[progress.description]{task.description}"
-                    ),
+                    TextColumn("[progress.description]{task.description}"),
                     BarColumn(),
                     MofNCompleteColumn(),
                     TimeElapsedColumn(),
@@ -788,10 +794,7 @@ def translate(
     from .postprocess import PostProcessor
 
     # Build paragraph count map for waterfall parsing
-    paragraph_counts = {
-        chunk.id: len(chunk.paragraph_indexes)
-        for chunk in chunk_set.chunks
-    }
+    paragraph_counts = {chunk.id: len(chunk.paragraph_indexes) for chunk in chunk_set.chunks}
 
     # Current chunk IDs from the chunk_set — anchors all postprocess
     # operations to the current book/chunker config, preventing stale
@@ -800,9 +803,7 @@ def translate(
 
     # Intersect with what's actually in cache (translated)
     cached_translate_ids = set(cache.get_all_chunk_ids_for_stage("translate"))
-    valid_chunk_ids = [
-        cid for cid in current_chunk_ids if cid in cached_translate_ids
-    ]
+    valid_chunk_ids = [cid for cid in current_chunk_ids if cid in cached_translate_ids]
 
     pp_stats_list: list[tuple[str, object]] = []
 
@@ -845,8 +846,7 @@ def translate(
             chunks_data_pp.append(entry)
 
         console.print(
-            f"\n[dim]Running {pp_stage} on {len(chunks_data_pp)} chunks "
-            f"with {pp_model}...[/dim]\n"
+            f"\n[dim]Running {pp_stage} on {len(chunks_data_pp)} chunks with {pp_model}...[/dim]\n"
         )
 
         processor = PostProcessor(
@@ -860,9 +860,7 @@ def translate(
             target_lang=cfg.target_lang,
         )
 
-        pp_parallelism = min(
-            parallelism or cfg.translate.parallelism, 8
-        ) or 4
+        pp_parallelism = min(parallelism or cfg.translate.parallelism, 8) or 4
 
         with Progress(
             TextColumn("[progress.description]{task.description}"),
@@ -884,6 +882,7 @@ def translate(
                             f"failed {pstats.chunks_failed}"
                         ),
                     )
+
                 return on_pp_progress
 
             pp_stats = processor.process_chunks(
@@ -905,12 +904,11 @@ def translate(
     # reflect/proofread/style/verify write to cache but not to the tree.
     # This step ensures the EPUB contains the latest post-processed text.
     from .pipeline_helpers import rehydrate_book_from_waterfall
+
     if pp_stats_list or reflect_stats:
         rehydrated, _ = rehydrate_book_from_waterfall(cache, chunk_set)
         if rehydrated:
-            console.print(
-                f"[dim]Rehydrated {rehydrated} chunks from post-processing.[/dim]"
-            )
+            console.print(f"[dim]Rehydrated {rehydrated} chunks from post-processing.[/dim]")
 
     modified = [ch for ch in book.chapters if ch.paragraphs]
     write_translated_epub(
@@ -930,8 +928,7 @@ def translate(
 
     if judge_stats:
         summary_parts.append(
-            f"Judge: {judge_stats.chunks_judged} new, "
-            f"{judge_stats.chunks_cached} cached."
+            f"Judge: {judge_stats.chunks_judged} new, {judge_stats.chunks_cached} cached."
         )
     if reflect_stats:
         summary_parts.append(
@@ -977,26 +974,41 @@ def _default_output_path(epub: Path, target_lang: str) -> Path:
 def judge_cmd(
     epub: Path = typer.Argument(..., exists=True, dir_okay=False, help="Source EPUB."),
     series: str | None = typer.Option(
-        None, "--series", "-s",
+        None,
+        "--series",
+        "-s",
         help="Series slug for glossary context.",
     ),
     glossary_path: Path | None = typer.Option(
-        None, "--glossary", "-g",
-        exists=True, dir_okay=False,
+        None,
+        "--glossary",
+        "-g",
+        exists=True,
+        dir_okay=False,
         help="Path to a single-book glossary.json.",
     ),
     config_path: Path = typer.Option(
-        DEFAULT_CONFIG, "--config", "-c", help="YAML config file.",
+        DEFAULT_CONFIG,
+        "--config",
+        "-c",
+        help="YAML config file.",
     ),
     work_dir: Path = typer.Option(
-        DEFAULT_WORK_DIR, "--work", "-w", help="Base directory for artifacts.",
+        DEFAULT_WORK_DIR,
+        "--work",
+        "-w",
+        help="Base directory for artifacts.",
     ),
     model: str | None = typer.Option(
-        None, "--model", "-m",
+        None,
+        "--model",
+        "-m",
         help="Override the judge model.",
     ),
     parallelism: int | None = typer.Option(
-        None, "--parallelism", "-j",
+        None,
+        "--parallelism",
+        "-j",
         help="Number of chunks to judge concurrently.",
     ),
 ) -> None:
@@ -1021,17 +1033,13 @@ def judge_cmd(
     # Get translated chunk IDs
     translate_ids = cache.get_all_chunk_ids_for_stage("translate")
     if not translate_ids:
-        console.print(
-            "[red]No translated chunks found. Run translate first.[/red]"
-        )
+        console.print("[red]No translated chunks found. Run translate first.[/red]")
         cache.close()
         raise typer.Exit(code=1)
 
     # Verify chunker config matches what was used during translate
     try:
-        verify_chunker_params(
-            cache, cfg.chunker.target_words, cfg.chunker.overlap_paragraphs
-        )
+        verify_chunker_params(cache, cfg.chunker.target_words, cfg.chunker.overlap_paragraphs)
     except ChunkerConfigMismatchError as e:
         console.print(f"[red]Error:[/red] {e}")
         cache.close()
@@ -1046,13 +1054,9 @@ def judge_cmd(
 
     # Collect originals and translations using shared helpers
     chunk_originals = collect_chunk_originals(chunk_set, translate_ids)
-    chunk_translations = collect_stage_translations(
-        cache, translate_ids, stage="translate"
-    )
+    chunk_translations = collect_stage_translations(cache, translate_ids, stage="translate")
 
-    judgeable_ids = sorted(
-        set(chunk_originals.keys()) & set(chunk_translations.keys())
-    )
+    judgeable_ids = sorted(set(chunk_originals.keys()) & set(chunk_translations.keys()))
     console.print(f"[bold]Chunks to judge:[/bold] {len(judgeable_ids)}")
 
     judge_model = model or cfg.models.judge
@@ -1060,7 +1064,7 @@ def judge_cmd(
 
     JUDGE_PROMPT = Path("prompts/judge.md")
     judge = Judge(
-        provider=create_provider(),
+        provider=create_provider(cfg),
         prompt_path=JUDGE_PROMPT,
         cache=cache,
         glossary=glossary,
@@ -1132,34 +1136,52 @@ def judge_cmd(
 def reflect_cmd(
     epub: Path = typer.Argument(..., exists=True, dir_okay=False, help="Source EPUB."),
     series: str | None = typer.Option(
-        None, "--series", "-s",
+        None,
+        "--series",
+        "-s",
         help="Series slug for glossary context.",
     ),
     glossary_path: Path | None = typer.Option(
-        None, "--glossary", "-g",
-        exists=True, dir_okay=False,
+        None,
+        "--glossary",
+        "-g",
+        exists=True,
+        dir_okay=False,
         help="Path to a single-book glossary.json.",
     ),
     config_path: Path = typer.Option(
-        DEFAULT_CONFIG, "--config", "-c", help="YAML config file.",
+        DEFAULT_CONFIG,
+        "--config",
+        "-c",
+        help="YAML config file.",
     ),
     work_dir: Path = typer.Option(
-        DEFAULT_WORK_DIR, "--work", "-w", help="Base directory for artifacts.",
+        DEFAULT_WORK_DIR,
+        "--work",
+        "-w",
+        help="Base directory for artifacts.",
     ),
     model: str | None = typer.Option(
-        None, "--model", "-m",
+        None,
+        "--model",
+        "-m",
         help="Override the reflect model.",
     ),
     threshold: int | None = typer.Option(
-        None, "--threshold", "-t",
+        None,
+        "--threshold",
+        "-t",
         help="Reflect chunks with judge score ≤ N (default from config).",
     ),
     all_chunks: bool = typer.Option(
-        False, "--all",
+        False,
+        "--all",
         help="Reflect all chunks regardless of score.",
     ),
     parallelism: int | None = typer.Option(
-        None, "--parallelism", "-j",
+        None,
+        "--parallelism",
+        "-j",
         help="Number of chunks to reflect concurrently.",
     ),
 ) -> None:
@@ -1172,9 +1194,7 @@ def reflect_cmd(
     cfg = load_config(config_path if config_path.exists() else None)
 
     if threshold is not None and not 1 <= threshold <= 5:
-        console.print(
-            "[red]--threshold must be between 1 and 5.[/red]"
-        )
+        console.print("[red]--threshold must be between 1 and 5.[/red]")
         raise typer.Exit(code=1)
 
     console.print(f"[bold]Reading EPUB:[/bold] {epub}")
@@ -1197,10 +1217,7 @@ def reflect_cmd(
         raise typer.Exit(code=1)
 
     # Determine which chunks to reflect
-    trigger = (
-        threshold if threshold is not None
-        else cfg.reflection.trigger_score
-    )
+    trigger = threshold if threshold is not None else cfg.reflection.trigger_score
 
     if all_chunks:
         # Reflect all translated chunks regardless of judge scores.
@@ -1217,22 +1234,15 @@ def reflect_cmd(
                 chunks_to_reflect_ids.add(cid)
 
     if not chunks_to_reflect_ids:
-        console.print(
-            f"[green]All chunks scored above {trigger}. "
-            f"Nothing to reflect.[/green]"
-        )
+        console.print(f"[green]All chunks scored above {trigger}. Nothing to reflect.[/green]")
         cache.close()
         return
 
-    console.print(
-        f"[bold]Chunks to reflect:[/bold] {len(chunks_to_reflect_ids)}"
-    )
+    console.print(f"[bold]Chunks to reflect:[/bold] {len(chunks_to_reflect_ids)}")
 
     # Verify chunker config matches what was used during translate
     try:
-        verify_chunker_params(
-            cache, cfg.chunker.target_words, cfg.chunker.overlap_paragraphs
-        )
+        verify_chunker_params(cache, cfg.chunker.target_words, cfg.chunker.overlap_paragraphs)
     except ChunkerConfigMismatchError as e:
         console.print(f"[red]Error:[/red] {e}")
         cache.close()
@@ -1251,9 +1261,7 @@ def reflect_cmd(
     )
 
     if not chunks_to_reflect_data:
-        console.print(
-            "[yellow]No chunks with translations to reflect on.[/yellow]"
-        )
+        console.print("[yellow]No chunks with translations to reflect on.[/yellow]")
         cache.close()
         return
 
@@ -1262,7 +1270,7 @@ def reflect_cmd(
 
     REFLECT_PROMPT = Path("prompts/reflect.md")
     reflector = Reflector(
-        provider=create_provider(),
+        provider=create_provider(cfg),
         reflect_prompt_path=REFLECT_PROMPT,
         translate_prompt_path=TRANSLATE_PROMPT,
         cache=cache,
@@ -1326,26 +1334,41 @@ def reflect_cmd(
 def proofread_cmd(
     epub: Path = typer.Argument(..., exists=True, dir_okay=False, help="Source EPUB."),
     series: str | None = typer.Option(
-        None, "--series", "-s",
+        None,
+        "--series",
+        "-s",
         help="Series slug for glossary context.",
     ),
     glossary_path: Path | None = typer.Option(
-        None, "--glossary", "-g",
-        exists=True, dir_okay=False,
+        None,
+        "--glossary",
+        "-g",
+        exists=True,
+        dir_okay=False,
         help="Path to a single-book glossary.json.",
     ),
     config_path: Path = typer.Option(
-        DEFAULT_CONFIG, "--config", "-c", help="YAML config file.",
+        DEFAULT_CONFIG,
+        "--config",
+        "-c",
+        help="YAML config file.",
     ),
     work_dir: Path = typer.Option(
-        DEFAULT_WORK_DIR, "--work", "-w", help="Base directory for artifacts.",
+        DEFAULT_WORK_DIR,
+        "--work",
+        "-w",
+        help="Base directory for artifacts.",
     ),
     model: str | None = typer.Option(
-        None, "--model", "-m",
+        None,
+        "--model",
+        "-m",
         help="Override the proofread model.",
     ),
     parallelism: int | None = typer.Option(
-        None, "--parallelism", "-j",
+        None,
+        "--parallelism",
+        "-j",
         help="Number of chunks to process concurrently.",
     ),
 ) -> None:
@@ -1376,26 +1399,41 @@ def proofread_cmd(
 def style_cmd(
     epub: Path = typer.Argument(..., exists=True, dir_okay=False, help="Source EPUB."),
     series: str | None = typer.Option(
-        None, "--series", "-s",
+        None,
+        "--series",
+        "-s",
         help="Series slug for glossary context.",
     ),
     glossary_path: Path | None = typer.Option(
-        None, "--glossary", "-g",
-        exists=True, dir_okay=False,
+        None,
+        "--glossary",
+        "-g",
+        exists=True,
+        dir_okay=False,
         help="Path to a single-book glossary.json.",
     ),
     config_path: Path = typer.Option(
-        DEFAULT_CONFIG, "--config", "-c", help="YAML config file.",
+        DEFAULT_CONFIG,
+        "--config",
+        "-c",
+        help="YAML config file.",
     ),
     work_dir: Path = typer.Option(
-        DEFAULT_WORK_DIR, "--work", "-w", help="Base directory for artifacts.",
+        DEFAULT_WORK_DIR,
+        "--work",
+        "-w",
+        help="Base directory for artifacts.",
     ),
     model: str | None = typer.Option(
-        None, "--model", "-m",
+        None,
+        "--model",
+        "-m",
         help="Override the style model.",
     ),
     parallelism: int | None = typer.Option(
-        None, "--parallelism", "-j",
+        None,
+        "--parallelism",
+        "-j",
         help="Number of chunks to process concurrently.",
     ),
 ) -> None:
@@ -1426,26 +1464,41 @@ def style_cmd(
 def verify_cmd(
     epub: Path = typer.Argument(..., exists=True, dir_okay=False, help="Source EPUB."),
     series: str | None = typer.Option(
-        None, "--series", "-s",
+        None,
+        "--series",
+        "-s",
         help="Series slug for glossary context.",
     ),
     glossary_path: Path | None = typer.Option(
-        None, "--glossary", "-g",
-        exists=True, dir_okay=False,
+        None,
+        "--glossary",
+        "-g",
+        exists=True,
+        dir_okay=False,
         help="Path to a single-book glossary.json.",
     ),
     config_path: Path = typer.Option(
-        DEFAULT_CONFIG, "--config", "-c", help="YAML config file.",
+        DEFAULT_CONFIG,
+        "--config",
+        "-c",
+        help="YAML config file.",
     ),
     work_dir: Path = typer.Option(
-        DEFAULT_WORK_DIR, "--work", "-w", help="Base directory for artifacts.",
+        DEFAULT_WORK_DIR,
+        "--work",
+        "-w",
+        help="Base directory for artifacts.",
     ),
     model: str | None = typer.Option(
-        None, "--model", "-m",
+        None,
+        "--model",
+        "-m",
         help="Override the verify model.",
     ),
     parallelism: int | None = typer.Option(
-        None, "--parallelism", "-j",
+        None,
+        "--parallelism",
+        "-j",
         help="Number of chunks to process concurrently.",
     ),
 ) -> None:
@@ -1506,16 +1559,12 @@ def _run_postprocess_cmd(
         # Verify translated chunks exist
         translate_ids = cache.get_all_chunk_ids_for_stage("translate")
         if not translate_ids:
-            console.print(
-                "[red]No translated chunks found. Run translate first.[/red]"
-            )
+            console.print("[red]No translated chunks found. Run translate first.[/red]")
             raise typer.Exit(code=1)
 
         # Verify chunker config
         try:
-            verify_chunker_params(
-                cache, cfg.chunker.target_words, cfg.chunker.overlap_paragraphs
-            )
+            verify_chunker_params(cache, cfg.chunker.target_words, cfg.chunker.overlap_paragraphs)
         except ChunkerConfigMismatchError as e:
             console.print(f"[red]Error:[/red] {e}")
             raise typer.Exit(code=1) from e
@@ -1528,17 +1577,12 @@ def _run_postprocess_cmd(
         )
 
         # Build paragraph count map
-        paragraph_counts = {
-            chunk.id: len(chunk.paragraph_indexes)
-            for chunk in chunk_set.chunks
-        }
+        paragraph_counts = {chunk.id: len(chunk.paragraph_indexes) for chunk in chunk_set.chunks}
 
         # Scope to current chunk_set IDs intersected with cache
         current_chunk_ids = [chunk.id for chunk in chunk_set.chunks]
         translate_id_set = set(translate_ids)
-        valid_chunk_ids = [
-            cid for cid in current_chunk_ids if cid in translate_id_set
-        ]
+        valid_chunk_ids = [cid for cid in current_chunk_ids if cid in translate_id_set]
 
         # Collect waterfall translations parsed into paragraphs
         waterfall_paragraphs = collect_waterfall_paragraphs(
@@ -1570,10 +1614,7 @@ def _run_postprocess_cmd(
                 entry["original_text"] = originals_map.get(cid, "")
             chunks_data.append(entry)
 
-        console.print(
-            f"[bold]Stage:[/bold] {stage}\n"
-            f"[bold]Chunks:[/bold] {len(chunks_data)}"
-        )
+        console.print(f"[bold]Stage:[/bold] {stage}\n[bold]Chunks:[/bold] {len(chunks_data)}")
 
         # Resolve model
         model_map = {
@@ -1585,7 +1626,7 @@ def _run_postprocess_cmd(
         console.print(f"[bold]Model:[/bold] {chosen_model}")
 
         processor = PostProcessor(
-            provider=create_provider(),
+            provider=create_provider(cfg),
             prompt_path=prompt_path,
             cache=cache,
             glossary=glossary,
@@ -1697,37 +1738,43 @@ def _resolve_glossary(
 @app.command("status")
 def status_overview(
     work_path: Path = typer.Argument(
-        ..., exists=True, file_okay=False,
+        ...,
+        exists=True,
+        file_okay=False,
         help="Book workdir (e.g. work/broken-homes).",
     ),
     scores: bool = typer.Option(
-        False, "--scores", help="Show judge scores table.",
+        False,
+        "--scores",
+        help="Show judge scores table.",
     ),
     below: int | None = typer.Option(
-        None, "--below", help="Only show chunks with score below N.",
+        None,
+        "--below",
+        help="Only show chunks with score below N.",
     ),
     diff: str | None = typer.Option(
-        None, "--diff", help="Show all passes for a specific chunk_id.",
+        None,
+        "--diff",
+        help="Show all passes for a specific chunk_id.",
     ),
     stages_filter: str | None = typer.Option(
-        None, "--stages",
+        None,
+        "--stages",
         help="Comma-separated stages to compare (use with --diff).",
     ),
     assembly_map: bool = typer.Option(
-        False, "--assembly-map",
+        False,
+        "--assembly-map",
         help="Show which stage each chunk will use at assembly.",
     ),
     grid: bool = typer.Option(
-        False, "--grid",
+        False,
+        "--grid",
         help="Show chunk × stage matrix with changed/unchanged status.",
     ),
 ) -> None:
     """Inspect the translation state of a book."""
-    from .status import (
-        build_status_report,
-        get_chunk_diff,
-        get_scores,
-    )
 
     cache_path = work_path / "cache.sqlite"
     if not cache_path.exists():
@@ -1781,8 +1828,10 @@ def _run_status(
         import difflib
 
         first = waterfall_entries[0]
-        console.print(f"[bold cyan]─── {first['stage']} ───[/bold cyan] "
-                      f"[dim]({first['model']}, {first['created_at']})[/dim]")
+        console.print(
+            f"[bold cyan]─── {first['stage']} ───[/bold cyan] "
+            f"[dim]({first['model']}, {first['created_at']})[/dim]"
+        )
         console.print(first["content"])
         console.print()
 
@@ -1793,14 +1842,20 @@ def _run_status(
             prev_lines = prev["content"].splitlines(keepends=True)
             curr_lines = curr["content"].splitlines(keepends=True)
 
-            diff_lines = list(difflib.unified_diff(
-                prev_lines, curr_lines,
-                fromfile=prev["stage"], tofile=curr["stage"],
-                lineterm="",
-            ))
+            diff_lines = list(
+                difflib.unified_diff(
+                    prev_lines,
+                    curr_lines,
+                    fromfile=prev["stage"],
+                    tofile=curr["stage"],
+                    lineterm="",
+                )
+            )
 
-            console.print(f"[bold cyan]─── {curr['stage']} ───[/bold cyan] "
-                          f"[dim]({curr['model']}, {curr['created_at']})[/dim]")
+            console.print(
+                f"[bold cyan]─── {curr['stage']} ───[/bold cyan] "
+                f"[dim]({curr['model']}, {curr['created_at']})[/dim]"
+            )
 
             if not diff_lines:
                 console.print("[dim]  (no changes)[/dim]")
@@ -1835,8 +1890,11 @@ def _run_status(
                     all_stages_present.add(stage)
 
         # Column order
-        from .status import _GRID_STAGES_WITH_REFLECT, _GRID_STAGES
-        stages_order = _GRID_STAGES_WITH_REFLECT if "reflect" in all_stages_present else _GRID_STAGES
+        from .status import _GRID_STAGES, _GRID_STAGES_WITH_REFLECT
+
+        stages_order = (
+            _GRID_STAGES_WITH_REFLECT if "reflect" in all_stages_present else _GRID_STAGES
+        )
 
         table = Table(
             title="Chunk × Stage grid",
@@ -1898,7 +1956,7 @@ def _run_status(
             u = stage_unchanged.get(stage, 0)
             if c + u > 0:
                 summary_parts.append(f"{stage}: {c}Δ {u}=")
-        console.print(f"\n[dim]Legend: ✓=base  Δ=changed  =[dim]=unchanged  —=not run[/dim]")
+        console.print("\n[dim]Legend: ✓=base  Δ=changed  =[dim]=unchanged  —=not run[/dim]")
         console.print(f"[dim]Totals ({total} chunks): {' | '.join(summary_parts)}[/dim]\n")
         return
 
@@ -2025,8 +2083,11 @@ def _run_status(
     # Assembly map summary
     if report.assembly_map:
         map_str = "  |  ".join(
-            f"{stage}: {count}" for stage, count in
-            sorted(report.assembly_map.items(), key=lambda x: STAGE_WATERFALL.index(x[0]) if x[0] in STAGE_WATERFALL else 99)
+            f"{stage}: {count}"
+            for stage, count in sorted(
+                report.assembly_map.items(),
+                key=lambda x: STAGE_WATERFALL.index(x[0]) if x[0] in STAGE_WATERFALL else 99,
+            )
         )
         console.print(f"\n[bold]Assembly source:[/bold] {map_str}")
 
@@ -2046,17 +2107,26 @@ def prefer_cmd(
         help="Stage to prefer (translate, reflect, proofread, style, verify).",
     ),
     reason: str | None = typer.Option(
-        None, "--reason", "-r", help="Why this preference.",
+        None,
+        "--reason",
+        "-r",
+        help="Why this preference.",
     ),
     reset: bool = typer.Option(
-        False, "--reset", help="Remove preference, revert to waterfall.",
+        False,
+        "--reset",
+        help="Remove preference, revert to waterfall.",
     ),
     work_path: Path = typer.Option(
-        DEFAULT_WORK_DIR, "--work", "-w",
+        DEFAULT_WORK_DIR,
+        "--work",
+        "-w",
         help="Base work directory.",
     ),
     book: str | None = typer.Option(
-        None, "--book", "-b",
+        None,
+        "--book",
+        "-b",
         help="Book slug (subfolder of work dir). Auto-detected if only one exists.",
     ),
 ) -> None:
@@ -2082,10 +2152,7 @@ def prefer_cmd(
         raise typer.Exit(code=1)
 
     if stage not in STAGE_WATERFALL:
-        console.print(
-            f"[red]Invalid stage {stage!r}. "
-            f"Valid: {', '.join(STAGE_WATERFALL)}[/red]"
-        )
+        console.print(f"[red]Invalid stage {stage!r}. Valid: {', '.join(STAGE_WATERFALL)}[/red]")
         cache.close()
         raise typer.Exit(code=1)
 
@@ -2116,43 +2183,65 @@ def prefer_cmd(
 @app.command("assemble")
 def assemble_cmd(
     work_path: Path = typer.Argument(
-        ..., exists=True, file_okay=False,
+        ...,
+        exists=True,
+        file_okay=False,
         help="Book workdir (e.g. work/broken-homes).",
     ),
     from_stage: str | None = typer.Option(
-        None, "--from",
+        None,
+        "--from",
         help="Use only this stage for all chunks (ignores waterfall).",
     ),
     out: Path | None = typer.Option(
-        None, "--out", "-o", help="Output EPUB path.",
+        None,
+        "--out",
+        "-o",
+        help="Output EPUB path.",
     ),
     epub: Path | None = typer.Option(
-        None, "--epub", "-e", exists=True, dir_okay=False,
+        None,
+        "--epub",
+        "-e",
+        exists=True,
+        dir_okay=False,
         help="Source EPUB (for structure).",
     ),
     notes: bool | None = typer.Option(
-        None, "--notes/--no-notes",
+        None,
+        "--notes/--no-notes",
         help="Inject reader footnotes from glossary (overrides config).",
     ),
     note_types: str | None = typer.Option(
-        None, "--note-types",
+        None,
+        "--note-types",
         help="Comma-separated glossary types to annotate (e.g. concept,term,place).",
     ),
     series: str | None = typer.Option(
-        None, "--series", "-s",
+        None,
+        "--series",
+        "-s",
         help="Series slug (for reader notes glossary source).",
     ),
     glossary_path: Path | None = typer.Option(
-        None, "--glossary", "-g",
-        exists=True, dir_okay=False,
+        None,
+        "--glossary",
+        "-g",
+        exists=True,
+        dir_okay=False,
         help="Path to a book-level glossary.json (for reader notes). "
-             "Mutually exclusive with --series.",
+        "Mutually exclusive with --series.",
     ),
     config_path: Path = typer.Option(
-        DEFAULT_CONFIG, "--config", "-c", help="YAML config file.",
+        DEFAULT_CONFIG,
+        "--config",
+        "-c",
+        help="YAML config file.",
     ),
     work_dir: Path = typer.Option(
-        DEFAULT_WORK_DIR, "--work", "-w",
+        DEFAULT_WORK_DIR,
+        "--work",
+        "-w",
         help="Base directory for artifacts (used for series lookup).",
     ),
 ) -> None:
@@ -2194,8 +2283,7 @@ def assemble_cmd(
 
     if from_stage and from_stage not in STAGE_WATERFALL:
         console.print(
-            f"[red]Invalid stage {from_stage!r}. "
-            f"Valid: {', '.join(STAGE_WATERFALL)}[/red]"
+            f"[red]Invalid stage {from_stage!r}. Valid: {', '.join(STAGE_WATERFALL)}[/red]"
         )
         raise typer.Exit(code=1)
 
@@ -2271,14 +2359,12 @@ def assemble_cmd(
 
         cached_chunker = cache.get_meta("chunker_params")
         if cached_chunker:
-            chunk_target_words = cached_chunker.get(
-                "target_words", cfg.chunker.target_words
-            )
-            chunk_overlap = cached_chunker.get(
-                "overlap_paragraphs", cfg.chunker.overlap_paragraphs
-            )
-            if (chunk_target_words != cfg.chunker.target_words
-                    or chunk_overlap != cfg.chunker.overlap_paragraphs):
+            chunk_target_words = cached_chunker.get("target_words", cfg.chunker.target_words)
+            chunk_overlap = cached_chunker.get("overlap_paragraphs", cfg.chunker.overlap_paragraphs)
+            if (
+                chunk_target_words != cfg.chunker.target_words
+                or chunk_overlap != cfg.chunker.overlap_paragraphs
+            ):
                 console.print(
                     f"[dim]Using chunker params from cache: "
                     f"target_words={chunk_target_words}, "
@@ -2299,15 +2385,14 @@ def assemble_cmd(
         # In assemble flow the book is loaded fresh from EPUB, so ALL chunks
         # need rehydration — including those resolved to 'translate'.
         rehydrated, failed_ids = rehydrate_book_from_waterfall(
-            cache, chunk_set, forced_stage=from_stage,
+            cache,
+            chunk_set,
+            forced_stage=from_stage,
             rehydrate_all=True,
         )
 
         total_expected = len(chunk_set.chunks)
-        console.print(
-            f"[dim]Rehydrated {rehydrated}/{total_expected} chunks "
-            f"from cache.[/dim]"
-        )
+        console.print(f"[dim]Rehydrated {rehydrated}/{total_expected} chunks from cache.[/dim]")
 
         # Check for incomplete rehydration
         if failed_ids:
@@ -2355,12 +2440,11 @@ def assemble_cmd(
                 )
             except GlossaryLoadError as e:
                 console.print(f"[red]Error loading glossary:[/red] {e}")
-                raise typer.Exit(code=1)
+                raise typer.Exit(code=1) from e
 
             if glossary is None and series:
                 console.print(
-                    f"[yellow]Warning:[/yellow] Series {series!r} not found. "
-                    f"Skipping reader notes."
+                    f"[yellow]Warning:[/yellow] Series {series!r} not found. Skipping reader notes."
                 )
             elif glossary is None and not series and not glossary_path:
                 console.print(
@@ -2408,9 +2492,7 @@ def assemble_cmd(
 
         console.print(f"\n[green]Assembled EPUB:[/green] {out_path}")
         if note_stats and note_stats.notes_injected > 0:
-            console.print(
-                f"[dim]  Reader notes: {note_stats.notes_injected} footnotes[/dim]"
-            )
+            console.print(f"[dim]  Reader notes: {note_stats.notes_injected} footnotes[/dim]")
     finally:
         cache.close()
 
@@ -2424,11 +2506,15 @@ def assemble_cmd(
 def cover_extract_cmd(
     epub: Path = typer.Argument(..., exists=True, dir_okay=False, help="Source EPUB."),
     out: Path | None = typer.Option(
-        None, "--out", "-o",
+        None,
+        "--out",
+        "-o",
         help="Output image path (default: <epub-stem>-cover.<ext>).",
     ),
     force: bool = typer.Option(
-        False, "--force", "-f",
+        False,
+        "--force",
+        "-f",
         help="Overwrite output file if it already exists.",
     ),
 ) -> None:
@@ -2463,8 +2549,7 @@ def cover_extract_cmd(
 
     if out.exists() and not force:
         console.print(
-            f"[red]Output file already exists: {out}[/red]\n"
-            f"[dim]Use --force to overwrite.[/dim]"
+            f"[red]Output file already exists: {out}[/red]\n[dim]Use --force to overwrite.[/dim]"
         )
         raise typer.Exit(code=1)
 
@@ -2511,11 +2596,17 @@ def _mime_to_extension(mime: str | None) -> str:
 def cover_replace(
     epub: Path = typer.Argument(..., exists=True, dir_okay=False, help="Source EPUB."),
     image: Path = typer.Option(
-        ..., "--image", "-i", exists=True, dir_okay=False,
+        ...,
+        "--image",
+        "-i",
+        exists=True,
+        dir_okay=False,
         help="Path to the new cover image (jpg/png/webp).",
     ),
     out: Path | None = typer.Option(
-        None, "--out", "-o",
+        None,
+        "--out",
+        "-o",
         help="Output EPUB path (default: <source>-cover.epub).",
     ),
 ) -> None:
@@ -2547,34 +2638,48 @@ def cover_replace(
 def cover_translate_cmd(
     epub: Path = typer.Argument(..., exists=True, dir_okay=False, help="Source EPUB."),
     title: str | None = typer.Option(
-        None, "--title", "-t",
-        help="Translated book title (optional — if omitted, the model translates all text automatically).",
+        None,
+        "--title",
+        "-t",
+        help="Translated book title (optional — if omitted, the model translates all text).",
     ),
     author: str | None = typer.Option(
-        None, "--author", "-a",
+        None,
+        "--author",
+        "-a",
         help="Author name for the cover (default: keep original).",
     ),
     model: str | None = typer.Option(
-        None, "--model", "-m",
+        None,
+        "--model",
+        "-m",
         help="Override the cover model (default from config).",
     ),
     config_path: Path = typer.Option(
-        DEFAULT_CONFIG, "--config", "-c", help="YAML config file.",
+        DEFAULT_CONFIG,
+        "--config",
+        "-c",
+        help="YAML config file.",
     ),
     out: Path | None = typer.Option(
-        None, "--out", "-o",
+        None,
+        "--out",
+        "-o",
         help="Output EPUB path (default: <source>-cover-translated.epub).",
     ),
     target_lang: str = typer.Option(
-        ..., "--target-lang",
+        ...,
+        "--target-lang",
         help="Target language name for the prompt (e.g. Russian, German).",
     ),
     aspect_ratio: str = typer.Option(
-        "2:3", "--aspect-ratio",
+        "2:3",
+        "--aspect-ratio",
         help="Output aspect ratio (default: 2:3 for book covers).",
     ),
     image_size: str = typer.Option(
-        "1K", "--image-size",
+        "1K",
+        "--image-size",
         help="Output resolution: 1K, 2K, or 4K.",
     ),
 ) -> None:
@@ -2591,7 +2696,8 @@ def cover_translate_cmd(
     Examples:
         btrans cover translate book.epub --target-lang Russian
         btrans cover translate book.epub --target-lang Russian --title "Реки Лондона"
-        btrans cover translate book.epub --target-lang Russian --title "Реки Лондона" --author "Бен Ааронович"
+        btrans cover translate book.epub --target-lang Russian \\
+            --title "Реки Лондона" --author "Бен Ааронович"
         btrans cover translate book.epub --target-lang Russian --model openai/gpt-5.4-image-2
     """
     from .cover import find_cover_in_epub, translate_cover
@@ -2628,7 +2734,7 @@ def cover_translate_cmd(
     )
     console.print("[dim]Generating translated cover...[/dim]")
 
-    provider = create_provider()
+    provider = create_image_provider(cfg)
     dest = out or epub.with_stem(f"{epub.stem}-cover-translated")
 
     try:

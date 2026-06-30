@@ -1,0 +1,68 @@
+# Example: text via kiro-gateway, image via OpenRouter.
+#
+# Copy this to configs/default.yaml (or use --config path) to use
+# kiro-gateway for text tasks while keeping OpenRouter for cover
+# image generation.
+#
+# Requires:
+#   - kiro-gateway running on localhost:8000
+#   - KIRO_GATEWAY_API_KEY set in .env (your PROXY_API_KEY from kiro-gateway)
+#   - OPENROUTER_API_KEY set in .env (for cover image generation)
+
+source_lang: en
+target_lang: ru
+
+providers:
+  text:
+    base_url: "http://localhost:8000/v1"
+    api_key_env: "KIRO_GATEWAY_API_KEY"
+  image:
+    base_url: "https://openrouter.ai/api/v1"
+    api_key_env: "OPENROUTER_API_KEY"
+
+chunker:
+  target_words: 2000
+  overlap_paragraphs: 1
+
+translate:
+  parallelism: 1
+
+# Model names must match your provider's format.
+# kiro-gateway normalizes names automatically (claude-sonnet-4-5 → ok).
+models:
+  glossary:   claude-sonnet-4-5
+  translate:  claude-sonnet-4-5
+  judge:      claude-haiku-4-5
+  reflect:    claude-sonnet-4-5
+  proofread:  claude-haiku-4-5
+  style:      claude-sonnet-4-5
+  verify:     claude-sonnet-4-5
+
+reflection:
+  trigger_score: 3
+  extended_thinking: true
+
+pauses:
+  after_glossary: true
+  after_translate: true
+
+stages:
+  proofread: true
+  style: true
+  verify: true
+
+retry:
+  max_attempts: 5
+  backoff_base: 2.0
+
+notifications:
+  enabled: true
+  provider: telegram
+
+cost:
+  hard_limit_usd: 50.0
+
+reader_notes:
+  enabled: false
+  types: [concept, term]
+  scope: first-in-book

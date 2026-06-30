@@ -2,15 +2,29 @@
 
 from __future__ import annotations
 
-from enum import Enum
+from enum import StrEnum
 from typing import Literal
 
 from pydantic import BaseModel, Field
 
-
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
+
+
+class ProviderConfig(BaseModel):
+    """Configuration for a single OpenAI-compatible provider endpoint."""
+
+    base_url: str = "https://openrouter.ai/api/v1"
+    api_key_env: str = "OPENROUTER_API_KEY"
+    extra_headers: dict[str, str] = Field(default_factory=dict)
+
+
+class ProvidersConfig(BaseModel):
+    """Independent provider endpoints for text and image tasks."""
+
+    text: ProviderConfig = Field(default_factory=ProviderConfig)
+    image: ProviderConfig = Field(default_factory=ProviderConfig)
 
 
 class ModelsConfig(BaseModel):
@@ -74,6 +88,7 @@ class CostConfig(BaseModel):
 class Config(BaseModel):
     source_lang: str = "en"
     target_lang: str = "ru"
+    providers: ProvidersConfig = Field(default_factory=ProvidersConfig)
     chunker: ChunkerConfig = Field(default_factory=ChunkerConfig)
     translate: TranslateConfig = Field(default_factory=TranslateConfig)
     models: ModelsConfig = Field(default_factory=ModelsConfig)
@@ -149,7 +164,7 @@ class SeriesGlossary(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-class Stage(str, Enum):
+class Stage(StrEnum):
     INIT = "init"
     EXTRACT = "extract"
     GLOSSARY = "glossary"

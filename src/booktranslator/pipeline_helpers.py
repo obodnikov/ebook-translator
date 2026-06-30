@@ -16,6 +16,7 @@ from typing import Any
 
 from .cache import Cache
 from .chunker import ChunkSet
+from .models import Config, ProviderConfig
 from .provider import OpenRouterProvider
 
 logger = logging.getLogger(__name__)
@@ -26,21 +27,45 @@ CHUNKER_META_KEY = "chunker_params"
 
 class ChunkerConfigMismatchError(Exception):
     """Raised when judge/reflect chunker config differs from translate time."""
+
     pass
 
 
-def create_provider() -> OpenRouterProvider:
-    """Create the LLM provider through a single factory point.
+def _create_provider_from_config(provider_cfg: ProviderConfig) -> OpenRouterProvider:
+    """Instantiate a provider from a ProviderConfig section."""
+    return OpenRouterProvider(
+        base_url=provider_cfg.base_url,
+        api_key_env=provider_cfg.api_key_env,
+        extra_headers=provider_cfg.extra_headers or None,
+    )
+
+
+def create_provider(cfg: Config | None = None) -> OpenRouterProvider:
+    """Create the text LLM provider through a single factory point.
 
     All commands should use this instead of calling OpenRouterProvider()
     directly, so provider configuration changes propagate everywhere.
+
+    If cfg is provided, uses cfg.providers.text settings.
+    Otherwise falls back to defaults (OpenRouter + OPENROUTER_API_KEY).
     """
+    if cfg is not None:
+        return _create_provider_from_config(cfg.providers.text)
     return OpenRouterProvider()
 
 
-def save_chunker_params(
-    cache: Cache, target_words: int, overlap_paragraphs: int
-) -> None:
+def create_image_provider(cfg: Config | None = None) -> OpenRouterProvider:
+    """Create the image generation provider.
+
+    Uses cfg.providers.image settings if provided.
+    Otherwise falls back to defaults (OpenRouter + OPENROUTER_API_KEY).
+    """
+    if cfg is not None:
+        return _create_provider_from_config(cfg.providers.image)
+    return OpenRouterProvider()
+
+
+def save_chunker_params(cache: Cache, target_words: int, overlap_paragraphs: int) -> None:
     """Persist chunker parameters used during translate.
 
     Called at translate time so that judge/reflect can verify they're
@@ -68,15 +93,16 @@ def save_chunker_params(
             f"Use a different workdir or clear the cache to re-translate "
             f"with new settings."
         )
-    cache.set_meta(CHUNKER_META_KEY, {
-        "target_words": target_words,
-        "overlap_paragraphs": overlap_paragraphs,
-    })
+    cache.set_meta(
+        CHUNKER_META_KEY,
+        {
+            "target_words": target_words,
+            "overlap_paragraphs": overlap_paragraphs,
+        },
+    )
 
 
-def verify_chunker_params(
-    cache: Cache, target_words: int, overlap_paragraphs: int
-) -> None:
+def verify_chunker_params(cache: Cache, target_words: int, overlap_paragraphs: int) -> None:
     """Verify current chunker params match those used during translate.
 
     Raises ChunkerConfigMismatchError if they differ. If no saved params
@@ -204,9 +230,7 @@ def build_reflect_input(
     Uses O(1) lookups for both originals and translations.
     """
     # Collect originals with paragraphs (O(n) over chunk_set, once)
-    originals_map = collect_chunk_originals_with_paragraphs(
-        chunk_set, chunk_ids_to_reflect
-    )
+    originals_map = collect_chunk_originals_with_paragraphs(chunk_set, chunk_ids_to_reflect)
 
     # Collect translations — for reflect, we want the 'translate' stage
     # (the raw first translation that was judged), not a later stage.
@@ -227,20 +251,18 @@ def build_reflect_input(
         judge_data = judge_by_id.get(cid, {})
         judge_score = int(judge_data.get("score", 0))
         raw_issues = judge_data.get("issues", [])
-        judge_issues = (
-            [str(i) for i in raw_issues]
-            if isinstance(raw_issues, list)
-            else []
-        )
+        judge_issues = [str(i) for i in raw_issues] if isinstance(raw_issues, list) else []
 
-        chunks_data.append({
-            "chunk_id": cid,
-            "original_text": original_text,
-            "original_paragraphs": original_paragraphs,
-            "translated_text": translated_text,
-            "judge_score": judge_score,
-            "judge_issues": judge_issues,
-        })
+        chunks_data.append(
+            {
+                "chunk_id": cid,
+                "original_text": original_text,
+                "original_paragraphs": original_paragraphs,
+                "translated_text": translated_text,
+                "judge_score": judge_score,
+                "judge_issues": judge_issues,
+            }
+        )
 
     return chunks_data
 
@@ -368,7 +390,10 @@ def collect_waterfall_paragraphs(
                 # Paragraph count mismatch — try earlier stage
                 logger.debug(
                     "Waterfall %s/%s: %d paragraphs, expected %d; trying earlier stage",
-                    cid, stage, len(fragments), expected,
+                    cid,
+                    stage,
+                    len(fragments),
+                    expected,
                 )
                 continue
 
@@ -378,9 +403,7 @@ def collect_waterfall_paragraphs(
     return result
 
 
-def _parse_waterfall_content(
-    content: str, marker_re: re.Pattern[str]
-) -> list[str] | None:
+def _parse_waterfall_content(content: str, marker_re: re.Pattern[str]) -> list[str] | None:
     """Parse ===PARAGRAPH N=== markers from cached content.
 
     Returns list of fragments, or None if no markers found.
@@ -448,9 +471,7 @@ def rehydrate_book_from_waterfall(
     _MARKER_RE = re.compile(r"^===PARAGRAPH\s+\d+===\s*$", re.MULTILINE)
 
     # Matches a `&` that does NOT start a valid XML entity
-    _BARE_AMP_RE = re.compile(
-        r"&(?!(?:amp|lt|gt|quot|apos|#\d+|#x[0-9a-fA-F]+);)"
-    )
+    _BARE_AMP_RE = re.compile(r"&(?!(?:amp|lt|gt|quot|apos|#\d+|#x[0-9a-fA-F]+);)")
 
     # Build chunk lookup: id -> Chunk
     chunk_by_id = {c.id: c for c in chunk_set.chunks}
@@ -473,8 +494,7 @@ def rehydrate_book_from_waterfall(
             # Translate flow: in-memory trees already have translate content,
             # only rehydrate chunks with later stages.
             chunks_to_rehydrate = [
-                cid for cid, stage in resolved_stages.items()
-                if stage != "translate"
+                cid for cid, stage in resolved_stages.items() if stage != "translate"
             ]
 
     if not chunks_to_rehydrate:
@@ -553,9 +573,7 @@ def rehydrate_book_from_waterfall(
             parsed_elements: list[tuple[int, etree._Element]] = []
             all_ok = True
 
-            for para_idx, frag_str in zip(
-                chunk.paragraph_indexes, candidate, strict=True
-            ):
+            for para_idx, frag_str in zip(chunk.paragraph_indexes, candidate, strict=True):
                 frag_str = _BARE_AMP_RE.sub("&amp;", frag_str)
                 try:
                     new_el = etree.fromstring(frag_str)
@@ -595,10 +613,7 @@ def rehydrate_book_from_waterfall(
 
     if forced_stage or rehydrate_all:
         # Report chunks that failed to rehydrate
-        failed_ids = [
-            cid for cid in chunks_to_rehydrate
-            if cid not in _rehydrated_set
-        ]
+        failed_ids = [cid for cid in chunks_to_rehydrate if cid not in _rehydrated_set]
         return rehydrated, failed_ids
 
     return rehydrated, []

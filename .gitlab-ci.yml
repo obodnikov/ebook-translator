@@ -1,0 +1,6 @@
+include:
+  - project: 'mike/ci-templates'
+    file: '/gitleaks.yml'
+
+stages:
+  - test
