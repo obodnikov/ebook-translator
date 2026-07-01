@@ -25,6 +25,7 @@ class CompletionResult:
     total_tokens: int
     model: str
     raw: dict
+    finish_reason: str | None = None  # e.g. "stop", "length", "content_filter"
 
 
 @dataclass
@@ -91,6 +92,7 @@ class OpenRouterProvider:
         temperature: float = 0.3,
         max_tokens: int | None = None,
         response_format: dict | None = None,
+        reasoning_effort: str | None = None,
     ) -> CompletionResult:
         messages: list[dict] = []
         if system:
@@ -106,6 +108,15 @@ class OpenRouterProvider:
             kwargs["max_tokens"] = max_tokens
         if response_format is not None:
             kwargs["response_format"] = response_format
+        # Pass reasoning_effort via extra_body so it merges into the request
+        # body as a non-standard field understood by kiro-gateway and some
+        # OpenRouter models (e.g. reasoning_effort: "none" disables thinking).
+        if reasoning_effort is not None:
+            # Merge into extra_body rather than overwriting, so other callers
+            # can also set extra_body fields without conflict.
+            extra = dict(kwargs.get("extra_body") or {})
+            extra["reasoning_effort"] = reasoning_effort
+            kwargs["extra_body"] = extra
 
         response = self.client.chat.completions.create(**kwargs)
 
@@ -123,6 +134,7 @@ class OpenRouterProvider:
             output_tokens=output_tokens,
             total_tokens=total_tokens,
             model=response.model or model,
+            finish_reason=getattr(choice, "finish_reason", None),
             raw=response.model_dump() if hasattr(response, "model_dump") else {},
         )
 

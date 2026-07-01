@@ -1,8 +1,9 @@
 ---
-version: 3
+version: 5
 model: anthropic/claude-sonnet-4.6
 temperature: 0.2
 max_tokens: 16000
+reasoning_effort: none
 ---
 
 # System
@@ -76,10 +77,26 @@ content actually requires a change.
 
 ## Output schema
 
-Output STRICT JSON, no preamble, no code fences, no commentary:
+Output STRICT JSON, no preamble, no code fences, no commentary.
+
+The response MUST be a JSON object with three top-level fields:
+
+1. `bookstart` — copy the value `xxxx` from the marker `[[BOOKSTART::xxxx]]` that
+   appears at the very beginning of the provided text. Read it from the text; do not
+   invent it. If you do not see such a marker at the start — the text was not delivered
+   in full; still return `bookstart` with whatever value you find closest to the start.
+2. `bookend` — copy the value `xxxx` from the marker `[[BOOKEND::xxxx]]` that
+   appears at the very end of the provided text. Read it from the text; do not
+   invent it. If you do not see such a marker at the end — the text was not delivered
+   in full; still return `bookend` with whatever value you find closest to the end.
+3. `entries` — the list of glossary entries (schema below).
+
+Do NOT return a top-level JSON array. Always return an object.
 
 ```
 {
+  "bookstart": "xxxx",
+  "bookend": "xxxx",
   "entries": [
     {
       "original": "string",

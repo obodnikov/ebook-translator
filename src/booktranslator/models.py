@@ -21,10 +21,20 @@ class ProviderConfig(BaseModel):
 
 
 class ProvidersConfig(BaseModel):
-    """Independent provider endpoints for text and image tasks."""
+    """Independent provider endpoints. `text` is the default for all text
+    stages; any stage may override it via its own optional field."""
 
     text: ProviderConfig = Field(default_factory=ProviderConfig)
     image: ProviderConfig = Field(default_factory=ProviderConfig)
+
+    # Optional per-stage overrides. Unset -> fall back to `text`.
+    glossary: ProviderConfig | None = None
+    translate: ProviderConfig | None = None
+    judge: ProviderConfig | None = None
+    reflect: ProviderConfig | None = None
+    proofread: ProviderConfig | None = None
+    style: ProviderConfig | None = None
+    verify: ProviderConfig | None = None
 
 
 class ModelsConfig(BaseModel):
@@ -51,7 +61,6 @@ class TranslateConfig(BaseModel):
 
 class ReflectionConfig(BaseModel):
     trigger_score: int = 3
-    extended_thinking: bool = True
 
 
 class PausesConfig(BaseModel):

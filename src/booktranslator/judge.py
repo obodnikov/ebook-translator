@@ -73,9 +73,7 @@ class Judge:
         self.source_lang = source_lang
         self.target_lang = target_lang
 
-        self._glossary_block = (
-            render_for_prompt(glossary) if glossary else "(no glossary provided)"
-        )
+        self._glossary_block = render_for_prompt(glossary) if glossary else "(no glossary provided)"
         self._lock = threading.Lock()
 
     def _build_context(
@@ -120,28 +118,22 @@ class Judge:
                 data, _ = decoder.raw_decode(text)
             except json.JSONDecodeError as e2:
                 raise ValueError(
-                    f"Judge response is not valid JSON: {e2}. "
-                    f"First 200 chars: {text[:200]!r}"
+                    f"Judge response is not valid JSON: {e2}. First 200 chars: {text[:200]!r}"
                 ) from e2
 
         raw_score = data.get("score")
         if raw_score is None:
             raise ValueError(
-                "Judge response missing required 'score' field. "
-                f"Got keys: {list(data.keys())}"
+                f"Judge response missing required 'score' field. Got keys: {list(data.keys())}"
             )
 
         try:
             score = int(raw_score)
         except (TypeError, ValueError) as e:
-            raise ValueError(
-                f"Judge 'score' is not a valid integer: {raw_score!r}"
-            ) from e
+            raise ValueError(f"Judge 'score' is not a valid integer: {raw_score!r}") from e
 
         if not 1 <= score <= 5:
-            raise ValueError(
-                f"Judge 'score' out of range 1-5: {score}"
-            )
+            raise ValueError(f"Judge 'score' out of range 1-5: {score}")
 
         raw_issues = data.get("issues", [])
         if isinstance(raw_issues, list):
@@ -177,6 +169,7 @@ class Judge:
 
         if cached is not None:
             raw_text = cached.content
+            result = None
             with self._lock:
                 stats.chunks_cached += 1
         else:
@@ -186,8 +179,25 @@ class Judge:
                 user=user,
                 temperature=self.prompt.temperature,
                 max_tokens=self.prompt.max_tokens,
+                reasoning_effort=self.prompt.reasoning_effort,
             )
             raw_text = result.text
+            # Guard: empty content means the provider routed the answer
+            # elsewhere (tool call / reasoning_content). Raise BEFORE caching so
+            # a poisoned empty response is never written to the cache.
+            if not raw_text.strip():
+                raise ValueError(
+                    "Judge model returned empty content "
+                    f"(finish_reason={result.finish_reason!r}). Check "
+                    "WEB_SEARCH_ENABLED / FAKE_REASONING on the gateway."
+                )
+
+        # Validate BEFORE caching: _parse_judge_response raises on invalid JSON,
+        # so a malformed/empty response is never written to the cache.
+        score, issues = self._parse_judge_response(raw_text)
+
+        # Cache only fresh, validated results (never on a cache hit).
+        if result is not None:
             with self._lock:
                 self.cache.put(
                     key=cache_key,
@@ -202,8 +212,6 @@ class Judge:
                 stats.chunks_judged += 1
                 stats.input_tokens += result.input_tokens
                 stats.output_tokens += result.output_tokens
-
-        score, issues = self._parse_judge_response(raw_text)
         judge_result = JudgeResult(
             chunk_id=chunk_id,
             score=score,

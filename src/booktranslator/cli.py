@@ -39,7 +39,7 @@ from .pipeline_helpers import (
     collect_stage_translations,
     collect_waterfall_paragraphs,
     create_image_provider,
-    create_provider,
+    create_stage_provider,
     normalize_judge_map,
     rehydrate_book_from_waterfall,
     save_chunker_params,
@@ -156,7 +156,7 @@ def glossary_extract(
         cache.conn.execute("DELETE FROM cache WHERE stage = 'glossary'")
         cache.conn.commit()
 
-    provider = create_provider(cfg)
+    provider = create_stage_provider(cfg, "glossary")
     chosen_model = model or cfg.models.glossary
     console.print(f"[bold]Model:[/bold]   {chosen_model}")
     console.print("[dim]Sending full book to the LLM...[/dim]")
@@ -640,7 +640,7 @@ def translate(
         console.print(f"[red]Error:[/red] {e}")
         cache.close()
         raise typer.Exit(code=1) from e
-    provider = create_provider(cfg)
+    provider = create_stage_provider(cfg, "translate")
     chosen_model = model or cfg.models.translate
     console.print(f"[bold]Model:[/bold]    {chosen_model}")
     console.print("[dim]Translating chunks...[/dim]\n")
@@ -712,7 +712,7 @@ def translate(
                 )
 
                 judge = Judge(
-                    provider=provider,
+                    provider=create_stage_provider(cfg, "judge"),
                     prompt_path=JUDGE_PROMPT,
                     cache=cache,
                     glossary=glossary,
@@ -797,7 +797,7 @@ def translate(
             )
 
             reflector = Reflector(
-                provider=provider,
+                provider=create_stage_provider(cfg, "reflect"),
                 reflect_prompt_path=REFLECT_PROMPT,
                 translate_prompt_path=TRANSLATE_PROMPT,
                 cache=cache,
@@ -925,7 +925,7 @@ def translate(
         )
 
         processor = PostProcessor(
-            provider=provider,
+            provider=create_stage_provider(cfg, pp_stage),
             prompt_path=pp_prompt_path,
             cache=cache,
             glossary=glossary,
@@ -1205,7 +1205,7 @@ def judge_cmd(
 
     JUDGE_PROMPT = Path("prompts/judge.md")
     judge = Judge(
-        provider=create_provider(cfg),
+        provider=create_stage_provider(cfg, "judge"),
         prompt_path=JUDGE_PROMPT,
         cache=cache,
         glossary=glossary,
@@ -1411,7 +1411,7 @@ def reflect_cmd(
 
     REFLECT_PROMPT = Path("prompts/reflect.md")
     reflector = Reflector(
-        provider=create_provider(cfg),
+        provider=create_stage_provider(cfg, "reflect"),
         reflect_prompt_path=REFLECT_PROMPT,
         translate_prompt_path=TRANSLATE_PROMPT,
         cache=cache,
@@ -1767,7 +1767,7 @@ def _run_postprocess_cmd(
         console.print(f"[bold]Model:[/bold] {chosen_model}")
 
         processor = PostProcessor(
-            provider=create_provider(cfg),
+            provider=create_stage_provider(cfg, stage),
             prompt_path=prompt_path,
             cache=cache,
             glossary=glossary,

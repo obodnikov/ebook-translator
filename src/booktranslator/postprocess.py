@@ -40,14 +40,10 @@ LANG_NAMES = {
     "hu": "Hungarian",
 }
 
-_PARAGRAPH_MARKER_RE = re.compile(
-    r"^===PARAGRAPH\s+(\d+)===\s*$", re.MULTILINE
-)
+_PARAGRAPH_MARKER_RE = re.compile(r"^===PARAGRAPH\s+(\d+)===\s*$", re.MULTILINE)
 
 # Matches a `&` that does NOT start a valid XML entity.
-_BARE_AMPERSAND_RE = re.compile(
-    r"&(?!(?:amp|lt|gt|quot|apos|#\d+|#x[0-9a-fA-F]+);)"
-)
+_BARE_AMPERSAND_RE = re.compile(r"&(?!(?:amp|lt|gt|quot|apos|#\d+|#x[0-9a-fA-F]+);)")
 
 PostprocessStage = Literal["proofread", "style", "verify"]
 
@@ -104,9 +100,7 @@ class PostProcessor:
         self.source_lang = source_lang
         self.target_lang = target_lang
 
-        self._glossary_block = (
-            render_for_prompt(glossary) if glossary else "(no glossary provided)"
-        )
+        self._glossary_block = render_for_prompt(glossary) if glossary else "(no glossary provided)"
         self._lock = threading.Lock()
 
     def _build_context(
@@ -150,8 +144,7 @@ class PostProcessor:
         matches = list(_PARAGRAPH_MARKER_RE.finditer(text))
         if not matches:
             raise ValueError(
-                "No '===PARAGRAPH N===' markers found in response. "
-                f"First 200 chars: {text[:200]!r}"
+                f"No '===PARAGRAPH N===' markers found in response. First 200 chars: {text[:200]!r}"
             )
 
         fragments: list[str] = []
@@ -162,9 +155,7 @@ class PostProcessor:
             fragments.append(fragment)
 
         if len(fragments) != expected_n:
-            raise ValueError(
-                f"Expected {expected_n} paragraphs, got {len(fragments)}."
-            )
+            raise ValueError(f"Expected {expected_n} paragraphs, got {len(fragments)}.")
         return fragments
 
     def _parse_delta_response(
@@ -204,7 +195,8 @@ class PostProcessor:
                 if isinstance(patches, list):
                     logger.debug(
                         "Found JSON array at offset %d (skipped %d chars of preamble)",
-                        json_start, json_start,
+                        json_start,
+                        json_start,
                     )
                     return self._apply_patches(patches, input_paragraphs)
             except json.JSONDecodeError:
@@ -231,26 +223,20 @@ class PostProcessor:
                     raise ValueError(
                         f"Delta response is not valid JSON or NO_CHANGES. "
                         f"First 200 chars: {text[:200]!r}"
-                    )
+                    ) from None
 
         if not isinstance(patches, list):
-            raise ValueError(
-                f"Delta response is not a JSON array. Got: {type(patches).__name__}"
-            )
+            raise ValueError(f"Delta response is not a JSON array. Got: {type(patches).__name__}")
 
         return self._apply_patches(patches, input_paragraphs)
 
-    def _apply_patches(
-        self, patches: list, input_paragraphs: list[str]
-    ) -> tuple[list[str], bool]:
+    def _apply_patches(self, patches: list, input_paragraphs: list[str]) -> tuple[list[str], bool]:
         """Apply a list of patch dicts to input paragraphs.
 
         Returns (output_paragraphs, changed).
         """
         if not isinstance(patches, list):
-            raise ValueError(
-                f"Delta response is not a JSON array. Got: {type(patches).__name__}"
-            )
+            raise ValueError(f"Delta response is not a JSON array. Got: {type(patches).__name__}")
 
         if len(patches) == 0:
             return list(input_paragraphs), False
@@ -264,15 +250,11 @@ class PostProcessor:
             p_idx = patch.get("p")
             p_text = patch.get("text")
             if p_idx is None or p_text is None:
-                raise ValueError(
-                    f"Patch missing 'p' or 'text': {patch!r}"
-                )
+                raise ValueError(f"Patch missing 'p' or 'text': {patch!r}")
             # p is 1-based
             idx = int(p_idx) - 1
             if idx < 0 or idx >= n:
-                raise ValueError(
-                    f"Patch paragraph index {p_idx} out of range 1..{n}"
-                )
+                raise ValueError(f"Patch paragraph index {p_idx} out of range 1..{n}")
             output[idx] = str(p_text).strip()
 
         return output, True
@@ -297,11 +279,9 @@ class PostProcessor:
             return True
         if stripped.startswith("["):
             return True
-        # If it has paragraph markers, it's legacy full-text format
-        if _PARAGRAPH_MARKER_RE.search(stripped):
-            return False
-        # Ambiguous — try delta
-        return True
+        # If it has paragraph markers, it's legacy full-text format;
+        # otherwise (ambiguous) treat as delta.
+        return not _PARAGRAPH_MARKER_RE.search(stripped)
 
     def _reconstruct_full_text(self, paragraphs: list[str]) -> str:
         """Rebuild the full ===PARAGRAPH N=== format for cache storage."""
@@ -332,17 +312,17 @@ class PostProcessor:
         # Try closing the array at each } from the end
         last_brace = text.rfind("}")
         while last_brace > 0:
-            candidate = text[:last_brace + 1] + "]"
+            candidate = text[: last_brace + 1] + "]"
             try:
                 result = json.loads(candidate)
                 if isinstance(result, list) and all(
-                    isinstance(p, dict) and "p" in p and "text" in p
-                    for p in result
+                    isinstance(p, dict) and "p" in p and "text" in p for p in result
                 ):
                     logger.info(
-                        "Salvaged %d patches from truncated JSON "
-                        "(%d/%d chars used)",
-                        len(result), last_brace + 1, len(text),
+                        "Salvaged %d patches from truncated JSON (%d/%d chars used)",
+                        len(result),
+                        last_brace + 1,
+                        len(text),
                     )
                     return result
             except json.JSONDecodeError:
@@ -395,8 +375,18 @@ class PostProcessor:
                 user=user,
                 temperature=self.prompt.temperature,
                 max_tokens=self.prompt.max_tokens,
+                reasoning_effort=self.prompt.reasoning_effort,
             )
             raw_text = result.text
+            # Guard: empty content means the provider routed the answer
+            # elsewhere (tool call / reasoning_content). Raise BEFORE the parse
+            # and cache below so a poisoned empty response is never stored.
+            if not raw_text.strip():
+                raise ValueError(
+                    f"{self.stage} model returned empty content "
+                    f"(finish_reason={result.finish_reason!r}). Check "
+                    "WEB_SEARCH_ENABLED / FAKE_REASONING on the gateway."
+                )
             with self._lock:
                 stats.chunks_processed += 1
                 stats.input_tokens += result.input_tokens
@@ -416,8 +406,10 @@ class PostProcessor:
                 logger.debug(
                     "%s chunk delta parse failed, raw response %d chars "
                     "(max_tokens=%s). Last 100: %r",
-                    self.stage, len(raw_text),
-                    self.prompt.max_tokens, raw_text[-100:],
+                    self.stage,
+                    len(raw_text),
+                    self.prompt.max_tokens,
+                    raw_text[-100:],
                 )
                 raise
             # Store reconstructed full text in cache (not the raw delta)
@@ -469,7 +461,9 @@ class PostProcessor:
             chunk_id=chunk_id,
             stage=self.stage,
             changed=changed,
-            content=self._reconstruct_full_text(output_paragraphs) if self._is_delta_response(raw_text) else raw_text,
+            content=self._reconstruct_full_text(output_paragraphs)
+            if self._is_delta_response(raw_text)
+            else raw_text,
         )
         with self._lock:
             stats.results.append(pp_result)
@@ -510,21 +504,23 @@ class PostProcessor:
                         stats.chunks_failed += 1
                     logger.warning(
                         "%s chunk %s failed: %s",
-                        self.stage, chunk_data["chunk_id"], e,
+                        self.stage,
+                        chunk_data["chunk_id"],
+                        e,
                     )
                 if on_progress:
                     on_progress(
-                        i + 1, len(chunks_data),
-                        chunk_data["chunk_id"], stats,
+                        i + 1,
+                        len(chunks_data),
+                        chunk_data["chunk_id"],
+                        stats,
                     )
             return stats
 
         done_count = 0
         with ThreadPoolExecutor(max_workers=parallelism) as pool:
             futures = {
-                pool.submit(
-                    self._process_chunk_safe, chunk_data, stats
-                ): chunk_data["chunk_id"]
+                pool.submit(self._process_chunk_safe, chunk_data, stats): chunk_data["chunk_id"]
                 for chunk_data in chunks_data
             }
             for fut in as_completed(futures):
@@ -535,19 +531,22 @@ class PostProcessor:
                         stats.chunks_failed += 1
                     logger.warning(
                         "%s chunk %s failed: %s",
-                        self.stage, chunk_id, err,
+                        self.stage,
+                        chunk_id,
+                        err,
                     )
                 done_count += 1
                 if on_progress:
                     on_progress(
-                        done_count, len(chunks_data), chunk_id, stats,
+                        done_count,
+                        len(chunks_data),
+                        chunk_id,
+                        stats,
                     )
 
         return stats
 
-    def _process_chunk_safe(
-        self, chunk_data: dict, stats: PostprocessStats
-    ) -> Exception | None:
+    def _process_chunk_safe(self, chunk_data: dict, stats: PostprocessStats) -> Exception | None:
         try:
             self.process_chunk(
                 chunk_id=chunk_data["chunk_id"],

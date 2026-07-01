@@ -1,21 +1,34 @@
-# Example: text via kiro-gateway, image via OpenRouter.
+# Example: text/translation stages via kiro-gateway, glossary and image via OpenRouter.
 #
-# Copy this to configs/default.yaml (or use --config path) to use
-# kiro-gateway for text tasks while keeping OpenRouter for cover
+# Copy this to configs/default.yaml (or use --config path) to route
+# translation stages through kiro-gateway while keeping OpenRouter for
+# glossary extraction (needs full book context, no truncation) and cover
 # image generation.
 #
 # Requires:
-#   - kiro-gateway running on localhost:8000
+#   - kiro-gateway running on localhost:9000
 #   - KIRO_GATEWAY_API_KEY set in .env (your PROXY_API_KEY from kiro-gateway)
-#   - OPENROUTER_API_KEY set in .env (for cover image generation)
+#   - OPENROUTER_API_KEY set in .env (for glossary + cover image generation)
 
 source_lang: en
 target_lang: ru
 
 providers:
-  text:
-    base_url: "http://localhost:8000/v1"
+  text:                       # default for all text stages (translate, judge, reflect, ...)
+    base_url: "http://localhost:9000/v1"
     api_key_env: "KIRO_GATEWAY_API_KEY"
+  glossary:                   # whole book -> needs large context without truncation
+    base_url: "https://openrouter.ai/api/v1"
+    api_key_env: "OPENROUTER_API_KEY"
+  judge:                   # whole book -> needs large context without truncation
+    base_url: "https://openrouter.ai/api/v1"
+    api_key_env: "OPENROUTER_API_KEY"
+  reflect:                   # whole book -> needs large context without truncation
+    base_url: "https://openrouter.ai/api/v1"
+    api_key_env: "OPENROUTER_API_KEY"
+  proofread:                   # whole book -> needs large context without truncation
+    base_url: "https://openrouter.ai/api/v1"
+    api_key_env: "OPENROUTER_API_KEY"
   image:
     base_url: "https://openrouter.ai/api/v1"
     api_key_env: "OPENROUTER_API_KEY"
@@ -28,19 +41,19 @@ translate:
   parallelism: 1
 
 # Model names must match your provider's format.
-# kiro-gateway normalizes names automatically (claude-sonnet-4-5 → ok).
+# - kiro-gateway: short names without prefix (claude-sonnet-4.6)
+# - OpenRouter: anthropic/ prefix required (anthropic/claude-sonnet-4.6)
 models:
-  glossary:   claude-sonnet-4-5
-  translate:  claude-sonnet-4-5
-  judge:      claude-haiku-4-5
-  reflect:    claude-sonnet-4-5
-  proofread:  claude-haiku-4-5
-  style:      claude-sonnet-4-5
-  verify:     claude-sonnet-4-5
+  glossary:   anthropic/claude-sonnet-4.6
+  translate:  claude-sonnet-4.6
+  judge:      anthropic/claude-haiku-4.5
+  reflect:    anthropic/claude-sonnet-4.6
+  proofread:  anthropic/claude-haiku-4.5
+  style:      claude-sonnet-4.6
+  verify:     claude-sonnet-4.6
 
 reflection:
   trigger_score: 3
-  extended_thinking: true
 
 pauses:
   after_glossary: true
@@ -63,6 +76,6 @@ cost:
   hard_limit_usd: 50.0
 
 reader_notes:
-  enabled: false
+  enabled: true
   types: [concept, term]
   scope: first-in-book
