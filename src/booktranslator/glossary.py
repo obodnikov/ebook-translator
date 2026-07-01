@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import secrets
 from pathlib import Path
 
 from pydantic import ValidationError
@@ -11,15 +12,25 @@ from pydantic import ValidationError
 from .cache import Cache
 from .epub_io import ExtractedBook
 from .models import Glossary, GlossaryEntry
-from .prompts import Prompt, load_prompt, render_prompt
+from .prompts import load_prompt, render_prompt
 from .provider import CompletionResult, OpenRouterProvider
-
 
 LANG_NAMES = {
     "en": "English",
     "ru": "Russian",
     "hu": "Hungarian",
 }
+
+
+class TruncationError(ValueError):
+    """Raised when the model response indicates the book text was truncated.
+
+    A truncated glossary would silently cover only part of the book, which
+    violates the "never corrupt a book" contract. Callers must surface this
+    loudly and must NOT write the glossary to disk.
+    """
+
+    pass
 
 
 def _strip_code_fences(text: str) -> str:
@@ -30,8 +41,11 @@ def _strip_code_fences(text: str) -> str:
     return text.strip()
 
 
-def _parse_llm_response(raw: str) -> list[GlossaryEntry]:
-    """Parse the LLM's JSON output into a list of validated entries.
+def _parse_llm_response(raw: str) -> tuple[str | None, str | None, list[GlossaryEntry]]:
+    """Parse the LLM's JSON output into (bookstart, bookend, entries).
+
+    Returns the bookstart value, bookend value (both None if absent/list
+    response), and the list of validated GlossaryEntry objects.
 
     Tolerates the extra `override` field used for series-aware extraction:
     it is folded into `notes` (prefixed with "[override] ") because the
@@ -43,13 +57,16 @@ def _parse_llm_response(raw: str) -> list[GlossaryEntry]:
         data = json.loads(cleaned)
     except json.JSONDecodeError as e:
         raise ValueError(
-            f"Model response is not valid JSON: {e}. "
-            f"First 200 chars: {cleaned[:200]!r}"
+            f"Model response is not valid JSON: {e}. First 200 chars: {cleaned[:200]!r}"
         ) from e
 
     if isinstance(data, list):
+        bookstart = None
+        bookend = None
         entries_raw = data
     elif isinstance(data, dict) and "entries" in data:
+        bookstart = data.get("bookstart")  # may be None if model omitted it
+        bookend = data.get("bookend")  # may be None if model omitted it
         entries_raw = data["entries"]
     else:
         raise ValueError(
@@ -76,10 +93,9 @@ def _parse_llm_response(raw: str) -> list[GlossaryEntry]:
 
     if errors and not entries:
         raise ValueError(
-            "No valid glossary entries could be parsed. Issues:\n"
-            + "\n".join(errors[:10])
+            "No valid glossary entries could be parsed. Issues:\n" + "\n".join(errors[:10])
         )
-    return entries
+    return bookstart, bookend, entries
 
 
 def extract_glossary(
@@ -100,13 +116,19 @@ def extract_glossary(
     If `known_terms` is given (typically the series glossary rendered as
     a compact table), it is injected into the prompt so the model can
     skip already-known names and only return new or overriding entries.
+
+    Raises TruncationError if the bookstart/bookend nonces are missing or wrong,
+    meaning the provider silently truncated the book text. The cache is
+    NOT written in that case.
     """
     prompt = load_prompt(prompt_path)
     chosen_model = model or prompt.model
     if not chosen_model:
         raise ValueError("No model specified (neither CLI/config nor prompt frontmatter)")
 
-    context = {
+    # Build stable context (WITHOUT nonce) for the cache key. The cache key
+    # must be deterministic across runs so that cache hits work correctly.
+    base_context = {
         "title": book.meta.title,
         "author": book.meta.author,
         "source_lang": source_lang,
@@ -116,10 +138,10 @@ def extract_glossary(
         "book_text": book.full_text(),
         "known_terms": known_terms or "",
     }
-    system, user = render_prompt(prompt, context)
+    system, user = render_prompt(prompt, base_context)
 
     cache_key = Cache.make_key(
-        "glossary",
+        "glossary_v2",  # v2: bookend guard introduced; invalidates pre-guard cache entries
         chosen_model,
         prompt.version,
         system,
@@ -127,17 +149,88 @@ def extract_glossary(
     )
     cached = cache.get(cache_key)
     if cached is not None:
-        raw_text = cached.content
-        result: CompletionResult | None = None
-    else:
+        # Cache hit: re-validate guard meta to reject poisoned/pre-guard entries.
+        cached_meta = cached.meta or {}
+        stored_bookstart = cached_meta.get("bookstart")
+        stored_bookend = cached_meta.get("bookend")
+        if stored_bookstart is None or stored_bookend is None:
+            # Old cache entry without guard meta — invalidate and recompute.
+            cache.conn.execute("DELETE FROM cache WHERE key = ?", (cache_key,))
+            cache.conn.commit()
+            cached = None
+
+    if cached is None:
+        # Live call path: inject bookstart+bookend nonces.
+        # Two nonces: one prepended (bookstart) and one appended (bookend).
+        # A provider that truncates from the beginning keeps the tail
+        # (bookend survives) but loses bookstart; a provider that truncates
+        # from the end loses bookend. Both cases are caught.
+        # The nonce values are NOT revealed in the prompt instruction —
+        # the model can only know them by reading the full text.
+        bookstart = secrets.token_hex(4)
+        bookend = secrets.token_hex(4)
+        # Reuse already-built book_text from base_context to avoid calling
+        # full_text() twice (it may be expensive for large EPUBs).
+        book_text_with_nonces = (
+            f"[[BOOKSTART::{bookstart}]]\n\n"
+            + base_context["book_text"]
+            + f"\n\n[[BOOKEND::{bookend}]]"
+        )
+        nonce_context = {**base_context, "book_text": book_text_with_nonces}
+        # Re-render BOTH system and user with nonce_context for the live call.
+        # Do not assume book_text only appears in the user template — future
+        # prompt edits might reference it in the system section too.
+        system_nonce, user_nonce = render_prompt(prompt, nonce_context)
+
         result = provider.complete(
             model=chosen_model,
-            system=system,
-            user=user,
+            system=system_nonce,
+            user=user_nonce,
             temperature=prompt.temperature,
             max_tokens=prompt.max_tokens,
+            reasoning_effort=prompt.reasoning_effort,
         )
         raw_text = result.text
+
+        # Guard: empty content means thinking consumed the entire output budget
+        # (e.g. kiro-gateway with extended thinking enabled). Do NOT cache or
+        # write a glossary — surface a clear error instead.
+        if not raw_text.strip():
+            finish_info = (
+                f" (finish_reason={result.finish_reason!r})" if result.finish_reason else ""
+            )
+            raise ValueError(
+                f"Model returned empty content{finish_info}. "
+                "На gateway с extended thinking ответ мог уйти в reasoning_content — "
+                "убедитесь, что в промпте задан reasoning_effort: none."
+            )
+
+        # Parse and validate bookend BEFORE writing to cache.
+        returned_bookstart, returned_bookend, entries = _parse_llm_response(raw_text)
+
+        # Normalize: strip whitespace in case model adds surrounding spaces.
+        returned_bookstart = (returned_bookstart or "").strip()
+        returned_bookend = (returned_bookend or "").strip()
+
+        # Bookstart guard: truncation from the beginning loses the start marker.
+        if returned_bookstart != bookstart:
+            raise TruncationError(
+                f"Книга, похоже, обрезана провайдером (начало): ожидался "
+                f"bookstart={bookstart!r}, получено {returned_bookstart!r}. "
+                "Глоссарий по неполному тексту не сохраняем. "
+                "Проверьте окно контекста провайдера стадии glossary."
+            )
+        # Bookend guard: truncation from the end loses the end marker.
+        if returned_bookend != bookend:
+            raise TruncationError(
+                f"Книга, похоже, обрезана провайдером (конец): ожидался "
+                f"bookend={bookend!r}, получено {returned_bookend!r}. "
+                "Глоссарий по неполному тексту не сохраняем. "
+                "Проверьте окно контекста провайдера стадии glossary."
+            )
+
+        # Cache AFTER successful validation — never cache a truncated/empty response.
+        # Store bookstart/bookend in meta so cache hits can be re-validated.
         cache.put(
             key=cache_key,
             stage="glossary",
@@ -146,9 +239,23 @@ def extract_glossary(
             content=raw_text,
             input_tokens=result.input_tokens,
             output_tokens=result.output_tokens,
+            meta={"bookstart": bookstart, "bookend": bookend},
         )
 
-    entries = _parse_llm_response(raw_text)
+        glossary = Glossary(
+            book=book.meta.title,
+            author=book.meta.author,
+            source_lang=source_lang,
+            target_lang=target_lang,
+            model=chosen_model,
+            entries=entries,
+        )
+        return glossary, result, raw_text
+
+    # Cache hit path: parse without bookend validation (already verified on write).
+    result = None
+    raw_text = cached.content
+    _, _, entries = _parse_llm_response(raw_text)
 
     glossary = Glossary(
         book=book.meta.title,

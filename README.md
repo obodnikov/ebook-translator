@@ -64,22 +64,29 @@ cp .env.example .env
 
 ## Провайдеры (LLM endpoints)
 
-Система использует **два независимых провайдера** — для текстовых задач
-и для работы с изображениями. Каждый может быть любым OpenAI-совместимым
-endpoint.
+Система маршрутизирует запросы по **провайдерам**. Базовых два:
 
-### Зачем два провайдера?
+- **`text`** — дефолт для всех текстовых стадий (словарь, перевод, оценка,
+  рефлексия, корректура, стилистика, сверка).
+- **`image`** — генерация изображений (перевод обложки).
 
-Текстовые задачи (перевод, оценка, рефлексия, корректура) и генерация
-изображений (перевод обложки) — разные возможности. Не все endpoint'ы
-умеют и то, и другое:
+Дополнительно **любую текстовую стадию можно увести на отдельный провайдер**
+через одноимённый оверрайд (см. «Оверрайды по стадиям»). Каждый провайдер —
+любой OpenAI-совместимый endpoint.
 
-- **kiro-gateway** — отлично для текстовых моделей Claude, но не
-  поддерживает image generation.
-- **OpenRouter** — поддерживает всё, но платный.
+### Зачем разделять провайдеры?
+
+Текстовые задачи и генерация изображений — разные возможности, и не каждый
+endpoint умеет оба. Кроме того, у провайдеров разные лимиты контекста:
+
+- **kiro-gateway** — отлично для текстовых моделей Claude, но не поддерживает
+  image generation и **режет очень большой вход** (важно для глоссария — см.
+  ниже).
+- **OpenRouter** — поддерживает всё, контекст до 200k токенов, но платный.
 - **vLLM / llama.cpp** — локальные модели для текста, без image.
 
-Разделение позволяет направить каждый тип задач к подходящему провайдеру.
+Маршрутизация по стадиям позволяет направить каждую задачу к подходящему
+провайдеру.
 
 ### Конфигурация
 
@@ -88,11 +95,11 @@ endpoint.
 ```yaml
 providers:
   text:
-    base_url: "http://localhost:8000/v1"    # Куда идут текстовые запросы
-    api_key_env: "KIRO_GATEWAY_API_KEY"     # Имя переменной окружения с ключом
+    base_url: "http://localhost:9000/v1"    # дефолт для всех текстовых стадий
+    api_key_env: "KIRO_GATEWAY_API_KEY"     # имя переменной окружения с ключом
   image:
-    base_url: "https://openrouter.ai/api/v1"  # Куда идут запросы image generation
-    api_key_env: "OPENROUTER_API_KEY"          # Имя переменной окружения с ключом
+    base_url: "https://openrouter.ai/api/v1"  # генерация обложки
+    api_key_env: "OPENROUTER_API_KEY"
 ```
 
 В `.env`:
@@ -102,28 +109,72 @@ KIRO_GATEWAY_API_KEY=my-super-secret-password-123
 OPENROUTER_API_KEY=sk-or-v1-...
 ```
 
-### Типичные схемы
+### Оверрайды по стадиям
 
-| Сценарий | `providers.text` | `providers.image` |
-|----------|------------------|-------------------|
-| Всё через OpenRouter (по умолчанию) | `openrouter.ai/api/v1` + `OPENROUTER_API_KEY` | `openrouter.ai/api/v1` + `OPENROUTER_API_KEY` |
-| Текст через kiro-gateway, обложка через OpenRouter | `localhost:8000/v1` + `KIRO_GATEWAY_API_KEY` | `openrouter.ai/api/v1` + `OPENROUTER_API_KEY` |
-| Текст через локальную модель (vLLM) | `localhost:8080/v1` + `LOCAL_API_KEY` | `openrouter.ai/api/v1` + `OPENROUTER_API_KEY` |
-| Всё через один self-hosted endpoint | одинаковые `base_url` и `api_key_env` | одинаковые `base_url` и `api_key_env` |
+Помимо `text` и `image`, в секции `providers` можно задать оверрайд для
+**любой текстовой стадии**. Не задан — стадия идёт на `text`. Доступные ключи:
 
-Готовый пример для kiro-gateway: `configs/kiro-gateway.yaml.example`.
-Скопировать в `configs/default.yaml` или указать через `--config`.
+| Ключ | Стадия |
+|------|--------|
+| `text` | дефолт для всех текстовых стадий |
+| `image` | генерация обложки |
+| `glossary` | извлечение словаря |
+| `translate` | перевод |
+| `judge` | оценка |
+| `reflect` | рефлексия |
+| `proofread` | корректура |
+| `style` | стилистика |
+| `verify` | сверка |
 
-### Какой провайдер для чего
+> ⚠️ Имя стадии должно **совпадать точно**. Незнакомые ключи в `providers`
+> молча игнорируются (стадия тихо уйдёт на `text`) — сверяйтесь с таблицей.
 
-| Команда | Провайдер |
-|---------|-----------|
-| `btrans glossary extract` | text |
-| `btrans translate` | text |
-| `btrans judge` | text |
-| `btrans reflect` | text |
-| `btrans proofread` / `style` / `verify` | text |
-| `btrans cover translate` | **image** |
+Пример: текст и все стадии через kiro-gateway, а словарь и обложку — на
+OpenRouter:
+
+```yaml
+providers:
+  text:                       # дефолт всех текстовых стадий (перевод, judge, ...)
+    base_url: "http://localhost:9000/v1"
+    api_key_env: "KIRO_GATEWAY_API_KEY"
+  glossary:                   # оверрайд: словарь шлёт всю книгу — нужен большой контекст
+    base_url: "https://openrouter.ai/api/v1"
+    api_key_env: "OPENROUTER_API_KEY"
+  image:
+    base_url: "https://openrouter.ai/api/v1"
+    api_key_env: "OPENROUTER_API_KEY"
+```
+
+Готовый пример: `configs/kiro-gateway.yaml.example`. Скопировать в
+`configs/default.yaml` или указать через `--config путь`.
+
+### Почему глоссарий стоит увести на OpenRouter
+
+Извлечение словаря — единственная стадия, которая отправляет **всю книгу
+одним запросом** (~150k токенов для романа на ~110k слов). Остальные стадии
+работают по фрагментам ~2000 слов и в окно любого провайдера помещаются.
+
+kiro-gateway **режет очень большой вход** (на практике до ~1/5 книги) — словарь
+тогда молча покрывал бы только начало. Чтобы этого не случилось, стадия `glossary`
+проверяет специальные маркеры в начале и конце текста и **громко падает с
+ошибкой**, если книга пришла обрезанной (`TruncationError`), а не пишет неполный
+словарь. Поэтому при `text: kiro-gateway` глоссарий стоит увести на OpenRouter
+(контекст 200k — типовой роман помещается целиком). Стадии-фрагменты при этом
+спокойно остаются на kiro-gateway.
+
+### Какой провайдер для какой стадии
+
+| Команда | Ключ конфига (дефолт — `text`) |
+|---------|--------------------------------|
+| `btrans glossary extract` | `glossary` → иначе `text` |
+| `btrans translate` | `translate` → иначе `text` |
+| `btrans judge` | `judge` → иначе `text` |
+| `btrans reflect` | `reflect` → иначе `text` |
+| `btrans proofread` | `proofread` → иначе `text` |
+| `btrans style` | `style` → иначе `text` |
+| `btrans verify` | `verify` → иначе `text` |
+| `btrans translate --cover` | **`image`** (opt-in) |
+| `btrans cover translate` | **`image`** |
 | `btrans cover replace` / `extract` | — (не вызывает LLM) |
 
 ### Дополнительные параметры
@@ -148,11 +199,30 @@ providers:
 
 ### Имена моделей
 
-Формат имён моделей зависит от провайдера:
+Имена моделей задаются в секции `models:` и должны соответствовать **тому
+провайдеру, на который уходит стадия**. Нормализации имён нет — строка из
+конфига уходит провайдеру дословно. Формат:
 
-- **OpenRouter:** `anthropic/claude-sonnet-4.6`, `google/gemini-3.1-flash-image-preview`
-- **kiro-gateway:** `claude-sonnet-4-5`, `claude-haiku-4-5` (нормализует автоматически)
+- **OpenRouter:** с префиксом — `anthropic/claude-sonnet-4.6`,
+  `google/gemini-3.1-flash-image-preview`
+- **kiro-gateway:** короткое имя без префикса — `claude-sonnet-4.6`,
+  `claude-haiku-4.5`
 - **vLLM / llama.cpp:** имя модели как указано при запуске сервера
+
+Если стадия уведена оверрайдом на другой провайдер — соответствующая модель в
+`models:` должна быть в формате этого провайдера. Пример: `glossary` →
+OpenRouter, остальное → kiro-gateway:
+
+```yaml
+models:
+  glossary:   anthropic/claude-sonnet-4.6   # OpenRouter — с префиксом
+  translate:  claude-sonnet-4.6             # kiro-gateway — без префикса
+  judge:      claude-haiku-4.5
+  reflect:    claude-sonnet-4.6
+  proofread:  claude-haiku-4.5
+  style:      claude-sonnet-4.6
+  verify:     claude-sonnet-4.6
+```
 
 ---
 
@@ -343,10 +413,15 @@ btrans translate path/to/book.epub -j 8
   с оригиналом — ищет пропуски, искажения, нарушения словаря.
 - Собирается новый EPUB: `books/extracted/<slug>-ru.epub` рядом с
   оригиналом (путь можно переопределить через `--out`).
-- **Читательские сноски не добавляются** — команда `translate` собирает
-  EPUB без них. Для сносок нужен отдельный вызов
-  `btrans assemble --notes` (см. раздел «Читательские сноски из словаря»
-  ниже).
+- **Читательские сноски** вставляются, если в конфиге `reader_notes.enabled:
+  true` и передан `--series` или `--glossary`. ⚠️ Шипящиеся конфиги
+  (`configs/default.yaml`, `configs/kiro-gateway.yaml.example`) ставят
+  `enabled: false` — включите флагом `--notes` или правкой конфига.
+  Принудительно отключить: `--no-notes`.
+- **Перевод обложки** (opt-in, платно): флаг `--cover` запускает
+  image-провайдер после сборки EPUB. По умолчанию выключен.
+  Standalone-команды `btrans cover translate` / `btrans assemble --notes`
+  остаются доступны для точечной работы.
 
 Время на ~115 тысяч слов / 102 фрагмента: около 50 минут при `-j 8`
 (перевод ~16 мин + оценка ~0.5 мин + корректура ~8 мин +
@@ -640,10 +715,18 @@ btrans assemble work/broken-homes/ \
 
 ```yaml
 reader_notes:
-  enabled: false          # по умолчанию выключено, включается через --notes
+  enabled: false          # в шипящихся конфигах выключено; поставьте true, чтобы включить
   types: [concept, term]  # какие типы терминов аннотировать
   scope: first-in-book    # first-in-book | first-in-chapter | all
 ```
+
+> ⚠️ **Про дефолт:** в коде `enabled` по умолчанию `true`
+> ([models.py](src/booktranslator/models.py)), но шипящиеся конфиги
+> (`configs/default.yaml`, `configs/kiro-gateway.yaml.example`) переопределяют
+> его в `false` — то есть с ними сноски выключены, пока вы не поставите
+> `enabled: true` или не передадите `--notes`. Флаг `--notes/--no-notes`
+> перекрывает конфиг и работает и в `assemble`, и в `translate`. Если глоссарий
+> не передан (`--series`/`--glossary`) — сноски пропускаются с предупреждением.
 
 **Особенности:**
 - Для коротких терминов (≤4 символов) — строгое совпадение по границам
@@ -654,6 +737,26 @@ reader_notes:
   уже размеченных сносок — XHTML остаётся валидным.
 - `--notes` и `--no-notes` перекрывают значение из конфига.
 - `--series` и `--glossary` взаимоисключающие (как в `translate`).
+- Сноски встроены в `btrans translate` (передайте `--series`/`--glossary`).
+  `btrans assemble --notes` остаётся для точечной сборки из кэша.
+
+**Флаги обложки в `btrans translate`:**
+
+```bash
+# Перевести обложку после сборки (opt-in)
+btrans translate book.epub --series rivers-of-london --cover
+
+# С явным переводом названия и имени автора
+btrans translate book.epub --series rivers-of-london \
+  --cover --cover-title "Реки Лондона" --cover-author "Бен Ааронович"
+
+# Другой язык или модель
+btrans translate book.epub --series rivers-of-london \
+  --cover --cover-target-lang German --cover-model openai/gpt-5.4-image-2
+```
+
+Если image-провайдер недоступен или вернул ошибку — `translate` завершается
+успешно, переведённый EPUB сохраняется, обложка пропускается с предупреждением.
 
 ### Посмотреть словарь серии
 
@@ -729,6 +832,54 @@ EOF
 задержкой (exponential backoff), но она не спасёт от жёсткого ограничения.
 Актуально для любого провайдера (OpenRouter, kiro-gateway и т.д.).
 
+### Глоссарий: «Книга, похоже, обрезана провайдером» (`TruncationError`)
+
+Стадия `glossary` шлёт всю книгу одним запросом и проверяет маркеры в начале и
+конце текста. Эта ошибка значит, что провайдер вернул не весь текст (типично для
+kiro-gateway на большой книге). Решение: увести `glossary` на провайдер с большим
+контекстом (OpenRouter, 200k) — см. «Почему глоссарий стоит увести на OpenRouter».
+Словарь по неполному тексту намеренно **не сохраняется**.
+
+### Глоссарий: «Model returned empty content»
+
+Модель вернула пустой ответ — обычно потому, что на шлюзе включён extended
+thinking и «размышления» съели весь бюджет вывода. Во всех промптах текстовых
+стадий стоит `reasoning_effort: none` именно для этого. Если ошибка возникает —
+проверьте, что в `prompts/*.md` (особенно `glossary_extract.md`) в заголовке
+есть `reasoning_effort: none`, и что провайдер стадии его принимает.
+
+### Забыл `--series` при `glossary extract` — как перенести словарь в серию
+
+Перегенерировать **не нужно**. Флаг `--series` при `glossary extract` — это лишь
+оптимизация для 2-й и последующих книг: он подсовывает модели уже известные
+термины серии, чтобы она не извлекала их заново. Для **первой** книги серии его
+не указывают вовсе. Сам словарь от наличия/отсутствия флага «серийным» не
+становится — перенос в серию делается отдельной командой `promote`.
+
+Уже сгенерированный `work/<slug>/glossary.json` переносится в серию в три шага:
+
+```bash
+# 1. Создать серию (один раз)
+btrans series init bear-head \
+  --title "Bear Head" \
+  --author "Adrian Tchaikovsky"
+
+# 2. (в редакторе) проставить "approved_by_human": true на проверенных записях
+#    в work/bear-head/glossary.json — promote по умолчанию берёт только их.
+
+# 3. Перенести в серию
+btrans glossary promote work/bear-head --series bear-head
+#    --all — перенести ВСЕ записи без фильтра по approved_by_human
+```
+
+Даже если серия уже существовала и флаг был забыт — `promote` дедуплицирует
+записи по полю `original`, а расхождения переводов складывает в `conflicts`
+(вариант серии сохраняется, вариант книги показывается для проверки). Поэтому
+повторный вызов модели не требуется ни в одном из случаев.
+
+Подробнее про серии и `promote` — в разделе «Перевод книги: пошагово»,
+шаги 3–4.
+
 ### Хочу посмотреть, что в кэше, без пересборки EPUB
 
 ```bash
@@ -768,7 +919,10 @@ ebook-translator/
 ├── AI-книги-от-А-до-Я.md    # первичный документ исследования
 ├── pyproject.toml
 ├── .env.example
-├── configs/default.yaml
+├── configs/
+│   ├── default.yaml              # активный конфиг (загружается по умолчанию)
+│   ├── default.yaml.example      # шаблон: всё через OpenRouter
+│   └── kiro-gateway.yaml.example # шаблон: text→kiro-gateway, glossary+image→OpenRouter
 ├── prompts/
 │   ├── glossary_extract.md
 │   ├── translate.md

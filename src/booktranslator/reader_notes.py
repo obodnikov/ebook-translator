@@ -11,12 +11,11 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import Literal
+from pathlib import Path
 
 from lxml import etree
 
-from .models import ReaderNotesConfig, SeriesGlossary, SeriesGlossaryEntry
-
+from .models import Config, ReaderNotesConfig, SeriesGlossary, SeriesGlossaryEntry
 
 # EPUB3 namespace for epub:type attribute
 EPUB_NS = "http://www.idpf.org/2007/ops"
@@ -27,6 +26,7 @@ NSMAP = {"epub": EPUB_NS, "xhtml": XHTML_NS}
 
 class GlossaryLoadError(Exception):
     """Raised when a glossary file cannot be loaded or validated."""
+
     pass
 
 
@@ -115,9 +115,7 @@ def _find_and_wrap_first_match(
             if "footnote" in epub_type:
                 return True
         # Skip existing reader-note <sup> elements
-        if local == "sup" and el.get("class", "") == "reader-note":
-            return True
-        return False
+        return local == "sup" and el.get("class", "") == "reader-note"
 
     def _collect_text_nodes(el: etree._Element, inside_forbidden: bool = False) -> None:
         forbidden = inside_forbidden or _is_forbidden_ancestor(el)
@@ -179,8 +177,8 @@ def _find_and_wrap_first_match(
                 return False
 
             # Split: before_match + matched_word + after_match
-            before = text_val[:local_pos + match_len]
-            after = text_val[local_pos + match_len:]
+            before = text_val[: local_pos + match_len]
+            after = text_val[local_pos + match_len :]
 
             # Create the superscript noteref element
             sup = etree.Element(f"{{{xhtml_ns}}}sup")
@@ -257,10 +255,7 @@ def inject_reader_notes(
         # Detect the XHTML namespace from the chapter's root element
         root = chapter.tree.getroot()
         root_tag = root.tag if isinstance(root.tag, str) else ""
-        if "}" in root_tag:
-            xhtml_ns = root_tag.split("}", 1)[0].lstrip("{")
-        else:
-            xhtml_ns = XHTML_NS
+        xhtml_ns = root_tag.split("}", 1)[0].lstrip("{") if "}" in root_tag else XHTML_NS
 
         # Track which entries have been noted in this chapter
         noted_in_chapter: set[tuple] = set()
@@ -294,9 +289,7 @@ def inject_reader_notes(
                 note_counter += 1
                 note_id = f"reader-note-{note_counter}"
 
-                success = _find_and_wrap_first_match(
-                    para, candidate.translation, note_id, xhtml_ns
-                )
+                success = _find_and_wrap_first_match(para, candidate.translation, note_id, xhtml_ns)
 
                 if success:
                     # Create the footnote aside element
@@ -339,8 +332,8 @@ def inject_reader_notes(
 
 def load_notes_glossary(
     series_slug: str | None,
-    glossary_path: "Path | None",
-    work_dir: "Path",
+    glossary_path: Path | None,
+    work_dir: Path,
     book_title: str,
     book_author: str,
     source_lang: str,
@@ -354,7 +347,8 @@ def load_notes_glossary(
     Raises GlossaryLoadError if --glossary file is malformed.
     """
     if series_slug:
-        from .series import SeriesWorkDir, load_series_glossary as _load
+        from .series import SeriesWorkDir
+        from .series import load_series_glossary as _load
 
         swd = SeriesWorkDir.for_series(work_dir, series_slug)
         if swd.exists():
@@ -372,16 +366,12 @@ def load_notes_glossary(
         try:
             raw = json.loads(path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError) as e:
-            raise GlossaryLoadError(
-                f"Cannot read glossary file {path}: {e}"
-            ) from e
+            raise GlossaryLoadError(f"Cannot read glossary file {path}: {e}") from e
 
         try:
             book_glossary = Glossary.model_validate(raw)
         except ValidationError as e:
-            raise GlossaryLoadError(
-                f"Invalid glossary schema in {path}: {e}"
-            ) from e
+            raise GlossaryLoadError(f"Invalid glossary schema in {path}: {e}") from e
 
         return SeriesGlossary(
             series_slug=f"ad-hoc:{book_title}",
@@ -403,6 +393,106 @@ def load_notes_glossary(
             ],
         )
     return None
+
+
+def inject_notes_for_cli(
+    *,
+    console,
+    chapters: list,
+    cfg: Config,
+    notes_flag: bool | None,
+    note_types: str | None,
+    series: str | None,
+    glossary_path: Path | None,
+    work_dir: Path,
+    book_title: str,
+    book_author: str,
+    preloaded_glossary: SeriesGlossary | None = None,
+    explicit: bool = False,
+) -> InjectionStats | None:
+    """Resolve config + glossary and inject reader notes into chapter trees.
+
+    Shared orchestration used by both ``translate`` and ``assemble`` commands.
+    Returns InjectionStats if notes were attempted, None if disabled or skipped.
+
+    Parameters
+    ----------
+    notes_flag:
+        Explicit CLI override (True/False) or None to use cfg.reader_notes.enabled.
+    preloaded_glossary:
+        Pass the already-loaded SeriesGlossary from ``translate`` to avoid
+        a redundant load. ``assemble`` passes None and loads via
+        load_notes_glossary().
+    explicit:
+        True when the user passed reader-notes-specific flags (--notes or
+        --note-types). Controls whether missing-glossary situations emit
+        warnings (explicit=True) or are silently skipped (explicit=False).
+        Note: --series/--glossary are for translation consistency and do NOT
+        count as explicit notes intent — they are passed as preloaded_glossary
+        when available, but their absence does not warn.
+    """
+    notes_enabled = notes_flag if notes_flag is not None else cfg.reader_notes.enabled
+    if not notes_enabled:
+        return None
+
+    # Resolve glossary -------------------------------------------------------
+    if preloaded_glossary is not None:
+        glossary = preloaded_glossary
+    else:
+        glossary = load_notes_glossary(
+            series_slug=series,
+            glossary_path=glossary_path,
+            work_dir=work_dir,
+            book_title=book_title,
+            book_author=book_author,
+            source_lang=cfg.source_lang,
+            target_lang=cfg.target_lang,
+        )  # raises GlossaryLoadError on malformed file — caller handles
+
+    if glossary is None and series:
+        if explicit:
+            console.print(
+                f"[yellow]Warning:[/yellow] Series {series!r} not found. Skipping reader notes."
+            )
+        return None
+    if glossary is None and not series and not glossary_path:
+        if explicit:
+            console.print(
+                "[yellow]Warning:[/yellow] Reader notes enabled but no glossary available "
+                "(pass --series or --glossary). Skipping."
+            )
+        return None
+    if glossary is None:
+        return None
+
+    if glossary_path and preloaded_glossary is None:
+        console.print(
+            f"[dim]Glossary for notes: {len(glossary.entries)} entries "
+            f"from {glossary_path.name}[/dim]"
+        )
+
+    # Inject -----------------------------------------------------------------
+    notes_config = resolve_notes_config(cfg.reader_notes, note_types_override=note_types)
+    note_stats = inject_reader_notes(
+        chapters=chapters,
+        glossary=glossary,
+        config=notes_config,
+    )
+
+    if note_stats.notes_injected > 0:
+        console.print(
+            f"[bold]Reader notes:[/bold] {note_stats.notes_injected} "
+            f"footnotes injected across "
+            f"{note_stats.chapters_modified} chapters "
+            f"(from {note_stats.total_candidates} candidates)"
+        )
+    else:
+        console.print(
+            f"[dim]Reader notes: 0 matches found "
+            f"({note_stats.total_candidates} candidates checked).[/dim]"
+        )
+
+    return note_stats
 
 
 def resolve_notes_config(

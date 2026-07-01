@@ -95,19 +95,21 @@ def reflector(mock_provider, reflect_prompt_path, translate_prompt_path, cache) 
 
 class TestGetReflectionNotes:
     def test_calls_provider_for_critique(self, reflector: Reflector, mock_provider):
-        critique_json = json.dumps({
-            "notes": [
-                {
-                    "paragraph": 1,
-                    "category": "naturalness",
-                    "original_fragment": "He was not happy",
-                    "current_translation": "Он был не счастлив",
-                    "suggestion": "Он был несчастен",
-                    "explanation": "More natural Russian phrasing",
-                }
-            ],
-            "general_notes": "",
-        })
+        critique_json = json.dumps(
+            {
+                "notes": [
+                    {
+                        "paragraph": 1,
+                        "category": "naturalness",
+                        "original_fragment": "He was not happy",
+                        "current_translation": "Он был не счастлив",
+                        "suggestion": "Он был несчастен",
+                        "explanation": "More natural Russian phrasing",
+                    }
+                ],
+                "general_notes": "",
+            }
+        )
         mock_provider.complete.return_value = CompletionResult(
             text=critique_json,
             input_tokens=1000,
@@ -143,9 +145,7 @@ class TestGetReflectionNotes:
         )
 
         stats = ReflectStats()
-        reflector._get_reflection_notes(
-            "ch01_c01", "original", "translated", 3, [], stats
-        )
+        reflector._get_reflection_notes("ch01_c01", "original", "translated", 3, [], stats)
 
         # Second call should use cache
         stats2 = ReflectStats()
@@ -197,15 +197,11 @@ class TestRetranslateWithNotes:
         )
 
         stats = ReflectStats()
-        reflector._retranslate_with_notes(
-            "ch01_c01", ["<p>Hello</p>"], "notes", stats
-        )
+        reflector._retranslate_with_notes("ch01_c01", ["<p>Hello</p>"], "notes", stats)
 
         # Second call uses cache
         stats2 = ReflectStats()
-        reflector._retranslate_with_notes(
-            "ch01_c01", ["<p>Hello</p>"], "notes", stats2
-        )
+        reflector._retranslate_with_notes("ch01_c01", ["<p>Hello</p>"], "notes", stats2)
 
         assert mock_provider.complete.call_count == 1
         assert stats2.chunks_cached == 1
@@ -221,9 +217,7 @@ class TestRetranslateWithNotes:
         )
 
         stats = ReflectStats()
-        reflector._retranslate_with_notes(
-            "ch01_c01", ["<p>Hello</p>"], "notes", stats
-        )
+        reflector._retranslate_with_notes("ch01_c01", ["<p>Hello</p>"], "notes", stats)
 
         stages = cache.get_chunk_stages("ch01_c01")
         reflect_stages = [s for s in stages if s.stage == "reflect"]
@@ -387,13 +381,19 @@ class TestReflectChunks:
                 if call_count[0] == 1:
                     return CompletionResult(
                         text='{"notes": [], "general_notes": ""}',
-                        input_tokens=500, output_tokens=50,
-                        total_tokens=550, model="s", raw={},
+                        input_tokens=500,
+                        output_tokens=50,
+                        total_tokens=550,
+                        model="s",
+                        raw={},
                     )
                 return CompletionResult(
                     text="===PARAGRAPH 1===\n<p>OK</p>",
-                    input_tokens=500, output_tokens=50,
-                    total_tokens=550, model="s", raw={},
+                    input_tokens=500,
+                    output_tokens=50,
+                    total_tokens=550,
+                    model="s",
+                    raw={},
                 )
             # Second chunk fails on first call
             raise RuntimeError("API timeout")
@@ -442,13 +442,19 @@ class TestReflectChunks:
             if call_count[0] % 2 == 1:
                 return CompletionResult(
                     text='{"notes": [], "general_notes": ""}',
-                    input_tokens=500, output_tokens=50,
-                    total_tokens=550, model="s", raw={},
+                    input_tokens=500,
+                    output_tokens=50,
+                    total_tokens=550,
+                    model="s",
+                    raw={},
                 )
             return CompletionResult(
                 text="===PARAGRAPH 1===\n<p>Done</p>",
-                input_tokens=500, output_tokens=50,
-                total_tokens=550, model="s", raw={},
+                input_tokens=500,
+                output_tokens=50,
+                total_tokens=550,
+                model="s",
+                raw={},
             )
 
         mock_provider.complete.side_effect = side_effect
@@ -469,9 +475,7 @@ class TestReflectChunks:
             },
         ]
 
-        reflector.reflect_chunks(
-            chunks_data, on_progress=on_progress, parallelism=1
-        )
+        reflector.reflect_chunks(chunks_data, on_progress=on_progress, parallelism=1)
 
         assert len(progress_calls) == 1
         assert progress_calls[0] == (1, 1, "c1")
@@ -486,8 +490,9 @@ class TestReflectCacheIntegration:
     def test_reflect_stage_in_waterfall(self, reflector: Reflector, mock_provider, cache: Cache):
         """Reflect results participate in waterfall resolution."""
         # Put a translate entry
-        cache.put("t1", "translate", "m", "v1", "original translation",
-                  meta={"chunk_id": "ch01_c01"})
+        cache.put(
+            "t1", "translate", "m", "v1", "original translation", meta={"chunk_id": "ch01_c01"}
+        )
 
         # Reflect it
         call_count = [0]
@@ -497,21 +502,32 @@ class TestReflectCacheIntegration:
             if call_count[0] == 1:
                 return CompletionResult(
                     text='{"notes": [{"suggestion": "fix"}], "general_notes": ""}',
-                    input_tokens=1000, output_tokens=200,
-                    total_tokens=1200, model="s", raw={},
+                    input_tokens=1000,
+                    output_tokens=200,
+                    total_tokens=1200,
+                    model="s",
+                    raw={},
                 )
             return CompletionResult(
                 text="===PARAGRAPH 1===\n<p>Better</p>",
-                input_tokens=1500, output_tokens=300,
-                total_tokens=1800, model="s", raw={},
+                input_tokens=1500,
+                output_tokens=300,
+                total_tokens=1800,
+                model="s",
+                raw={},
             )
 
         mock_provider.complete.side_effect = side_effect
 
         stats = ReflectStats()
         reflector.reflect_chunk(
-            "ch01_c01", "<p>Orig</p>", ["<p>Orig</p>"],
-            "original translation", 2, ["issue"], stats,
+            "ch01_c01",
+            "<p>Orig</p>",
+            ["<p>Orig</p>"],
+            "original translation",
+            2,
+            ["issue"],
+            stats,
         )
 
         # Waterfall should now resolve to reflect
@@ -520,8 +536,9 @@ class TestReflectCacheIntegration:
 
     def test_original_translate_preserved(self, reflector: Reflector, mock_provider, cache: Cache):
         """Reflect does not modify the original translate entry."""
-        cache.put("t1", "translate", "m", "v1", "original translation",
-                  meta={"chunk_id": "ch01_c01"})
+        cache.put(
+            "t1", "translate", "m", "v1", "original translation", meta={"chunk_id": "ch01_c01"}
+        )
 
         call_count = [0]
 
@@ -530,21 +547,32 @@ class TestReflectCacheIntegration:
             if call_count[0] == 1:
                 return CompletionResult(
                     text='{"notes": [], "general_notes": ""}',
-                    input_tokens=500, output_tokens=50,
-                    total_tokens=550, model="s", raw={},
+                    input_tokens=500,
+                    output_tokens=50,
+                    total_tokens=550,
+                    model="s",
+                    raw={},
                 )
             return CompletionResult(
                 text="===PARAGRAPH 1===\n<p>New</p>",
-                input_tokens=500, output_tokens=50,
-                total_tokens=550, model="s", raw={},
+                input_tokens=500,
+                output_tokens=50,
+                total_tokens=550,
+                model="s",
+                raw={},
             )
 
         mock_provider.complete.side_effect = side_effect
 
         stats = ReflectStats()
         reflector.reflect_chunk(
-            "ch01_c01", "<p>Orig</p>", ["<p>Orig</p>"],
-            "original translation", 3, [], stats,
+            "ch01_c01",
+            "<p>Orig</p>",
+            ["<p>Orig</p>"],
+            "original translation",
+            3,
+            [],
+            stats,
         )
 
         # Original translate entry still there
@@ -557,8 +585,7 @@ class TestReflectCacheIntegration:
         self, reflector: Reflector, mock_provider, cache: Cache
     ):
         """After reflect, user can prefer translate via preferences."""
-        cache.put("t1", "translate", "m", "v1", "original",
-                  meta={"chunk_id": "ch01_c01"})
+        cache.put("t1", "translate", "m", "v1", "original", meta={"chunk_id": "ch01_c01"})
 
         call_count = [0]
 
@@ -567,21 +594,32 @@ class TestReflectCacheIntegration:
             if call_count[0] == 1:
                 return CompletionResult(
                     text='{"notes": [], "general_notes": ""}',
-                    input_tokens=500, output_tokens=50,
-                    total_tokens=550, model="s", raw={},
+                    input_tokens=500,
+                    output_tokens=50,
+                    total_tokens=550,
+                    model="s",
+                    raw={},
                 )
             return CompletionResult(
                 text="===PARAGRAPH 1===\n<p>Reflected</p>",
-                input_tokens=500, output_tokens=50,
-                total_tokens=550, model="s", raw={},
+                input_tokens=500,
+                output_tokens=50,
+                total_tokens=550,
+                model="s",
+                raw={},
             )
 
         mock_provider.complete.side_effect = side_effect
 
         stats = ReflectStats()
         reflector.reflect_chunk(
-            "ch01_c01", "<p>Orig</p>", ["<p>Orig</p>"],
-            "original", 2, [], stats,
+            "ch01_c01",
+            "<p>Orig</p>",
+            ["<p>Orig</p>"],
+            "original",
+            2,
+            [],
+            stats,
         )
 
         # Default: reflect wins

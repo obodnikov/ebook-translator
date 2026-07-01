@@ -25,22 +25,17 @@ from .cache import Cache
 from .chunker import Chunk, ChunkSet
 from .models import SeriesGlossary
 from .prompts import Prompt, load_prompt, render_prompt
-from .provider import CompletionResult, OpenRouterProvider
+from .provider import OpenRouterProvider
 from .series import render_for_prompt
-
 
 logger = logging.getLogger(__name__)
 
-_PARAGRAPH_MARKER_RE = re.compile(
-    r"^===PARAGRAPH\s+(\d+)===\s*$", re.MULTILINE
-)
+_PARAGRAPH_MARKER_RE = re.compile(r"^===PARAGRAPH\s+(\d+)===\s*$", re.MULTILINE)
 
 # Matches a `&` that does NOT start a valid XML entity
 # (&amp; &lt; &gt; &quot; &apos; or numeric like &#123; / &#xAF;).
 # Used to fix stray ampersands in LLM output like "M&S", "AT&T".
-_BARE_AMPERSAND_RE = re.compile(
-    r"&(?!(?:amp|lt|gt|quot|apos|#\d+|#x[0-9a-fA-F]+);)"
-)
+_BARE_AMPERSAND_RE = re.compile(r"&(?!(?:amp|lt|gt|quot|apos|#\d+|#x[0-9a-fA-F]+);)")
 
 
 def _escape_bare_ampersands(fragment: str) -> str:
@@ -52,6 +47,7 @@ def _escape_bare_ampersands(fragment: str) -> str:
     instruction is easy to miss on a long chunk.
     """
     return _BARE_AMPERSAND_RE.sub("&amp;", fragment)
+
 
 LANG_NAMES = {
     "en": "English",
@@ -90,9 +86,7 @@ class Translator:
         self.source_lang = source_lang
         self.target_lang = target_lang
 
-        self._glossary_block = (
-            render_for_prompt(glossary) if glossary else "(no glossary provided)"
-        )
+        self._glossary_block = render_for_prompt(glossary) if glossary else "(no glossary provided)"
         # Serialize stats updates and live-tree mutations when running
         # chunks in parallel. The lxml tree itself is not thread-safe
         # for writes even across disjoint elements on some builds.
@@ -142,8 +136,7 @@ class Translator:
         matches = list(_PARAGRAPH_MARKER_RE.finditer(text))
         if not matches:
             raise ValueError(
-                "No '===PARAGRAPH N===' markers found in response. "
-                f"First 200 chars: {text[:200]!r}"
+                f"No '===PARAGRAPH N===' markers found in response. First 200 chars: {text[:200]!r}"
             )
 
         fragments: list[str] = []
@@ -154,9 +147,7 @@ class Translator:
             fragments.append(fragment)
 
         if len(fragments) != expected_n:
-            raise ValueError(
-                f"Expected {expected_n} paragraphs, got {len(fragments)}."
-            )
+            raise ValueError(f"Expected {expected_n} paragraphs, got {len(fragments)}.")
         return fragments
 
     # -- splicing fragments back into the chapter tree --------------------
@@ -200,9 +191,7 @@ class Translator:
         new_el.tail = old_el.tail
         parent = old_el.getparent()
         if parent is None:
-            raise RuntimeError(
-                "Cannot replace root element of a chapter tree."
-            )
+            raise RuntimeError("Cannot replace root element of a chapter tree.")
         parent.replace(old_el, new_el)
 
     # -- core translate one chunk -----------------------------------------
@@ -238,8 +227,28 @@ class Translator:
                 user=user,
                 temperature=self.prompt.temperature,
                 max_tokens=self.prompt.max_tokens,
+                reasoning_effort=self.prompt.reasoning_effort,
             )
             raw_text = result.text
+            # Guard: empty content means the provider routed the answer
+            # elsewhere (tool call / reasoning_content) — e.g. kiro-gateway with
+            # web_search or fake reasoning enabled. Raise BEFORE caching so a
+            # poisoned empty response is never written to the cache.
+            if not raw_text.strip():
+                raise ValueError(
+                    "Model returned empty content "
+                    f"(finish_reason={result.finish_reason!r}). The provider may have "
+                    "returned a tool call or put the answer in reasoning_content — "
+                    "check WEB_SEARCH_ENABLED / FAKE_REASONING on the gateway."
+                )
+
+        # Validate BEFORE caching: a result that violates the paragraph-count
+        # contract must never be written to the cache (AI_PIPELINE.md).
+        expected = len(chunk.paragraph_indexes)
+        fragments = self._parse_response(raw_text, expected)
+
+        # Cache only fresh, validated results (never on a cache hit).
+        if result is not None:
             with self._lock:
                 self.cache.put(
                     key=cache_key,
@@ -255,16 +264,13 @@ class Translator:
                 stats.input_tokens += result.input_tokens
                 stats.output_tokens += result.output_tokens
 
-        expected = len(chunk.paragraph_indexes)
-        fragments = self._parse_response(raw_text, expected)
-
         # Splice fragments into the live tree. Guarded by the lock so
         # parallel chunks don't race when mutating lxml elements (even
         # though they target different subtrees, we stay on the safe
         # side).
         with self._lock:
             chapter = chunk_set.book.chapters[chunk.chapter_index]
-            for para_idx, frag_str in zip(chunk.paragraph_indexes, fragments):
+            for para_idx, frag_str in zip(chunk.paragraph_indexes, fragments, strict=False):
                 original_el = chapter.paragraphs[para_idx]
                 new_el = self._parse_fragment(frag_str)
                 self._replace_element(original_el, new_el)
@@ -297,7 +303,6 @@ class Translator:
         # call is blocking I/O so threads are fine here (no GIL issues
         # for network waits).
         done_count = 0
-        last_chunk: Chunk | None = None
         with ThreadPoolExecutor(max_workers=parallelism) as pool:
             futures = {
                 pool.submit(self._translate_chunk_safe, chunk_set, chunk, stats): chunk
@@ -305,7 +310,6 @@ class Translator:
             }
             for fut in as_completed(futures):
                 chunk = futures[fut]
-                last_chunk = chunk
                 err = fut.result()
                 if err is not None:
                     with self._lock:

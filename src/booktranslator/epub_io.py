@@ -13,17 +13,16 @@ left untouched in this first cut.
 
 from __future__ import annotations
 
-import shutil
 import warnings
 import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from ebooklib import ITEM_DOCUMENT, epub
-from lxml import etree, html as lxhtml
+from lxml import etree
+from lxml import html as lxhtml
 
 from .models import BookMeta
-
 
 # ---------------------------------------------------------------------------
 # Flat read (used by glossary extraction)
@@ -100,10 +99,10 @@ def read_book(path: Path) -> ExtractedBook:
 class ChapterDoc:
     """One XHTML document from the EPUB spine, with its parsed tree."""
 
-    spine_index: int                   # 0-based position in the spine
-    archive_name: str                  # path inside the EPUB zip
-    original_bytes: bytes              # raw file bytes (for unchanged copy)
-    tree: etree._ElementTree           # parsed lxml tree
+    spine_index: int  # 0-based position in the spine
+    archive_name: str  # path inside the EPUB zip
+    original_bytes: bytes  # raw file bytes (for unchanged copy)
+    tree: etree._ElementTree  # parsed lxml tree
     # Paragraphs are elements we can translate. We keep references to the
     # actual lxml elements so the translator can update them in place.
     paragraphs: list[etree._Element] = field(default_factory=list)
@@ -131,11 +130,10 @@ def _is_translatable(el: etree._Element) -> bool:
     if tag not in TRANSLATABLE_TAGS:
         return False
     # Skip empty paragraphs.
-    if not (el.text or "").strip() and not any(
+    has_text = (el.text or "").strip() or any(
         (child.text or child.tail or "").strip() for child in el
-    ):
-        return False
-    return True
+    )
+    return bool(has_text)
 
 
 def _find_paragraphs(tree: etree._ElementTree) -> list[etree._Element]:
@@ -200,13 +198,15 @@ def read_book_structured(path: Path) -> StructuredBook:
             except Exception:
                 continue
             paragraphs = _find_paragraphs(tree)
-            chapters.append(ChapterDoc(
-                spine_index=idx,
-                archive_name=candidate,
-                original_bytes=raw,
-                tree=tree,
-                paragraphs=paragraphs,
-            ))
+            chapters.append(
+                ChapterDoc(
+                    spine_index=idx,
+                    archive_name=candidate,
+                    original_bytes=raw,
+                    tree=tree,
+                    paragraphs=paragraphs,
+                )
+            )
             for p in paragraphs:
                 total_words += len(" ".join(p.itertext()).split())
 
@@ -220,9 +220,7 @@ def read_book_structured(path: Path) -> StructuredBook:
     return StructuredBook(meta=meta, source_path=path, chapters=chapters)
 
 
-def _resolve_archive_path(
-    href: str, archive_names: set[str], book: epub.EpubBook
-) -> str | None:
+def _resolve_archive_path(href: str, archive_names: set[str], book: epub.EpubBook) -> str | None:
     """Map an ebooklib item href to the actual path inside the zip."""
     if href in archive_names:
         return href
@@ -266,35 +264,32 @@ def write_translated_epub(
     opf_name: str | None = None
     opf_new_bytes: bytes | None = None
     if new_language or title_translation:
-        opf_name, opf_new_bytes = _maybe_update_opf(
-            source_path, new_language, title_translation
-        )
+        opf_name, opf_new_bytes = _maybe_update_opf(source_path, new_language, title_translation)
         if opf_new_bytes is not None:
             replacements[opf_name] = opf_new_bytes
 
-    with zipfile.ZipFile(source_path, "r") as src:
-        with zipfile.ZipFile(dest_path, "w") as dst:
-            # mimetype first, uncompressed (EPUB spec).
-            dst.writestr(
-                zipfile.ZipInfo("mimetype"),
-                "application/epub+zip",
-                compress_type=zipfile.ZIP_STORED,
-            )
-            for info in src.infolist():
-                if info.filename == "mimetype":
-                    continue
-                if info.filename in replacements:
+    with zipfile.ZipFile(source_path, "r") as src, zipfile.ZipFile(dest_path, "w") as dst:
+        # mimetype first, uncompressed (EPUB spec).
+        dst.writestr(
+            zipfile.ZipInfo("mimetype"),
+            "application/epub+zip",
+            compress_type=zipfile.ZIP_STORED,
+        )
+        for info in src.infolist():
+            if info.filename == "mimetype":
+                continue
+            if info.filename in replacements:
+                dst.writestr(
+                    info.filename,
+                    replacements[info.filename],
+                    compress_type=zipfile.ZIP_DEFLATED,
+                )
+            else:
+                with src.open(info) as fh:
                     dst.writestr(
-                        info.filename,
-                        replacements[info.filename],
-                        compress_type=zipfile.ZIP_DEFLATED,
+                        info,
+                        fh.read(),
                     )
-                else:
-                    with src.open(info) as fh:
-                        dst.writestr(
-                            info,
-                            fh.read(),
-                        )
 
 
 def _maybe_update_opf(
@@ -335,7 +330,5 @@ def _maybe_update_opf(
                 changed = True
         if not changed:
             return opf_name, None
-        new_bytes = etree.tostring(
-            opf, xml_declaration=True, encoding="utf-8"
-        )
+        new_bytes = etree.tostring(opf, xml_declaration=True, encoding="utf-8")
         return opf_name, new_bytes

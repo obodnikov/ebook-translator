@@ -25,14 +25,13 @@ import sys
 import unicodedata
 import uuid
 import zipfile
-from dataclasses import dataclass, field
+from collections.abc import Iterable
+from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
-from typing import Iterable
 from urllib.parse import unquote, urlparse
 
 from lxml import etree
-
 
 # ---------------------------------------------------------------------------
 # XML namespaces used across EPUB 2.0 / NCX / container specs.
@@ -55,19 +54,19 @@ NS = {
 @dataclass
 class ManifestItem:
     item_id: str
-    href: str            # href relative to the OPF file (= root of the archive here)
+    href: str  # href relative to the OPF file (= root of the archive here)
     media_type: str
 
 
 @dataclass
 class Book:
-    index: int                         # 1-based position in the anthology
+    index: int  # 1-based position in the anthology
     title: str
-    prefix: str                        # e.g. "1/1/", "3/"
-    entry_href: str                    # href (no fragment) of the book's TOC entry
-    nav_subtree: etree._Element        # the top-level <navPoint> for this book
-    manifest_items: list[ManifestItem] # items whose href starts with prefix
-    spine_idrefs: list[str]            # idrefs for this book, in reading order
+    prefix: str  # e.g. "1/1/", "3/"
+    entry_href: str  # href (no fragment) of the book's TOC entry
+    nav_subtree: etree._Element  # the top-level <navPoint> for this book
+    manifest_items: list[ManifestItem]  # items whose href starts with prefix
+    spine_idrefs: list[str]  # idrefs for this book, in reading order
 
 
 # ---------------------------------------------------------------------------
@@ -122,10 +121,8 @@ def strip_prefix(href: str, prefix: str) -> str:
     """Remove the book prefix from a manifest/toc href. Fragment preserved."""
     path, _, frag = href.partition("#")
     if not path.startswith(prefix):
-        raise ValueError(
-            f"Expected href {href!r} to start with prefix {prefix!r}"
-        )
-    stripped = path[len(prefix):]
+        raise ValueError(f"Expected href {href!r} to start with prefix {prefix!r}")
+    stripped = path[len(prefix) :]
     return stripped + (f"#{frag}" if frag else "")
 
 
@@ -157,9 +154,7 @@ class Anthology:
     def _find_opf_path(self) -> str:
         with self.zip.open("META-INF/container.xml") as fh:
             tree = etree.parse(fh)
-        rootfile = tree.find(
-            ".//container:rootfiles/container:rootfile", NS
-        )
+        rootfile = tree.find(".//container:rootfiles/container:rootfile", NS)
         if rootfile is None:
             raise RuntimeError("container.xml has no rootfile entry")
         return rootfile.get("full-path")
@@ -197,9 +192,7 @@ class Anthology:
     def _parse_spine(self) -> list[str]:
         return [
             itemref.get("idref")
-            for itemref in self.opf_tree.findall(
-                ".//opf:spine/opf:itemref", NS
-            )
+            for itemref in self.opf_tree.findall(".//opf:spine/opf:itemref", NS)
         ]
 
     # --- NCX parsing: find books ---
@@ -225,23 +218,24 @@ class Anthology:
             prefix = book_prefix_from_href(entry_src)
 
             manifest_items = [
-                item for item in self.manifest.values()
+                item
+                for item in self.manifest.values()
                 if href_to_path(item.href).startswith(prefix)
             ]
             manifest_ids = {item.item_id for item in manifest_items}
-            spine_idrefs = [
-                idref for idref in self.spine_idrefs if idref in manifest_ids
-            ]
+            spine_idrefs = [idref for idref in self.spine_idrefs if idref in manifest_ids]
 
-            books.append(Book(
-                index=idx,
-                title=title,
-                prefix=prefix,
-                entry_href=href_to_path(entry_src),
-                nav_subtree=np,
-                manifest_items=manifest_items,
-                spine_idrefs=spine_idrefs,
-            ))
+            books.append(
+                Book(
+                    index=idx,
+                    title=title,
+                    prefix=prefix,
+                    entry_href=href_to_path(entry_src),
+                    nav_subtree=np,
+                    manifest_items=manifest_items,
+                    spine_idrefs=spine_idrefs,
+                )
+            )
         return books
 
     # --- Anthology-level metadata ---
@@ -305,59 +299,57 @@ class BookWriter:
 
     def _make_container_xml(self) -> bytes:
         root = etree.Element(
-            "{%s}container" % NS["container"],
+            "{{{}}}container".format(NS["container"]),
             nsmap={None: NS["container"]},
             version="1.0",
         )
-        rootfiles = etree.SubElement(root, "{%s}rootfiles" % NS["container"])
+        rootfiles = etree.SubElement(root, "{{{}}}rootfiles".format(NS["container"]))
         etree.SubElement(
             rootfiles,
-            "{%s}rootfile" % NS["container"],
+            "{{{}}}rootfile".format(NS["container"]),
             attrib={
                 "full-path": "content.opf",
                 "media-type": "application/oebps-package+xml",
             },
         )
-        return etree.tostring(
-            root, xml_declaration=True, encoding="utf-8", standalone=True
-        )
+        return etree.tostring(root, xml_declaration=True, encoding="utf-8", standalone=True)
 
     def _make_opf(self) -> bytes:
         package = etree.Element(
-            "{%s}package" % NS["opf"],
+            "{{{}}}package".format(NS["opf"]),
             nsmap={None: NS["opf"]},
             attrib={"version": "2.0", "unique-identifier": "bookid"},
         )
         metadata = etree.SubElement(
             package,
-            "{%s}metadata" % NS["opf"],
+            "{{{}}}metadata".format(NS["opf"]),
             nsmap={"dc": NS["dc"], "opf": NS["opf"]},
         )
 
         identifier = etree.SubElement(
             metadata,
-            "{%s}identifier" % NS["dc"],
+            "{{{}}}identifier".format(NS["dc"]),
             attrib={"id": "bookid"},
         )
-        identifier.set("{%s}scheme" % NS["opf"], "UUID")
+        identifier.set("{{{}}}scheme".format(NS["opf"]), "UUID")
         identifier.text = f"urn:uuid:{uuid.uuid4()}"
 
-        title = etree.SubElement(metadata, "{%s}title" % NS["dc"])
+        title = etree.SubElement(metadata, "{{{}}}title".format(NS["dc"]))
         title.text = self.book.title
 
-        creator = etree.SubElement(metadata, "{%s}creator" % NS["dc"])
-        creator.set("{%s}role" % NS["opf"], "aut")
+        creator = etree.SubElement(metadata, "{{{}}}creator".format(NS["dc"]))
+        creator.set("{{{}}}role".format(NS["opf"]), "aut")
         creator.text = self.anthology.creator()
 
-        language = etree.SubElement(metadata, "{%s}language" % NS["dc"])
+        language = etree.SubElement(metadata, "{{{}}}language".format(NS["dc"]))
         language.text = self.anthology.language()
 
         # Point to NCX (id "ncx") so EPUB2 readers recognise the TOC.
         # The spine references it by id below.
-        manifest_el = etree.SubElement(package, "{%s}manifest" % NS["opf"])
+        manifest_el = etree.SubElement(package, "{{{}}}manifest".format(NS["opf"]))
         etree.SubElement(
             manifest_el,
-            "{%s}item" % NS["opf"],
+            "{{{}}}item".format(NS["opf"]),
             attrib={
                 "id": "ncx",
                 "href": "toc.ncx",
@@ -367,7 +359,7 @@ class BookWriter:
         for item in self.book.manifest_items:
             etree.SubElement(
                 manifest_el,
-                "{%s}item" % NS["opf"],
+                "{{{}}}item".format(NS["opf"]),
                 attrib={
                     "id": item.item_id,
                     "href": strip_prefix(item.href, self.book.prefix),
@@ -375,28 +367,24 @@ class BookWriter:
                 },
             )
 
-        spine_el = etree.SubElement(
-            package, "{%s}spine" % NS["opf"], attrib={"toc": "ncx"}
-        )
+        spine_el = etree.SubElement(package, "{{{}}}spine".format(NS["opf"]), attrib={"toc": "ncx"})
         for idref in self.book.spine_idrefs:
             etree.SubElement(
                 spine_el,
-                "{%s}itemref" % NS["opf"],
+                "{{{}}}itemref".format(NS["opf"]),
                 attrib={"idref": idref, "linear": "yes"},
             )
 
-        return etree.tostring(
-            package, xml_declaration=True, encoding="utf-8", pretty_print=True
-        )
+        return etree.tostring(package, xml_declaration=True, encoding="utf-8", pretty_print=True)
 
     def _make_ncx(self) -> bytes:
         ncx = etree.Element(
-            "{%s}ncx" % NS["ncx"],
+            "{{{}}}ncx".format(NS["ncx"]),
             nsmap={None: NS["ncx"]},
             attrib={"version": "2005-1"},
         )
 
-        head = etree.SubElement(ncx, "{%s}head" % NS["ncx"])
+        head = etree.SubElement(ncx, "{{{}}}head".format(NS["ncx"]))
         for name, value in (
             ("dtb:uid", f"urn:uuid:{uuid.uuid4()}"),
             ("dtb:depth", "2"),
@@ -405,21 +393,19 @@ class BookWriter:
         ):
             etree.SubElement(
                 head,
-                "{%s}meta" % NS["ncx"],
+                "{{{}}}meta".format(NS["ncx"]),
                 attrib={"name": name, "content": value},
             )
 
-        doc_title = etree.SubElement(ncx, "{%s}docTitle" % NS["ncx"])
-        etree.SubElement(doc_title, "{%s}text" % NS["ncx"]).text = self.book.title
+        doc_title = etree.SubElement(ncx, "{{{}}}docTitle".format(NS["ncx"]))
+        etree.SubElement(doc_title, "{{{}}}text".format(NS["ncx"])).text = self.book.title
 
-        nav_map = etree.SubElement(ncx, "{%s}navMap" % NS["ncx"])
+        nav_map = etree.SubElement(ncx, "{{{}}}navMap".format(NS["ncx"]))
         play_order = [1]  # mutable counter across the nested walker
 
         def walk(src_point: etree._Element, target_parent: etree._Element) -> None:
             """Copy a navPoint, rewriting src to strip the book prefix."""
-            label_text_el = src_point.find(
-                "ncx:navLabel/ncx:text", NS
-            )
+            label_text_el = src_point.find("ncx:navLabel/ncx:text", NS)
             content_el = src_point.find("ncx:content", NS)
             if label_text_el is None or content_el is None:
                 return
@@ -433,20 +419,18 @@ class BookWriter:
 
             new_point = etree.SubElement(
                 target_parent,
-                "{%s}navPoint" % NS["ncx"],
+                "{{{}}}navPoint".format(NS["ncx"]),
                 attrib={
                     "id": f"navpt_{play_order[0]}",
                     "playOrder": str(play_order[0]),
                 },
             )
             play_order[0] += 1
-            new_label = etree.SubElement(
-                new_point, "{%s}navLabel" % NS["ncx"]
-            )
-            etree.SubElement(new_label, "{%s}text" % NS["ncx"]).text = label
+            new_label = etree.SubElement(new_point, "{{{}}}navLabel".format(NS["ncx"]))
+            etree.SubElement(new_label, "{{{}}}text".format(NS["ncx"])).text = label
             etree.SubElement(
                 new_point,
-                "{%s}content" % NS["ncx"],
+                "{{{}}}content".format(NS["ncx"]),
                 attrib={"src": new_src},
             )
             for child in src_point.findall("ncx:navPoint", NS):
@@ -461,9 +445,7 @@ class BookWriter:
         else:
             walk(self.book.nav_subtree, nav_map)
 
-        return etree.tostring(
-            ncx, xml_declaration=True, encoding="utf-8", pretty_print=True
-        )
+        return etree.tostring(ncx, xml_declaration=True, encoding="utf-8", pretty_print=True)
 
     def _copy_book_files(self, zf: zipfile.ZipFile) -> None:
         src_zip = self.anthology.zip
@@ -474,7 +456,7 @@ class BookWriter:
                 continue
             if not name.startswith(prefix):
                 continue
-            new_name = name[len(prefix):]
+            new_name = name[len(prefix) :]
             with src_zip.open(name) as fh:
                 zf.writestr(new_name, fh.read(), compress_type=zipfile.ZIP_DEFLATED)
 
@@ -504,9 +486,7 @@ def cmd_list(anthology: Anthology) -> None:
 def cmd_extract(anthology: Anthology, index: int, out_dir: Path) -> Path:
     matches = [b for b in anthology.books if b.index == index]
     if not matches:
-        raise SystemExit(
-            f"No book with index {index}. Valid: 1..{len(anthology.books)}"
-        )
+        raise SystemExit(f"No book with index {index}. Valid: 1..{len(anthology.books)}")
     book = matches[0]
     author_slug = slugify(anthology.creator())
     title_slug = slugify(book.title)
@@ -518,8 +498,7 @@ def cmd_extract(anthology: Anthology, index: int, out_dir: Path) -> Path:
 
     print(f"Book:      {book.title}")
     print(f"Prefix:    {book.prefix}")
-    print(f"Files:     {len(book.manifest_items)} manifest, "
-          f"{len(book.spine_idrefs)} in spine")
+    print(f"Files:     {len(book.manifest_items)} manifest, {len(book.spine_idrefs)} in spine")
     print(f"Output:    {out_path}")
     print(f"Size:      {out_path.stat().st_size:,} bytes")
     return out_path
@@ -532,15 +511,20 @@ def main(argv: Iterable[str] | None = None) -> int:
     parser.add_argument("epub", type=Path, help="Path to the merged EPUB")
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument(
-        "--list", action="store_true",
+        "--list",
+        action="store_true",
         help="List books contained in the anthology and exit.",
     )
     group.add_argument(
-        "--book", type=int, metavar="N",
+        "--book",
+        type=int,
+        metavar="N",
         help="Extract book number N (see --list for numbering).",
     )
     parser.add_argument(
-        "--out", type=Path, default=Path("books/extracted"),
+        "--out",
+        type=Path,
+        default=Path("books/extracted"),
         help="Output directory (default: books/extracted).",
     )
     args = parser.parse_args(argv)

@@ -21,10 +21,20 @@ class ProviderConfig(BaseModel):
 
 
 class ProvidersConfig(BaseModel):
-    """Independent provider endpoints for text and image tasks."""
+    """Independent provider endpoints. `text` is the default for all text
+    stages; any stage may override it via its own optional field."""
 
     text: ProviderConfig = Field(default_factory=ProviderConfig)
     image: ProviderConfig = Field(default_factory=ProviderConfig)
+
+    # Optional per-stage overrides. Unset -> fall back to `text`.
+    glossary: ProviderConfig | None = None
+    translate: ProviderConfig | None = None
+    judge: ProviderConfig | None = None
+    reflect: ProviderConfig | None = None
+    proofread: ProviderConfig | None = None
+    style: ProviderConfig | None = None
+    verify: ProviderConfig | None = None
 
 
 class ModelsConfig(BaseModel):
@@ -51,7 +61,6 @@ class TranslateConfig(BaseModel):
 
 class ReflectionConfig(BaseModel):
     trigger_score: int = 3
-    extended_thinking: bool = True
 
 
 class PausesConfig(BaseModel):
@@ -76,7 +85,7 @@ class NotificationsConfig(BaseModel):
 
 
 class ReaderNotesConfig(BaseModel):
-    enabled: bool = False
+    enabled: bool = True
     types: list[str] = Field(default_factory=lambda: ["concept", "term"])
     scope: Literal["first-in-chapter", "first-in-book", "all"] = "first-in-book"
 
@@ -85,9 +94,38 @@ class CostConfig(BaseModel):
     hard_limit_usd: float = 50.0
 
 
+# Mapping from common ISO 639-1 codes to human-readable names for cover prompts.
+# Extend as needed; absent codes require explicit target_lang_name in config.
+_LANG_NAME_MAP: dict[str, str] = {
+    "ru": "Russian",
+    "de": "German",
+    "fr": "French",
+    "es": "Spanish",
+    "it": "Italian",
+    "pt": "Portuguese",
+    "nl": "Dutch",
+    "pl": "Polish",
+    "uk": "Ukrainian",
+    "zh": "Chinese",
+    "ja": "Japanese",
+    "ko": "Korean",
+    "ar": "Arabic",
+    "tr": "Turkish",
+    "sv": "Swedish",
+    "no": "Norwegian",
+    "da": "Danish",
+    "fi": "Finnish",
+    "cs": "Czech",
+    "hu": "Hungarian",
+}
+
+
 class Config(BaseModel):
     source_lang: str = "en"
     target_lang: str = "ru"
+    # Human-readable language name for cover-translation prompts.
+    # Auto-derived from target_lang if not set explicitly.
+    target_lang_name: str | None = None
     providers: ProvidersConfig = Field(default_factory=ProvidersConfig)
     chunker: ChunkerConfig = Field(default_factory=ChunkerConfig)
     translate: TranslateConfig = Field(default_factory=TranslateConfig)
@@ -99,6 +137,20 @@ class Config(BaseModel):
     notifications: NotificationsConfig = Field(default_factory=NotificationsConfig)
     reader_notes: ReaderNotesConfig = Field(default_factory=ReaderNotesConfig)
     cost: CostConfig = Field(default_factory=CostConfig)
+
+    def resolved_target_lang_name(self) -> str | None:
+        """Return the effective human-readable target language name.
+
+        Returns target_lang_name if explicitly set, otherwise looks up
+        target_lang in the built-in ISO code map using the base language
+        code (e.g. 'ru-RU' -> 'ru'). Returns None if the code is not in
+        the map — callers must then require explicit input.
+        """
+        if self.target_lang_name:
+            return self.target_lang_name
+        # Normalize: lowercase, strip region subtag (e.g. 'ru-RU' -> 'ru')
+        base = self.target_lang.lower().replace("_", "-").split("-", 1)[0]
+        return _LANG_NAME_MAP.get(base)
 
 
 # ---------------------------------------------------------------------------

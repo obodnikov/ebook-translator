@@ -40,6 +40,35 @@ def _create_provider_from_config(provider_cfg: ProviderConfig) -> OpenRouterProv
     )
 
 
+_TEXT_STAGES = (
+    "glossary",
+    "translate",
+    "judge",
+    "reflect",
+    "proofread",
+    "style",
+    "verify",
+)
+
+
+def create_stage_provider(cfg: Config | None, stage: str) -> OpenRouterProvider:
+    """Provider for a named text stage: providers.<stage> if set, else providers.text.
+
+    Unknown stage names fall back to `text` with a warning.
+    """
+    if cfg is None:
+        return OpenRouterProvider()
+    override = getattr(cfg.providers, stage, None)
+    if override is None and stage not in _TEXT_STAGES:
+        logger.warning(
+            "create_stage_provider: unknown stage %r — falling back to providers.text. "
+            "Known stages: %s",
+            stage,
+            ", ".join(_TEXT_STAGES),
+        )
+    return _create_provider_from_config(override or cfg.providers.text)
+
+
 def create_provider(cfg: Config | None = None) -> OpenRouterProvider:
     """Create the text LLM provider through a single factory point.
 

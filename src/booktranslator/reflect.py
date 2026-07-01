@@ -31,9 +31,7 @@ LANG_NAMES = {
     "hu": "Hungarian",
 }
 
-_PARAGRAPH_MARKER_RE = re.compile(
-    r"^===PARAGRAPH\s+(\d+)===\s*$", re.MULTILINE
-)
+_PARAGRAPH_MARKER_RE = re.compile(r"^===PARAGRAPH\s+(\d+)===\s*$", re.MULTILINE)
 
 
 @dataclass
@@ -83,9 +81,7 @@ class Reflector:
         self.source_lang = source_lang
         self.target_lang = target_lang
 
-        self._glossary_block = (
-            render_for_prompt(glossary) if glossary else "(no glossary provided)"
-        )
+        self._glossary_block = render_for_prompt(glossary) if glossary else "(no glossary provided)"
         self._lock = threading.Lock()
 
     def _build_reflect_context(
@@ -162,7 +158,18 @@ class Reflector:
             user=user,
             temperature=self.reflect_prompt.temperature,
             max_tokens=self.reflect_prompt.max_tokens,
+            reasoning_effort=self.reflect_prompt.reasoning_effort,
         )
+
+        # Guard: empty content means the provider routed the answer elsewhere
+        # (tool call / reasoning_content). Raise BEFORE caching so an empty
+        # response is never written to the cache.
+        if not (result.text or "").strip():
+            raise ValueError(
+                "Reflect (notes) model returned empty content "
+                f"(finish_reason={result.finish_reason!r}). Check "
+                "WEB_SEARCH_ENABLED / FAKE_REASONING on the gateway."
+            )
 
         # Store reflection notes in cache (not in waterfall — internal artifact)
         with self._lock:
@@ -189,9 +196,7 @@ class Reflector:
         stats: ReflectStats,
     ) -> str:
         """Step 2: Re-translate using the translate prompt + reflection notes."""
-        context = self._build_retranslate_context(
-            original_paragraphs, reflection_notes
-        )
+        context = self._build_retranslate_context(original_paragraphs, reflection_notes)
         system, user = render_prompt(self.translate_prompt, context)
 
         cache_key = Cache.make_key(
@@ -216,7 +221,18 @@ class Reflector:
             user=user,
             temperature=self.translate_prompt.temperature,
             max_tokens=self.translate_prompt.max_tokens,
+            reasoning_effort=self.translate_prompt.reasoning_effort,
         )
+
+        # Guard: empty content means the provider routed the answer elsewhere
+        # (tool call / reasoning_content). Raise BEFORE caching so an empty
+        # response is never written to the cache.
+        if not (result.text or "").strip():
+            raise ValueError(
+                "Reflect (re-translate) model returned empty content "
+                f"(finish_reason={result.finish_reason!r}). Check "
+                "WEB_SEARCH_ENABLED / FAKE_REASONING on the gateway."
+            )
 
         with self._lock:
             self.cache.put(
@@ -258,8 +274,7 @@ class Reflector:
         """
         # Step 1: Get reflection notes (critique)
         reflection_notes = self._get_reflection_notes(
-            chunk_id, original_text, translated_text,
-            judge_score, judge_issues, stats
+            chunk_id, original_text, translated_text, judge_score, judge_issues, stats
         )
 
         # Step 2: Re-translate with notes
@@ -319,7 +334,8 @@ class Reflector:
                     stats.chunks_failed += 1
                     logger.warning(
                         "Reflect chunk %s failed: %s",
-                        chunk_data["chunk_id"], e,
+                        chunk_data["chunk_id"],
+                        e,
                     )
                 if on_progress:
                     on_progress(i + 1, len(chunks_to_reflect), chunk_data["chunk_id"], stats)
@@ -328,9 +344,7 @@ class Reflector:
         done_count = 0
         with ThreadPoolExecutor(max_workers=parallelism) as pool:
             futures = {
-                pool.submit(
-                    self._reflect_chunk_safe, chunk_data, stats
-                ): chunk_data["chunk_id"]
+                pool.submit(self._reflect_chunk_safe, chunk_data, stats): chunk_data["chunk_id"]
                 for chunk_data in chunks_to_reflect
             }
             for fut in as_completed(futures):
@@ -342,15 +356,11 @@ class Reflector:
                     logger.warning("Reflect chunk %s failed: %s", chunk_id, err)
                 done_count += 1
                 if on_progress:
-                    on_progress(
-                        done_count, len(chunks_to_reflect), chunk_id, stats
-                    )
+                    on_progress(done_count, len(chunks_to_reflect), chunk_id, stats)
 
         return stats
 
-    def _reflect_chunk_safe(
-        self, chunk_data: dict, stats: ReflectStats
-    ) -> Exception | None:
+    def _reflect_chunk_safe(self, chunk_data: dict, stats: ReflectStats) -> Exception | None:
         try:
             self.reflect_chunk(
                 chunk_id=chunk_data["chunk_id"],

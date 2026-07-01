@@ -1,8 +1,9 @@
 ---
-version: 1
+version: 2
 model: anthropic/claude-sonnet-4.6
 temperature: 0.3
 max_tokens: 12000
+reasoning_effort: none
 ---
 
 # System

@@ -97,8 +97,12 @@ def work_with_cache(tmp_path: Path) -> Path:
     )
     cache.put(
         Cache.make_key("translate", "test-model", "v1", "sys", "user1"),
-        "translate", "test-model", "v1", translated,
-        input_tokens=100, output_tokens=50,
+        "translate",
+        "test-model",
+        "v1",
+        translated,
+        input_tokens=100,
+        output_tokens=50,
         meta={"chunk_id": "ch01_c01"},
     )
 
@@ -111,15 +115,17 @@ def work_with_cache(tmp_path: Path) -> Path:
     )
     cache.put(
         Cache.make_key("style", "test-model", "v1", "sys", "user1"),
-        "style", "test-model", "v1", styled,
-        input_tokens=100, output_tokens=50,
+        "style",
+        "test-model",
+        "v1",
+        styled,
+        input_tokens=100,
+        output_tokens=50,
         meta={"chunk_id": "ch01_c01"},
     )
 
     # Save chunker params
-    cache.set_meta("chunker_params", {
-        "target_words": 2000, "overlap_paragraphs": 1
-    })
+    cache.set_meta("chunker_params", {"target_words": 2000, "overlap_paragraphs": 1})
 
     cache.close()
     return work_path
@@ -163,9 +169,7 @@ def series_glossary(tmp_path: Path) -> Path:
     )
 
     glossary_path = series_dir / "series.glossary.json"
-    glossary_path.write_text(
-        glossary.model_dump_json(indent=2), encoding="utf-8"
-    )
+    glossary_path.write_text(glossary.model_dump_json(indent=2), encoding="utf-8")
     return tmp_path / "work"
 
 
@@ -177,9 +181,13 @@ def series_glossary(tmp_path: Path) -> Path:
 class TestAssembleBasic:
     def test_assemble_requires_epub(self, work_with_cache: Path):
         """Assemble without --epub should fail."""
-        result = runner.invoke(app, [
-            "assemble", str(work_with_cache),
-        ])
+        result = runner.invoke(
+            app,
+            [
+                "assemble",
+                str(work_with_cache),
+            ],
+        )
         assert result.exit_code == 1
         assert "--epub is required" in result.output
 
@@ -187,10 +195,15 @@ class TestAssembleBasic:
         """Assemble with empty workdir (no cache) should fail."""
         empty_work = tmp_path / "empty-work"
         empty_work.mkdir()
-        result = runner.invoke(app, [
-            "assemble", str(empty_work),
-            "--epub", str(minimal_epub),
-        ])
+        result = runner.invoke(
+            app,
+            [
+                "assemble",
+                str(empty_work),
+                "--epub",
+                str(minimal_epub),
+            ],
+        )
         assert result.exit_code == 1
         assert "No cache.sqlite" in result.output
 
@@ -199,11 +212,17 @@ class TestAssembleBasic:
     ):
         """Assemble in waterfall mode produces an EPUB file."""
         out_path = tmp_path / "output.epub"
-        result = runner.invoke(app, [
-            "assemble", str(work_with_cache),
-            "--epub", str(minimal_epub),
-            "--out", str(out_path),
-        ])
+        result = runner.invoke(
+            app,
+            [
+                "assemble",
+                str(work_with_cache),
+                "--epub",
+                str(minimal_epub),
+                "--out",
+                str(out_path),
+            ],
+        )
         assert result.exit_code == 0, result.output
         assert out_path.exists()
         # Verify it's a valid zip
@@ -214,36 +233,51 @@ class TestAssembleBasic:
     ):
         """Assemble with --from translate uses only translate stage."""
         out_path = tmp_path / "from-translate.epub"
-        result = runner.invoke(app, [
-            "assemble", str(work_with_cache),
-            "--epub", str(minimal_epub),
-            "--from", "translate",
-            "--out", str(out_path),
-        ])
+        result = runner.invoke(
+            app,
+            [
+                "assemble",
+                str(work_with_cache),
+                "--epub",
+                str(minimal_epub),
+                "--from",
+                "translate",
+                "--out",
+                str(out_path),
+            ],
+        )
         assert result.exit_code == 0, result.output
         assert out_path.exists()
 
-    def test_assemble_from_invalid_stage(
-        self, work_with_cache: Path, minimal_epub: Path
-    ):
+    def test_assemble_from_invalid_stage(self, work_with_cache: Path, minimal_epub: Path):
         """Assemble with invalid --from stage should fail."""
-        result = runner.invoke(app, [
-            "assemble", str(work_with_cache),
-            "--epub", str(minimal_epub),
-            "--from", "nonexistent",
-        ])
+        result = runner.invoke(
+            app,
+            [
+                "assemble",
+                str(work_with_cache),
+                "--epub",
+                str(minimal_epub),
+                "--from",
+                "nonexistent",
+            ],
+        )
         assert result.exit_code == 1
         assert "Invalid stage" in result.output
 
-    def test_assemble_from_missing_stage(
-        self, work_with_cache: Path, minimal_epub: Path
-    ):
+    def test_assemble_from_missing_stage(self, work_with_cache: Path, minimal_epub: Path):
         """Assemble with --from for a stage not in cache should fail."""
-        result = runner.invoke(app, [
-            "assemble", str(work_with_cache),
-            "--epub", str(minimal_epub),
-            "--from", "verify",  # not in our test cache
-        ])
+        result = runner.invoke(
+            app,
+            [
+                "assemble",
+                str(work_with_cache),
+                "--epub",
+                str(minimal_epub),
+                "--from",
+                "verify",  # not in our test cache
+            ],
+        )
         assert result.exit_code == 1
         assert "do not have stage" in result.output
 
@@ -254,15 +288,19 @@ class TestAssembleBasic:
 
 
 class TestAssembleConfig:
-    def test_nonexistent_explicit_config_fails(
-        self, work_with_cache: Path, minimal_epub: Path
-    ):
+    def test_nonexistent_explicit_config_fails(self, work_with_cache: Path, minimal_epub: Path):
         """Explicitly provided --config that doesn't exist should fail."""
-        result = runner.invoke(app, [
-            "assemble", str(work_with_cache),
-            "--epub", str(minimal_epub),
-            "--config", "/nonexistent/path/config.yaml",
-        ])
+        result = runner.invoke(
+            app,
+            [
+                "assemble",
+                str(work_with_cache),
+                "--epub",
+                str(minimal_epub),
+                "--config",
+                "/nonexistent/path/config.yaml",
+            ],
+        )
         assert result.exit_code == 1
         assert "Config file not found" in result.output
 
@@ -273,11 +311,17 @@ class TestAssembleConfig:
         out_path = tmp_path / "output.epub"
         # Don't pass --config, let it use the default which may not exist
         # in the test environment — should still work with built-in defaults
-        result = runner.invoke(app, [
-            "assemble", str(work_with_cache),
-            "--epub", str(minimal_epub),
-            "--out", str(out_path),
-        ])
+        result = runner.invoke(
+            app,
+            [
+                "assemble",
+                str(work_with_cache),
+                "--epub",
+                str(minimal_epub),
+                "--out",
+                str(out_path),
+            ],
+        )
         assert result.exit_code == 0, result.output
 
 
@@ -292,45 +336,66 @@ class TestAssembleReaderNotes:
     ):
         """--notes without --series should warn and skip."""
         out_path = tmp_path / "output.epub"
-        result = runner.invoke(app, [
-            "assemble", str(work_with_cache),
-            "--epub", str(minimal_epub),
-            "--notes",
-            "--out", str(out_path),
-        ])
+        result = runner.invoke(
+            app,
+            [
+                "assemble",
+                str(work_with_cache),
+                "--epub",
+                str(minimal_epub),
+                "--notes",
+                "--out",
+                str(out_path),
+            ],
+        )
         assert result.exit_code == 0
-        assert "--notes requires --series" in result.output
+        assert "no glossary available" in result.output or "Skipping" in result.output
 
     def test_notes_with_nonexistent_series_warns(
         self, work_with_cache: Path, minimal_epub: Path, tmp_path: Path
     ):
         """--notes with non-existent series should warn and skip."""
         out_path = tmp_path / "output.epub"
-        result = runner.invoke(app, [
-            "assemble", str(work_with_cache),
-            "--epub", str(minimal_epub),
-            "--notes",
-            "--series", "nonexistent",
-            "--work", str(work_with_cache.parent),
-            "--out", str(out_path),
-        ])
+        result = runner.invoke(
+            app,
+            [
+                "assemble",
+                str(work_with_cache),
+                "--epub",
+                str(minimal_epub),
+                "--notes",
+                "--series",
+                "nonexistent",
+                "--work",
+                str(work_with_cache.parent),
+                "--out",
+                str(out_path),
+            ],
+        )
         assert result.exit_code == 0
         assert "not found" in result.output
 
     def test_notes_injects_footnotes(
-        self, work_with_cache: Path, minimal_epub: Path,
-        series_glossary: Path, tmp_path: Path
+        self, work_with_cache: Path, minimal_epub: Path, series_glossary: Path, tmp_path: Path
     ):
         """--notes with valid series injects footnotes into EPUB."""
         out_path = tmp_path / "output.epub"
-        result = runner.invoke(app, [
-            "assemble", str(work_with_cache),
-            "--epub", str(minimal_epub),
-            "--notes",
-            "--series", "rivers-of-london",
-            "--work", str(series_glossary),
-            "--out", str(out_path),
-        ])
+        result = runner.invoke(
+            app,
+            [
+                "assemble",
+                str(work_with_cache),
+                "--epub",
+                str(minimal_epub),
+                "--notes",
+                "--series",
+                "rivers-of-london",
+                "--work",
+                str(series_glossary),
+                "--out",
+                str(out_path),
+            ],
+        )
         assert result.exit_code == 0, result.output
         assert "footnotes injected" in result.output or "Reader notes:" in result.output
 
@@ -340,19 +405,26 @@ class TestAssembleReaderNotes:
             assert "noteref" in content or "footnote" in content
 
     def test_no_notes_flag_skips_injection(
-        self, work_with_cache: Path, minimal_epub: Path,
-        series_glossary: Path, tmp_path: Path
+        self, work_with_cache: Path, minimal_epub: Path, series_glossary: Path, tmp_path: Path
     ):
         """--no-notes explicitly disables reader notes."""
         out_path = tmp_path / "output.epub"
-        result = runner.invoke(app, [
-            "assemble", str(work_with_cache),
-            "--epub", str(minimal_epub),
-            "--no-notes",
-            "--series", "rivers-of-london",
-            "--work", str(series_glossary),
-            "--out", str(out_path),
-        ])
+        result = runner.invoke(
+            app,
+            [
+                "assemble",
+                str(work_with_cache),
+                "--epub",
+                str(minimal_epub),
+                "--no-notes",
+                "--series",
+                "rivers-of-london",
+                "--work",
+                str(series_glossary),
+                "--out",
+                str(out_path),
+            ],
+        )
         assert result.exit_code == 0, result.output
         # Should NOT have footnotes
         with zipfile.ZipFile(out_path, "r") as zf:
@@ -360,21 +432,29 @@ class TestAssembleReaderNotes:
             assert "noteref" not in content
 
     def test_note_types_override(
-        self, work_with_cache: Path, minimal_epub: Path,
-        series_glossary: Path, tmp_path: Path
+        self, work_with_cache: Path, minimal_epub: Path, series_glossary: Path, tmp_path: Path
     ):
         """--note-types filters which glossary types get annotated."""
         out_path = tmp_path / "output.epub"
         # Only annotate "concept" — should match "вестигиум" but not "DCI"
-        result = runner.invoke(app, [
-            "assemble", str(work_with_cache),
-            "--epub", str(minimal_epub),
-            "--notes",
-            "--series", "rivers-of-london",
-            "--work", str(series_glossary),
-            "--note-types", "concept",
-            "--out", str(out_path),
-        ])
+        result = runner.invoke(
+            app,
+            [
+                "assemble",
+                str(work_with_cache),
+                "--epub",
+                str(minimal_epub),
+                "--notes",
+                "--series",
+                "rivers-of-london",
+                "--work",
+                str(series_glossary),
+                "--note-types",
+                "concept",
+                "--out",
+                str(out_path),
+            ],
+        )
         assert result.exit_code == 0, result.output
 
     def test_notes_with_standalone_glossary(
@@ -412,13 +492,20 @@ class TestAssembleReaderNotes:
         )
 
         out_path = tmp_path / "standalone-notes.epub"
-        result = runner.invoke(app, [
-            "assemble", str(work_with_cache),
-            "--epub", str(minimal_epub),
-            "--notes",
-            "--glossary", str(glossary_file),
-            "--out", str(out_path),
-        ])
+        result = runner.invoke(
+            app,
+            [
+                "assemble",
+                str(work_with_cache),
+                "--epub",
+                str(minimal_epub),
+                "--notes",
+                "--glossary",
+                str(glossary_file),
+                "--out",
+                str(out_path),
+            ],
+        )
         assert result.exit_code == 0, result.output
         assert "footnotes injected" in result.output or "Reader notes:" in result.output
 
@@ -432,15 +519,24 @@ class TestAssembleReaderNotes:
     ):
         """--series and --glossary together should fail."""
         glossary_file = tmp_path / "glossary.json"
-        glossary_file.write_text('{"book":"x","author":"x","source_lang":"en","target_lang":"ru","model":"x","entries":[]}')
+        glossary_file.write_text(
+            '{"book":"x","author":"x","source_lang":"en","target_lang":"ru","model":"x","entries":[]}'
+        )
 
-        result = runner.invoke(app, [
-            "assemble", str(work_with_cache),
-            "--epub", str(minimal_epub),
-            "--notes",
-            "--series", "rivers-of-london",
-            "--glossary", str(glossary_file),
-        ])
+        result = runner.invoke(
+            app,
+            [
+                "assemble",
+                str(work_with_cache),
+                "--epub",
+                str(minimal_epub),
+                "--notes",
+                "--series",
+                "rivers-of-london",
+                "--glossary",
+                str(glossary_file),
+            ],
+        )
         assert result.exit_code == 1
         assert "mutually exclusive" in result.output
 
@@ -451,12 +547,18 @@ class TestAssembleReaderNotes:
         bad_file = tmp_path / "bad-glossary.json"
         bad_file.write_text("not valid json {{{", encoding="utf-8")
 
-        result = runner.invoke(app, [
-            "assemble", str(work_with_cache),
-            "--epub", str(minimal_epub),
-            "--notes",
-            "--glossary", str(bad_file),
-        ])
+        result = runner.invoke(
+            app,
+            [
+                "assemble",
+                str(work_with_cache),
+                "--epub",
+                str(minimal_epub),
+                "--notes",
+                "--glossary",
+                str(bad_file),
+            ],
+        )
         assert result.exit_code == 1
         assert "Error loading glossary" in result.output
 
@@ -467,11 +569,17 @@ class TestAssembleReaderNotes:
         bad_file = tmp_path / "bad-schema.json"
         bad_file.write_text('{"wrong_field": true}', encoding="utf-8")
 
-        result = runner.invoke(app, [
-            "assemble", str(work_with_cache),
-            "--epub", str(minimal_epub),
-            "--notes",
-            "--glossary", str(bad_file),
-        ])
+        result = runner.invoke(
+            app,
+            [
+                "assemble",
+                str(work_with_cache),
+                "--epub",
+                str(minimal_epub),
+                "--notes",
+                "--glossary",
+                str(bad_file),
+            ],
+        )
         assert result.exit_code == 1
         assert "Error loading glossary" in result.output

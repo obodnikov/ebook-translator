@@ -1,11 +1,3 @@
-# Default configuration for btrans.
-#
-# Uses OpenRouter for all stages (universally runnable default).
-# Copy this file to your project directory as configs/default.yaml and
-# adjust as needed.
-#
-# For kiro-gateway routing, see configs/kiro-gateway.yaml.example.
-
 source_lang: en
 target_lang: ru
 # target_lang_name: Russian  # auto-derived from target_lang if omitted
@@ -23,10 +15,8 @@ chunker:
   overlap_paragraphs: 1
 
 translate:
-  parallelism: 1
+  parallelism: 1    # concurrent chunks; raise to 4-8 for speedup.
 
-# Model names must match your provider's format.
-# For OpenRouter use the anthropic/ prefix (anthropic/claude-sonnet-4.6).
 models:
   glossary:   anthropic/claude-sonnet-4.6
   translate:  anthropic/claude-sonnet-4.6
@@ -60,6 +50,6 @@ cost:
   hard_limit_usd: 50.0
 
 reader_notes:
-  enabled: false
+  enabled: true
   types: [concept, term]
-  scope: first-in-book
+  scope: first-in-book  # first-in-chapter | first-in-book | all

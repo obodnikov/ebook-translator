@@ -1,8 +1,9 @@
 ---
-version: 1
+version: 2
 model: anthropic/claude-haiku-4.5
 temperature: 0.1
 max_tokens: 2000
+reasoning_effort: none
 ---
 
 # System

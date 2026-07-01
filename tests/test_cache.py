@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import sqlite3
-import tempfile
 from pathlib import Path
 
 import pytest
@@ -39,21 +38,25 @@ def legacy_db(tmp_path: Path) -> Path:
     """)
     # Insert some legacy rows (no chunk_id column, no meta_json)
     conn.execute(
-        "INSERT INTO cache (key, stage, model, prompt_version, content) "
-        "VALUES (?, ?, ?, ?, ?)",
+        "INSERT INTO cache (key, stage, model, prompt_version, content) VALUES (?, ?, ?, ?, ?)",
         ("abc123", "translate", "anthropic/claude-sonnet-4.6", "v1", "Привет мир"),
     )
     conn.execute(
-        "INSERT INTO cache (key, stage, model, prompt_version, content) "
-        "VALUES (?, ?, ?, ?, ?)",
+        "INSERT INTO cache (key, stage, model, prompt_version, content) VALUES (?, ?, ?, ?, ?)",
         ("def456", "translate", "anthropic/claude-sonnet-4.6", "v1", "Второй чанк"),
     )
     # One with meta_json containing chunk_id (simulates partially migrated data)
     conn.execute(
         "INSERT INTO cache (key, stage, model, prompt_version, content, meta_json) "
         "VALUES (?, ?, ?, ?, ?, ?)",
-        ("ghi789", "translate", "anthropic/claude-sonnet-4.6", "v1", "Третий",
-         json.dumps({"chunk_id": "ch01_c03"})),
+        (
+            "ghi789",
+            "translate",
+            "anthropic/claude-sonnet-4.6",
+            "v1",
+            "Третий",
+            json.dumps({"chunk_id": "ch01_c03"}),
+        ),
     )
     conn.commit()
     conn.close()
@@ -69,10 +72,7 @@ class TestSchemaMigration:
     def test_legacy_db_gets_chunk_id_column(self, legacy_db: Path):
         """Opening a legacy DB adds the chunk_id column."""
         cache = Cache(legacy_db)
-        cols = {
-            row[1]
-            for row in cache.conn.execute("PRAGMA table_info(cache)").fetchall()
-        }
+        cols = {row[1] for row in cache.conn.execute("PRAGMA table_info(cache)").fetchall()}
         assert "chunk_id" in cols
         cache.close()
 
@@ -91,18 +91,14 @@ class TestSchemaMigration:
     def test_legacy_db_backfills_chunk_id_from_meta(self, legacy_db: Path):
         """Entries with chunk_id in meta_json get backfilled."""
         cache = Cache(legacy_db)
-        row = cache.conn.execute(
-            "SELECT chunk_id FROM cache WHERE key = 'ghi789'"
-        ).fetchone()
+        row = cache.conn.execute("SELECT chunk_id FROM cache WHERE key = 'ghi789'").fetchone()
         assert row[0] == "ch01_c03"
         cache.close()
 
     def test_legacy_db_null_chunk_id_for_entries_without_meta(self, legacy_db: Path):
         """Entries without meta_json keep chunk_id as NULL."""
         cache = Cache(legacy_db)
-        row = cache.conn.execute(
-            "SELECT chunk_id FROM cache WHERE key = 'abc123'"
-        ).fetchone()
+        row = cache.conn.execute("SELECT chunk_id FROM cache WHERE key = 'abc123'").fetchone()
         assert row[0] is None
         cache.close()
 
@@ -117,10 +113,7 @@ class TestSchemaMigration:
 
     def test_fresh_db_has_full_schema(self, fresh_cache: Cache):
         """A new DB has chunk_id column and preferences table from the start."""
-        cols = {
-            row[1]
-            for row in fresh_cache.conn.execute("PRAGMA table_info(cache)").fetchall()
-        }
+        cols = {row[1] for row in fresh_cache.conn.execute("PRAGMA table_info(cache)").fetchall()}
         assert "chunk_id" in cols
         tables = {
             row[0]
@@ -134,10 +127,7 @@ class TestSchemaMigration:
     def test_index_exists_after_migration(self, legacy_db: Path):
         """The idx_cache_chunk_stage index is created."""
         cache = Cache(legacy_db)
-        indexes = {
-            row[1]
-            for row in cache.conn.execute("PRAGMA index_list(cache)").fetchall()
-        }
+        indexes = {row[1] for row in cache.conn.execute("PRAGMA index_list(cache)").fetchall()}
         assert "idx_cache_chunk_stage" in indexes
         cache.close()
 
@@ -240,8 +230,9 @@ class TestWaterfallResolution:
     def test_full_waterfall(self, fresh_cache: Cache):
         cache = fresh_cache
         for stage in STAGE_WATERFALL:
-            cache.put(f"k_{stage}", stage, "m", "v1", f"text_{stage}",
-                      meta={"chunk_id": "ch01_c01"})
+            cache.put(
+                f"k_{stage}", stage, "m", "v1", f"text_{stage}", meta={"chunk_id": "ch01_c01"}
+            )
         assert cache.resolve_stage_for_chunk("ch01_c01") == "verify"
 
     def test_preference_overrides_waterfall(self, fresh_cache: Cache):
@@ -301,12 +292,22 @@ class TestQueryMethods:
 
     def test_get_judge_scores(self, fresh_cache: Cache):
         cache = fresh_cache
-        cache.put("j1", "judge", "m", "v1",
-                  json.dumps({"score": 4, "issues": ["minor"]}),
-                  meta={"chunk_id": "c1"})
-        cache.put("j2", "judge", "m", "v1",
-                  json.dumps({"score": 2, "issues": ["bad", "worse"]}),
-                  meta={"chunk_id": "c2"})
+        cache.put(
+            "j1",
+            "judge",
+            "m",
+            "v1",
+            json.dumps({"score": 4, "issues": ["minor"]}),
+            meta={"chunk_id": "c1"},
+        )
+        cache.put(
+            "j2",
+            "judge",
+            "m",
+            "v1",
+            json.dumps({"score": 2, "issues": ["bad", "worse"]}),
+            meta={"chunk_id": "c2"},
+        )
         scores = cache.get_judge_scores()
         assert len(scores) == 2
         by_id = {s["chunk_id"]: s for s in scores}
@@ -430,13 +431,13 @@ class TestBulkResolutionScale:
 
         # Insert translate entries for all chunks
         for i, cid in enumerate(chunk_ids):
-            cache.put(f"k{i}", "translate", "m", "v1", f"text{i}",
-                      meta={"chunk_id": cid})
+            cache.put(f"k{i}", "translate", "m", "v1", f"text{i}", meta={"chunk_id": cid})
 
         # Add reflect for first 100
         for i in range(100):
-            cache.put(f"r{i}", "reflect", "m", "v1", f"reflected{i}",
-                      meta={"chunk_id": chunk_ids[i]})
+            cache.put(
+                f"r{i}", "reflect", "m", "v1", f"reflected{i}", meta={"chunk_id": chunk_ids[i]}
+            )
 
         resolved = cache.resolve_stages_bulk(chunk_ids)
         assert len(resolved) == n
@@ -454,10 +455,8 @@ class TestBulkResolutionScale:
         chunk_ids = [f"ch{i:04d}_c01" for i in range(n)]
 
         for i, cid in enumerate(chunk_ids):
-            cache.put(f"k{i}", "translate", "m", "v1", f"text{i}",
-                      meta={"chunk_id": cid})
-            cache.put(f"r{i}", "reflect", "m", "v1", f"ref{i}",
-                      meta={"chunk_id": cid})
+            cache.put(f"k{i}", "translate", "m", "v1", f"text{i}", meta={"chunk_id": cid})
+            cache.put(f"r{i}", "reflect", "m", "v1", f"ref{i}", meta={"chunk_id": cid})
 
         # Set preference for chunk 500 to use translate
         cache.set_preference(chunk_ids[500], "translate")

@@ -23,6 +23,7 @@ from booktranslator.pipeline_helpers import (
     collect_preferred_translations,
     collect_stage_translations,
     create_provider,
+    create_stage_provider,
     save_chunker_params,
     verify_chunker_params,
 )
@@ -60,20 +61,24 @@ class MockChunkSet:
 
 class TestCollectChunkOriginals:
     def test_filters_by_ids(self):
-        cs = MockChunkSet({
-            "c1": ["<p>Hello</p>", "<p>World</p>"],
-            "c2": ["<p>Foo</p>"],
-            "c3": ["<p>Bar</p>"],
-        })
+        cs = MockChunkSet(
+            {
+                "c1": ["<p>Hello</p>", "<p>World</p>"],
+                "c2": ["<p>Foo</p>"],
+                "c3": ["<p>Bar</p>"],
+            }
+        )
         result = collect_chunk_originals(cs, ["c1", "c3"])
         assert "c1" in result
         assert "c3" in result
         assert "c2" not in result
 
     def test_joins_paragraphs(self):
-        cs = MockChunkSet({
-            "c1": ["<p>Line 1</p>", "<p>Line 2</p>"],
-        })
+        cs = MockChunkSet(
+            {
+                "c1": ["<p>Line 1</p>", "<p>Line 2</p>"],
+            }
+        )
         result = collect_chunk_originals(cs, ["c1"])
         assert result["c1"] == "<p>Line 1</p>\n<p>Line 2</p>"
 
@@ -96,9 +101,11 @@ class TestCollectChunkOriginals:
 
 class TestCollectChunkOriginalsWithParagraphs:
     def test_returns_tuple(self):
-        cs = MockChunkSet({
-            "c1": ["<p>A</p>", "<p>B</p>"],
-        })
+        cs = MockChunkSet(
+            {
+                "c1": ["<p>A</p>", "<p>B</p>"],
+            }
+        )
         result = collect_chunk_originals_with_paragraphs(cs, ["c1"])
         text, paras = result["c1"]
         assert text == "<p>A</p>\n<p>B</p>"
@@ -112,45 +119,37 @@ class TestCollectChunkOriginalsWithParagraphs:
 
 class TestCollectStageTranslations:
     def test_gets_translate_stage(self, cache: Cache):
-        cache.put("k1", "translate", "m", "v1", "Translation 1",
-                  meta={"chunk_id": "c1"})
-        cache.put("k2", "judge", "m", "v1", '{"score": 5}',
-                  meta={"chunk_id": "c1"})
+        cache.put("k1", "translate", "m", "v1", "Translation 1", meta={"chunk_id": "c1"})
+        cache.put("k2", "judge", "m", "v1", '{"score": 5}', meta={"chunk_id": "c1"})
 
         result = collect_stage_translations(cache, ["c1"], "translate")
         assert result == {"c1": "Translation 1"}
 
     def test_gets_latest_revision(self, cache: Cache):
         """When multiple translate entries exist, returns the latest."""
-        cache.put("k1", "translate", "m", "v1", "Old translation",
-                  meta={"chunk_id": "c1"})
-        cache.put("k2", "translate", "m", "v2", "New translation",
-                  meta={"chunk_id": "c1"})
+        cache.put("k1", "translate", "m", "v1", "Old translation", meta={"chunk_id": "c1"})
+        cache.put("k2", "translate", "m", "v2", "New translation", meta={"chunk_id": "c1"})
 
         result = collect_stage_translations(cache, ["c1"], "translate")
         # Should get the latest (v2)
         assert result["c1"] == "New translation"
 
     def test_missing_chunk_not_in_result(self, cache: Cache):
-        cache.put("k1", "translate", "m", "v1", "text",
-                  meta={"chunk_id": "c1"})
+        cache.put("k1", "translate", "m", "v1", "text", meta={"chunk_id": "c1"})
 
         result = collect_stage_translations(cache, ["c1", "c99"], "translate")
         assert "c1" in result
         assert "c99" not in result
 
     def test_wrong_stage_not_returned(self, cache: Cache):
-        cache.put("k1", "reflect", "m", "v1", "reflected",
-                  meta={"chunk_id": "c1"})
+        cache.put("k1", "reflect", "m", "v1", "reflected", meta={"chunk_id": "c1"})
 
         result = collect_stage_translations(cache, ["c1"], "translate")
         assert result == {}
 
     def test_gets_reflect_stage(self, cache: Cache):
-        cache.put("k1", "translate", "m", "v1", "original",
-                  meta={"chunk_id": "c1"})
-        cache.put("k2", "reflect", "m", "v1", "reflected",
-                  meta={"chunk_id": "c1"})
+        cache.put("k1", "translate", "m", "v1", "original", meta={"chunk_id": "c1"})
+        cache.put("k2", "reflect", "m", "v1", "reflected", meta={"chunk_id": "c1"})
 
         result = collect_stage_translations(cache, ["c1"], "reflect")
         assert result == {"c1": "reflected"}
@@ -163,31 +162,24 @@ class TestCollectStageTranslations:
 
 class TestCollectPreferredTranslations:
     def test_waterfall_picks_latest_stage(self, cache: Cache):
-        cache.put("k1", "translate", "m", "v1", "original",
-                  meta={"chunk_id": "c1"})
-        cache.put("k2", "reflect", "m", "v1", "reflected",
-                  meta={"chunk_id": "c1"})
+        cache.put("k1", "translate", "m", "v1", "original", meta={"chunk_id": "c1"})
+        cache.put("k2", "reflect", "m", "v1", "reflected", meta={"chunk_id": "c1"})
 
         result = collect_preferred_translations(cache, ["c1"])
         assert result["c1"] == "reflected"
 
     def test_preference_overrides_waterfall(self, cache: Cache):
-        cache.put("k1", "translate", "m", "v1", "original",
-                  meta={"chunk_id": "c1"})
-        cache.put("k2", "reflect", "m", "v1", "reflected",
-                  meta={"chunk_id": "c1"})
+        cache.put("k1", "translate", "m", "v1", "original", meta={"chunk_id": "c1"})
+        cache.put("k2", "reflect", "m", "v1", "reflected", meta={"chunk_id": "c1"})
         cache.set_preference("c1", "translate")
 
         result = collect_preferred_translations(cache, ["c1"])
         assert result["c1"] == "original"
 
     def test_multiple_chunks(self, cache: Cache):
-        cache.put("k1", "translate", "m", "v1", "t1",
-                  meta={"chunk_id": "c1"})
-        cache.put("k2", "translate", "m", "v1", "t2",
-                  meta={"chunk_id": "c2"})
-        cache.put("k3", "reflect", "m", "v1", "r1",
-                  meta={"chunk_id": "c1"})
+        cache.put("k1", "translate", "m", "v1", "t1", meta={"chunk_id": "c1"})
+        cache.put("k2", "translate", "m", "v1", "t2", meta={"chunk_id": "c2"})
+        cache.put("k3", "reflect", "m", "v1", "r1", meta={"chunk_id": "c1"})
 
         result = collect_preferred_translations(cache, ["c1", "c2"])
         assert result["c1"] == "r1"  # reflect wins
@@ -201,14 +193,14 @@ class TestCollectPreferredTranslations:
 
 class TestBuildReflectInput:
     def test_builds_correct_structure(self, cache: Cache):
-        cs = MockChunkSet({
-            "c1": ["<p>Hello</p>", "<p>World</p>"],
-            "c2": ["<p>Foo</p>"],
-        })
-        cache.put("k1", "translate", "m", "v1", "Translated c1",
-                  meta={"chunk_id": "c1"})
-        cache.put("k2", "translate", "m", "v1", "Translated c2",
-                  meta={"chunk_id": "c2"})
+        cs = MockChunkSet(
+            {
+                "c1": ["<p>Hello</p>", "<p>World</p>"],
+                "c2": ["<p>Foo</p>"],
+            }
+        )
+        cache.put("k1", "translate", "m", "v1", "Translated c1", meta={"chunk_id": "c1"})
+        cache.put("k2", "translate", "m", "v1", "Translated c2", meta={"chunk_id": "c2"})
 
         judge_by_id = {
             "c1": {"score": 2, "issues": ["accuracy: omission"]},
@@ -226,13 +218,14 @@ class TestBuildReflectInput:
         assert c1_data["judge_issues"] == ["accuracy: omission"]
 
     def test_skips_chunks_without_translation(self, cache: Cache):
-        cs = MockChunkSet({
-            "c1": ["<p>Hello</p>"],
-            "c2": ["<p>World</p>"],
-        })
+        cs = MockChunkSet(
+            {
+                "c1": ["<p>Hello</p>"],
+                "c2": ["<p>World</p>"],
+            }
+        )
         # Only c1 has a translation
-        cache.put("k1", "translate", "m", "v1", "Translated",
-                  meta={"chunk_id": "c1"})
+        cache.put("k1", "translate", "m", "v1", "Translated", meta={"chunk_id": "c1"})
 
         judge_by_id = {
             "c1": {"score": 2, "issues": []},
@@ -246,10 +239,8 @@ class TestBuildReflectInput:
     def test_uses_latest_translate_revision(self, cache: Cache):
         """build_reflect_input should use the latest translate revision."""
         cs = MockChunkSet({"c1": ["<p>Text</p>"]})
-        cache.put("k1", "translate", "m", "v1", "Old translation",
-                  meta={"chunk_id": "c1"})
-        cache.put("k2", "translate", "m", "v2", "New translation",
-                  meta={"chunk_id": "c1"})
+        cache.put("k1", "translate", "m", "v1", "Old translation", meta={"chunk_id": "c1"})
+        cache.put("k2", "translate", "m", "v2", "New translation", meta={"chunk_id": "c1"})
 
         judge_by_id = {"c1": {"score": 2, "issues": []}}
         result = build_reflect_input(cs, cache, {"c1"}, judge_by_id)
@@ -258,8 +249,7 @@ class TestBuildReflectInput:
 
     def test_handles_missing_judge_data(self, cache: Cache):
         cs = MockChunkSet({"c1": ["<p>Text</p>"]})
-        cache.put("k1", "translate", "m", "v1", "Translated",
-                  meta={"chunk_id": "c1"})
+        cache.put("k1", "translate", "m", "v1", "Translated", meta={"chunk_id": "c1"})
 
         # No judge data for c1
         result = build_reflect_input(cs, cache, {"c1"}, {})
@@ -285,6 +275,7 @@ class TestCreateProvider:
         with patch.dict("os.environ", {}, clear=True):
             # Remove the key if it exists
             import os
+
             env_backup = os.environ.get("OPENROUTER_API_KEY")
             if "OPENROUTER_API_KEY" in os.environ:
                 del os.environ["OPENROUTER_API_KEY"]
@@ -349,3 +340,71 @@ class TestChunkerConfigPersistence:
         save_chunker_params(cache, target_words=1500, overlap_paragraphs=2)
         # Verify they're stored
         verify_chunker_params(cache, target_words=1500, overlap_paragraphs=2)
+
+
+# ---------------------------------------------------------------------------
+# create_stage_provider
+# ---------------------------------------------------------------------------
+
+
+from booktranslator.models import Config, ProviderConfig, ProvidersConfig  # noqa: E402
+
+
+class TestCreateStageProvider:
+    @patch.dict("os.environ", {"OPENROUTER_API_KEY": "or-key"})
+    def test_no_config_falls_back_to_defaults(self):
+        """None config returns a default OpenRouterProvider."""
+        provider = create_stage_provider(None, "glossary")
+        assert provider is not None
+
+    @patch.dict("os.environ", {"TEXT_KEY": "text-secret"})
+    def test_no_override_uses_text(self):
+        """Stage with no override falls back to providers.text."""
+        cfg = Config(
+            providers=ProvidersConfig(
+                text=ProviderConfig(base_url="http://text/v1", api_key_env="TEXT_KEY"),
+            )
+        )
+        provider = create_stage_provider(cfg, "translate")
+        assert provider._base_url == "http://text/v1"
+        assert provider._api_key == "text-secret"
+
+    @patch.dict("os.environ", {"TEXT_KEY": "text-secret", "GLOSSARY_KEY": "glossary-secret"})
+    def test_override_used_when_set(self):
+        """Stage with explicit override uses that provider."""
+        cfg = Config(
+            providers=ProvidersConfig(
+                text=ProviderConfig(base_url="http://text/v1", api_key_env="TEXT_KEY"),
+                glossary=ProviderConfig(
+                    base_url="https://openrouter.ai/api/v1", api_key_env="GLOSSARY_KEY"
+                ),
+            )
+        )
+        provider = create_stage_provider(cfg, "glossary")
+        assert provider._base_url == "https://openrouter.ai/api/v1"
+        assert provider._api_key == "glossary-secret"
+
+    @patch.dict("os.environ", {"TEXT_KEY": "text-secret"})
+    def test_unknown_stage_falls_back_to_text(self):
+        """Unknown stage name falls back to providers.text silently."""
+        cfg = Config(
+            providers=ProvidersConfig(
+                text=ProviderConfig(base_url="http://text/v1", api_key_env="TEXT_KEY"),
+            )
+        )
+        provider = create_stage_provider(cfg, "nonexistent_stage")
+        assert provider._base_url == "http://text/v1"
+
+    @patch.dict("os.environ", {"TEXT_KEY": "text-secret", "JUDGE_KEY": "judge-secret"})
+    def test_judge_override_independent_of_translate(self):
+        """judge override does not affect translate (which uses text)."""
+        cfg = Config(
+            providers=ProvidersConfig(
+                text=ProviderConfig(base_url="http://text/v1", api_key_env="TEXT_KEY"),
+                judge=ProviderConfig(base_url="http://judge/v1", api_key_env="JUDGE_KEY"),
+            )
+        )
+        judge_prov = create_stage_provider(cfg, "judge")
+        translate_prov = create_stage_provider(cfg, "translate")
+        assert judge_prov._base_url == "http://judge/v1"
+        assert translate_prov._base_url == "http://text/v1"

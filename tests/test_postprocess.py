@@ -432,9 +432,7 @@ class TestProcessChunks:
             {"chunk_id": "c2", "translated_paragraphs": ["<p>B.</p>"]},
         ]
 
-        proofreader.process_chunks(
-            chunks_data, on_progress=on_progress, parallelism=1
-        )
+        proofreader.process_chunks(chunks_data, on_progress=on_progress, parallelism=1)
 
         assert len(progress_calls) == 2
         assert progress_calls[-1][0] == 2  # done
@@ -451,8 +449,7 @@ class TestProcessChunks:
         )
 
         chunks_data = [
-            {"chunk_id": f"c{i}", "translated_paragraphs": [f"<p>Text {i}.</p>"]}
-            for i in range(8)
+            {"chunk_id": f"c{i}", "translated_paragraphs": [f"<p>Text {i}.</p>"]} for i in range(8)
         ]
 
         stats = proofreader.process_chunks(chunks_data, parallelism=4)
@@ -471,8 +468,14 @@ class TestWaterfallIntegration:
     def test_proofread_in_waterfall(self, proofreader: PostProcessor, mock_provider, cache: Cache):
         """Proofread results participate in waterfall resolution."""
         # Put a translate entry
-        cache.put("t1", "translate", "m", "v1", "===PARAGRAPH 1===\n<p>Original.</p>",
-                  meta={"chunk_id": "ch01_c01"})
+        cache.put(
+            "t1",
+            "translate",
+            "m",
+            "v1",
+            "===PARAGRAPH 1===\n<p>Original.</p>",
+            meta={"chunk_id": "ch01_c01"},
+        )
 
         # Run proofread
         mock_provider.complete.return_value = CompletionResult(
@@ -495,10 +498,22 @@ class TestWaterfallIntegration:
         self, styler: PostProcessor, mock_provider, cache: Cache
     ):
         """Style after proofread: waterfall resolves to style."""
-        cache.put("t1", "translate", "m", "v1", "===PARAGRAPH 1===\n<p>Translate.</p>",
-                  meta={"chunk_id": "ch01_c01"})
-        cache.put("p1", "proofread", "m", "v1", "===PARAGRAPH 1===\n<p>Proofread.</p>",
-                  meta={"chunk_id": "ch01_c01"})
+        cache.put(
+            "t1",
+            "translate",
+            "m",
+            "v1",
+            "===PARAGRAPH 1===\n<p>Translate.</p>",
+            meta={"chunk_id": "ch01_c01"},
+        )
+        cache.put(
+            "p1",
+            "proofread",
+            "m",
+            "v1",
+            "===PARAGRAPH 1===\n<p>Proofread.</p>",
+            meta={"chunk_id": "ch01_c01"},
+        )
 
         mock_provider.complete.return_value = CompletionResult(
             text="===PARAGRAPH 1===\n<p>Styled.</p>",
@@ -515,16 +530,27 @@ class TestWaterfallIntegration:
         resolved = cache.resolve_stage_for_chunk("ch01_c01")
         assert resolved == "style"
 
-    def test_verify_is_highest_priority(
-        self, verifier: PostProcessor, mock_provider, cache: Cache
-    ):
+    def test_verify_is_highest_priority(self, verifier: PostProcessor, mock_provider, cache: Cache):
         """Verify is the highest stage in waterfall."""
-        cache.put("t1", "translate", "m", "v1", "===PARAGRAPH 1===\n<p>T.</p>",
-                  meta={"chunk_id": "ch01_c01"})
-        cache.put("p1", "proofread", "m", "v1", "===PARAGRAPH 1===\n<p>P.</p>",
-                  meta={"chunk_id": "ch01_c01"})
-        cache.put("s1", "style", "m", "v1", "===PARAGRAPH 1===\n<p>S.</p>",
-                  meta={"chunk_id": "ch01_c01"})
+        cache.put(
+            "t1",
+            "translate",
+            "m",
+            "v1",
+            "===PARAGRAPH 1===\n<p>T.</p>",
+            meta={"chunk_id": "ch01_c01"},
+        )
+        cache.put(
+            "p1",
+            "proofread",
+            "m",
+            "v1",
+            "===PARAGRAPH 1===\n<p>P.</p>",
+            meta={"chunk_id": "ch01_c01"},
+        )
+        cache.put(
+            "s1", "style", "m", "v1", "===PARAGRAPH 1===\n<p>S.</p>", meta={"chunk_id": "ch01_c01"}
+        )
 
         mock_provider.complete.return_value = CompletionResult(
             text="===PARAGRAPH 1===\n<p>Verified.</p>",
@@ -537,7 +563,9 @@ class TestWaterfallIntegration:
 
         stats = PostprocessStats(stage="verify")
         verifier.process_chunk(
-            "ch01_c01", ["<p>S.</p>"], stats,
+            "ch01_c01",
+            ["<p>S.</p>"],
+            stats,
             original_text="<p>Original.</p>",
         )
 
@@ -548,8 +576,14 @@ class TestWaterfallIntegration:
         self, proofreader: PostProcessor, mock_provider, cache: Cache
     ):
         """User preference can revert to translate even after postprocess."""
-        cache.put("t1", "translate", "m", "v1", "===PARAGRAPH 1===\n<p>T.</p>",
-                  meta={"chunk_id": "ch01_c01"})
+        cache.put(
+            "t1",
+            "translate",
+            "m",
+            "v1",
+            "===PARAGRAPH 1===\n<p>T.</p>",
+            meta={"chunk_id": "ch01_c01"},
+        )
 
         mock_provider.complete.return_value = CompletionResult(
             text="===PARAGRAPH 1===\n<p>Proofread.</p>",
@@ -574,8 +608,14 @@ class TestWaterfallIntegration:
         self, proofreader: PostProcessor, mock_provider, cache: Cache
     ):
         """Post-processing does not modify earlier stage entries."""
-        cache.put("t1", "translate", "m", "v1", "===PARAGRAPH 1===\n<p>Original translate.</p>",
-                  meta={"chunk_id": "ch01_c01"})
+        cache.put(
+            "t1",
+            "translate",
+            "m",
+            "v1",
+            "===PARAGRAPH 1===\n<p>Original translate.</p>",
+            meta={"chunk_id": "ch01_c01"},
+        )
 
         mock_provider.complete.return_value = CompletionResult(
             text="===PARAGRAPH 1===\n<p>Proofread version.</p>",
@@ -605,13 +645,16 @@ class TestCollectWaterfallParagraphs:
     def test_gets_translate_when_no_later_stages(self, cache: Cache):
         from booktranslator.pipeline_helpers import collect_waterfall_paragraphs
 
-        cache.put("t1", "translate", "m", "v1",
-                  "===PARAGRAPH 1===\n<p>First.</p>\n===PARAGRAPH 2===\n<p>Second.</p>",
-                  meta={"chunk_id": "ch01_c01"})
-
-        result = collect_waterfall_paragraphs(
-            cache, ["ch01_c01"], "proofread", {"ch01_c01": 2}
+        cache.put(
+            "t1",
+            "translate",
+            "m",
+            "v1",
+            "===PARAGRAPH 1===\n<p>First.</p>\n===PARAGRAPH 2===\n<p>Second.</p>",
+            meta={"chunk_id": "ch01_c01"},
         )
+
+        result = collect_waterfall_paragraphs(cache, ["ch01_c01"], "proofread", {"ch01_c01": 2})
 
         assert "ch01_c01" in result
         assert result["ch01_c01"] == ["<p>First.</p>", "<p>Second.</p>"]
@@ -619,35 +662,51 @@ class TestCollectWaterfallParagraphs:
     def test_gets_proofread_for_style_stage(self, cache: Cache):
         from booktranslator.pipeline_helpers import collect_waterfall_paragraphs
 
-        cache.put("t1", "translate", "m", "v1",
-                  "===PARAGRAPH 1===\n<p>Translate.</p>",
-                  meta={"chunk_id": "ch01_c01"})
-        cache.put("p1", "proofread", "m", "v1",
-                  "===PARAGRAPH 1===\n<p>Proofread.</p>",
-                  meta={"chunk_id": "ch01_c01"})
-
-        result = collect_waterfall_paragraphs(
-            cache, ["ch01_c01"], "style", {"ch01_c01": 1}
+        cache.put(
+            "t1",
+            "translate",
+            "m",
+            "v1",
+            "===PARAGRAPH 1===\n<p>Translate.</p>",
+            meta={"chunk_id": "ch01_c01"},
         )
+        cache.put(
+            "p1",
+            "proofread",
+            "m",
+            "v1",
+            "===PARAGRAPH 1===\n<p>Proofread.</p>",
+            meta={"chunk_id": "ch01_c01"},
+        )
+
+        result = collect_waterfall_paragraphs(cache, ["ch01_c01"], "style", {"ch01_c01": 1})
 
         assert result["ch01_c01"] == ["<p>Proofread.</p>"]
 
     def test_gets_style_for_verify_stage(self, cache: Cache):
         from booktranslator.pipeline_helpers import collect_waterfall_paragraphs
 
-        cache.put("t1", "translate", "m", "v1",
-                  "===PARAGRAPH 1===\n<p>T.</p>",
-                  meta={"chunk_id": "ch01_c01"})
-        cache.put("p1", "proofread", "m", "v1",
-                  "===PARAGRAPH 1===\n<p>P.</p>",
-                  meta={"chunk_id": "ch01_c01"})
-        cache.put("s1", "style", "m", "v1",
-                  "===PARAGRAPH 1===\n<p>S.</p>",
-                  meta={"chunk_id": "ch01_c01"})
-
-        result = collect_waterfall_paragraphs(
-            cache, ["ch01_c01"], "verify", {"ch01_c01": 1}
+        cache.put(
+            "t1",
+            "translate",
+            "m",
+            "v1",
+            "===PARAGRAPH 1===\n<p>T.</p>",
+            meta={"chunk_id": "ch01_c01"},
         )
+        cache.put(
+            "p1",
+            "proofread",
+            "m",
+            "v1",
+            "===PARAGRAPH 1===\n<p>P.</p>",
+            meta={"chunk_id": "ch01_c01"},
+        )
+        cache.put(
+            "s1", "style", "m", "v1", "===PARAGRAPH 1===\n<p>S.</p>", meta={"chunk_id": "ch01_c01"}
+        )
+
+        result = collect_waterfall_paragraphs(cache, ["ch01_c01"], "verify", {"ch01_c01": 1})
 
         assert result["ch01_c01"] == ["<p>S.</p>"]
 
@@ -655,30 +714,41 @@ class TestCollectWaterfallParagraphs:
         from booktranslator.pipeline_helpers import collect_waterfall_paragraphs
 
         # Content has 1 paragraph but we expect 2
-        cache.put("t1", "translate", "m", "v1",
-                  "===PARAGRAPH 1===\n<p>Only one.</p>",
-                  meta={"chunk_id": "ch01_c01"})
-
-        result = collect_waterfall_paragraphs(
-            cache, ["ch01_c01"], "proofread", {"ch01_c01": 2}
+        cache.put(
+            "t1",
+            "translate",
+            "m",
+            "v1",
+            "===PARAGRAPH 1===\n<p>Only one.</p>",
+            meta={"chunk_id": "ch01_c01"},
         )
+
+        result = collect_waterfall_paragraphs(cache, ["ch01_c01"], "proofread", {"ch01_c01": 2})
 
         assert "ch01_c01" not in result
 
     def test_handles_reflect_in_waterfall(self, cache: Cache):
         from booktranslator.pipeline_helpers import collect_waterfall_paragraphs
 
-        cache.put("t1", "translate", "m", "v1",
-                  "===PARAGRAPH 1===\n<p>Translate.</p>",
-                  meta={"chunk_id": "ch01_c01"})
-        cache.put("r1", "reflect", "m", "v1",
-                  "===PARAGRAPH 1===\n<p>Reflected.</p>",
-                  meta={"chunk_id": "ch01_c01"})
+        cache.put(
+            "t1",
+            "translate",
+            "m",
+            "v1",
+            "===PARAGRAPH 1===\n<p>Translate.</p>",
+            meta={"chunk_id": "ch01_c01"},
+        )
+        cache.put(
+            "r1",
+            "reflect",
+            "m",
+            "v1",
+            "===PARAGRAPH 1===\n<p>Reflected.</p>",
+            meta={"chunk_id": "ch01_c01"},
+        )
 
         # For proofread, reflect is the latest preceding stage
-        result = collect_waterfall_paragraphs(
-            cache, ["ch01_c01"], "proofread", {"ch01_c01": 1}
-        )
+        result = collect_waterfall_paragraphs(cache, ["ch01_c01"], "proofread", {"ch01_c01": 1})
 
         assert result["ch01_c01"] == ["<p>Reflected.</p>"]
 
@@ -693,17 +763,25 @@ class TestCollectWaterfallParagraphs:
         from booktranslator.pipeline_helpers import collect_waterfall_paragraphs
 
         # translate has correct count (2)
-        cache.put("t1", "translate", "m", "v1",
-                  "===PARAGRAPH 1===\n<p>T1.</p>\n===PARAGRAPH 2===\n<p>T2.</p>",
-                  meta={"chunk_id": "ch01_c01"})
-        # reflect has wrong count (1 instead of 2)
-        cache.put("r1", "reflect", "m", "v1",
-                  "===PARAGRAPH 1===\n<p>Only one.</p>",
-                  meta={"chunk_id": "ch01_c01"})
-
-        result = collect_waterfall_paragraphs(
-            cache, ["ch01_c01"], "proofread", {"ch01_c01": 2}
+        cache.put(
+            "t1",
+            "translate",
+            "m",
+            "v1",
+            "===PARAGRAPH 1===\n<p>T1.</p>\n===PARAGRAPH 2===\n<p>T2.</p>",
+            meta={"chunk_id": "ch01_c01"},
         )
+        # reflect has wrong count (1 instead of 2)
+        cache.put(
+            "r1",
+            "reflect",
+            "m",
+            "v1",
+            "===PARAGRAPH 1===\n<p>Only one.</p>",
+            meta={"chunk_id": "ch01_c01"},
+        )
+
+        result = collect_waterfall_paragraphs(cache, ["ch01_c01"], "proofread", {"ch01_c01": 2})
 
         # Should fall back to translate
         assert "ch01_c01" in result
@@ -714,17 +792,25 @@ class TestCollectWaterfallParagraphs:
         from booktranslator.pipeline_helpers import collect_waterfall_paragraphs
 
         # Expected 2 paragraphs — "no markers" content can't satisfy that
-        cache.put("t1", "translate", "m", "v1",
-                  "===PARAGRAPH 1===\n<p>T1.</p>\n===PARAGRAPH 2===\n<p>T2.</p>",
-                  meta={"chunk_id": "ch01_c01"})
-        # reflect has no markers (malformed)
-        cache.put("r1", "reflect", "m", "v1",
-                  "Just some text without markers",
-                  meta={"chunk_id": "ch01_c01"})
-
-        result = collect_waterfall_paragraphs(
-            cache, ["ch01_c01"], "proofread", {"ch01_c01": 2}
+        cache.put(
+            "t1",
+            "translate",
+            "m",
+            "v1",
+            "===PARAGRAPH 1===\n<p>T1.</p>\n===PARAGRAPH 2===\n<p>T2.</p>",
+            meta={"chunk_id": "ch01_c01"},
         )
+        # reflect has no markers (malformed)
+        cache.put(
+            "r1",
+            "reflect",
+            "m",
+            "v1",
+            "Just some text without markers",
+            meta={"chunk_id": "ch01_c01"},
+        )
+
+        result = collect_waterfall_paragraphs(cache, ["ch01_c01"], "proofread", {"ch01_c01": 2})
 
         # Should fall back to translate
         assert "ch01_c01" in result
@@ -735,24 +821,37 @@ class TestCollectWaterfallParagraphs:
         from booktranslator.pipeline_helpers import collect_waterfall_paragraphs
 
         # translate is valid (2 paragraphs)
-        cache.put("t1", "translate", "m", "v1",
-                  "===PARAGRAPH 1===\n<p>T1 OK.</p>\n===PARAGRAPH 2===\n<p>T2 OK.</p>",
-                  meta={"chunk_id": "ch01_c01"})
+        cache.put(
+            "t1",
+            "translate",
+            "m",
+            "v1",
+            "===PARAGRAPH 1===\n<p>T1 OK.</p>\n===PARAGRAPH 2===\n<p>T2 OK.</p>",
+            meta={"chunk_id": "ch01_c01"},
+        )
         # reflect is malformed (wrong count: 1 instead of 2)
-        cache.put("r1", "reflect", "m", "v1",
-                  "===PARAGRAPH 1===\n<p>Only one.</p>",
-                  meta={"chunk_id": "ch01_c01"})
+        cache.put(
+            "r1",
+            "reflect",
+            "m",
+            "v1",
+            "===PARAGRAPH 1===\n<p>Only one.</p>",
+            meta={"chunk_id": "ch01_c01"},
+        )
         # proofread is malformed (no markers)
-        cache.put("p1", "proofread", "m", "v1",
-                  "garbage content without markers",
-                  meta={"chunk_id": "ch01_c01"})
+        cache.put(
+            "p1",
+            "proofread",
+            "m",
+            "v1",
+            "garbage content without markers",
+            meta={"chunk_id": "ch01_c01"},
+        )
 
         # For style, preceding stages are: translate, reflect, proofread
         # proofread (latest) has no markers, reflect has wrong count (1 vs 2)
         # should fall back to translate
-        result = collect_waterfall_paragraphs(
-            cache, ["ch01_c01"], "style", {"ch01_c01": 2}
-        )
+        result = collect_waterfall_paragraphs(cache, ["ch01_c01"], "style", {"ch01_c01": 2})
 
         assert "ch01_c01" in result
         assert result["ch01_c01"] == ["<p>T1 OK.</p>", "<p>T2 OK.</p>"]
@@ -767,8 +866,7 @@ class TestCollectWaterfallTranslations:
     def test_basic_waterfall(self, cache: Cache):
         from booktranslator.pipeline_helpers import collect_waterfall_translations
 
-        cache.put("t1", "translate", "m", "v1", "translate content",
-                  meta={"chunk_id": "ch01_c01"})
+        cache.put("t1", "translate", "m", "v1", "translate content", meta={"chunk_id": "ch01_c01"})
 
         result = collect_waterfall_translations(cache, ["ch01_c01"], "proofread")
         assert result["ch01_c01"] == "translate content"
@@ -776,12 +874,9 @@ class TestCollectWaterfallTranslations:
     def test_picks_latest_preceding(self, cache: Cache):
         from booktranslator.pipeline_helpers import collect_waterfall_translations
 
-        cache.put("t1", "translate", "m", "v1", "translate",
-                  meta={"chunk_id": "ch01_c01"})
-        cache.put("r1", "reflect", "m", "v1", "reflect",
-                  meta={"chunk_id": "ch01_c01"})
-        cache.put("p1", "proofread", "m", "v1", "proofread",
-                  meta={"chunk_id": "ch01_c01"})
+        cache.put("t1", "translate", "m", "v1", "translate", meta={"chunk_id": "ch01_c01"})
+        cache.put("r1", "reflect", "m", "v1", "reflect", meta={"chunk_id": "ch01_c01"})
+        cache.put("p1", "proofread", "m", "v1", "proofread", meta={"chunk_id": "ch01_c01"})
 
         # For style, proofread is the latest preceding stage
         result = collect_waterfall_translations(cache, ["ch01_c01"], "style")
@@ -859,12 +954,18 @@ class TestRehydrateBookFromWaterfall:
 
         # Put translate and proofread in cache
         cache.put(
-            "t1", "translate", "m", "v1",
+            "t1",
+            "translate",
+            "m",
+            "v1",
             "===PARAGRAPH 1===\n<p>Translated 1</p>\n===PARAGRAPH 2===\n<p>Translated 2</p>",
             meta={"chunk_id": "ch01_c01"},
         )
         cache.put(
-            "p1", "proofread", "m", "v1",
+            "p1",
+            "proofread",
+            "m",
+            "v1",
             "===PARAGRAPH 1===\n<p>Proofread 1</p>\n===PARAGRAPH 2===\n<p>Proofread 2</p>",
             meta={"chunk_id": "ch01_c01"},
         )
@@ -874,6 +975,7 @@ class TestRehydrateBookFromWaterfall:
         assert rehydrated == 1
         # Check that in-memory paragraphs were updated
         from lxml import etree
+
         chapter = chunk_set.book.chapters[0]
         text1 = etree.tostring(chapter.paragraphs[0], encoding="unicode")
         text2 = etree.tostring(chapter.paragraphs[1], encoding="unicode")
@@ -887,7 +989,10 @@ class TestRehydrateBookFromWaterfall:
 
         # Only translate stage — no rehydration needed
         cache.put(
-            "t1", "translate", "m", "v1",
+            "t1",
+            "translate",
+            "m",
+            "v1",
             "===PARAGRAPH 1===\n<p>Translated 1</p>\n===PARAGRAPH 2===\n<p>Translated 2</p>",
             meta={"chunk_id": "ch01_c01"},
         )
@@ -901,22 +1006,34 @@ class TestRehydrateBookFromWaterfall:
         chunk_set = self._make_book_and_chunks(None)
 
         cache.put(
-            "t1", "translate", "m", "v1",
+            "t1",
+            "translate",
+            "m",
+            "v1",
             "===PARAGRAPH 1===\n<p>T1</p>\n===PARAGRAPH 2===\n<p>T2</p>",
             meta={"chunk_id": "ch01_c01"},
         )
         cache.put(
-            "p1", "proofread", "m", "v1",
+            "p1",
+            "proofread",
+            "m",
+            "v1",
             "===PARAGRAPH 1===\n<p>P1</p>\n===PARAGRAPH 2===\n<p>P2</p>",
             meta={"chunk_id": "ch01_c01"},
         )
         cache.put(
-            "s1", "style", "m", "v1",
+            "s1",
+            "style",
+            "m",
+            "v1",
             "===PARAGRAPH 1===\n<p>S1</p>\n===PARAGRAPH 2===\n<p>S2</p>",
             meta={"chunk_id": "ch01_c01"},
         )
         cache.put(
-            "v1", "verify", "m", "v1",
+            "v1",
+            "verify",
+            "m",
+            "v1",
             "===PARAGRAPH 1===\n<p>Verified 1</p>\n===PARAGRAPH 2===\n<p>Verified 2</p>",
             meta={"chunk_id": "ch01_c01"},
         )
@@ -925,6 +1042,7 @@ class TestRehydrateBookFromWaterfall:
 
         assert rehydrated == 1
         from lxml import etree
+
         chapter = chunk_set.book.chapters[0]
         text1 = etree.tostring(chapter.paragraphs[0], encoding="unicode")
         assert "Verified 1" in text1
@@ -935,13 +1053,19 @@ class TestRehydrateBookFromWaterfall:
         chunk_set = self._make_book_and_chunks(None)
 
         cache.put(
-            "t1", "translate", "m", "v1",
+            "t1",
+            "translate",
+            "m",
+            "v1",
             "===PARAGRAPH 1===\n<p>T1</p>\n===PARAGRAPH 2===\n<p>T2</p>",
             meta={"chunk_id": "ch01_c01"},
         )
         # Proofread has wrong paragraph count (1 instead of 2)
         cache.put(
-            "p1", "proofread", "m", "v1",
+            "p1",
+            "proofread",
+            "m",
+            "v1",
             "===PARAGRAPH 1===\n<p>Only one</p>",
             meta={"chunk_id": "ch01_c01"},
         )
@@ -960,19 +1084,28 @@ class TestRehydrateBookFromWaterfall:
         chunk_set = self._make_book_and_chunks(None)
 
         cache.put(
-            "t1", "translate", "m", "v1",
+            "t1",
+            "translate",
+            "m",
+            "v1",
             "===PARAGRAPH 1===\n<p>T1</p>\n===PARAGRAPH 2===\n<p>T2</p>",
             meta={"chunk_id": "ch01_c01"},
         )
         # reflect is valid
         cache.put(
-            "r1", "reflect", "m", "v1",
+            "r1",
+            "reflect",
+            "m",
+            "v1",
             "===PARAGRAPH 1===\n<p>Reflect 1</p>\n===PARAGRAPH 2===\n<p>Reflect 2</p>",
             meta={"chunk_id": "ch01_c01"},
         )
         # proofread is malformed (wrong count) — this is the resolved stage
         cache.put(
-            "p1", "proofread", "m", "v1",
+            "p1",
+            "proofread",
+            "m",
+            "v1",
             "===PARAGRAPH 1===\n<p>Only one paragraph</p>",
             meta={"chunk_id": "ch01_c01"},
         )
@@ -982,6 +1115,7 @@ class TestRehydrateBookFromWaterfall:
         # Should fall back to reflect (valid, earlier stage)
         assert rehydrated == 1
         from lxml import etree
+
         chapter = chunk_set.book.chapters[0]
         text1 = etree.tostring(chapter.paragraphs[0], encoding="unicode")
         assert "Reflect 1" in text1
@@ -993,19 +1127,28 @@ class TestRehydrateBookFromWaterfall:
         chunk_set = self._make_book_and_chunks(None)
 
         cache.put(
-            "t1", "translate", "m", "v1",
+            "t1",
+            "translate",
+            "m",
+            "v1",
             "===PARAGRAPH 1===\n<p>T1</p>\n===PARAGRAPH 2===\n<p>T2</p>",
             meta={"chunk_id": "ch01_c01"},
         )
         # reflect is valid
         cache.put(
-            "r1", "reflect", "m", "v1",
+            "r1",
+            "reflect",
+            "m",
+            "v1",
             "===PARAGRAPH 1===\n<p>Good 1</p>\n===PARAGRAPH 2===\n<p>Good 2</p>",
             meta={"chunk_id": "ch01_c01"},
         )
         # proofread has broken XML in second fragment
         cache.put(
-            "p1", "proofread", "m", "v1",
+            "p1",
+            "proofread",
+            "m",
+            "v1",
             "===PARAGRAPH 1===\n<p>OK</p>\n===PARAGRAPH 2===\n<p>Broken <unclosed",
             meta={"chunk_id": "ch01_c01"},
         )
@@ -1015,6 +1158,7 @@ class TestRehydrateBookFromWaterfall:
         # Should fall back to reflect
         assert rehydrated == 1
         from lxml import etree
+
         chapter = chunk_set.book.chapters[0]
         text1 = etree.tostring(chapter.paragraphs[0], encoding="unicode")
         assert "Good 1" in text1
@@ -1026,13 +1170,19 @@ class TestRehydrateBookFromWaterfall:
         chunk_set = self._make_book_and_chunks(None)
 
         cache.put(
-            "t1", "translate", "m", "v1",
+            "t1",
+            "translate",
+            "m",
+            "v1",
             "===PARAGRAPH 1===\n<p>T1</p>\n===PARAGRAPH 2===\n<p>T2</p>",
             meta={"chunk_id": "ch01_c01"},
         )
         # Proofread: first fragment valid, second is broken XML
         cache.put(
-            "p1", "proofread", "m", "v1",
+            "p1",
+            "proofread",
+            "m",
+            "v1",
             "===PARAGRAPH 1===\n<p>Good</p>\n===PARAGRAPH 2===\n<p>Broken <unclosed",
             meta={"chunk_id": "ch01_c01"},
         )
@@ -1044,6 +1194,7 @@ class TestRehydrateBookFromWaterfall:
 
         # Verify first paragraph was NOT changed (no partial mutation)
         from lxml import etree
+
         chapter = chunk_set.book.chapters[0]
         text1 = etree.tostring(chapter.paragraphs[0], encoding="unicode")
         # Should still contain original content, not "Good"
@@ -1058,24 +1209,36 @@ class TestRehydrateBookFromWaterfall:
 
         # Put a stale chunk in cache that doesn't exist in chunk_set
         cache.put(
-            "t_stale", "translate", "m", "v1",
+            "t_stale",
+            "translate",
+            "m",
+            "v1",
             "===PARAGRAPH 1===\n<p>Stale</p>",
             meta={"chunk_id": "ch99_c99"},
         )
         cache.put(
-            "p_stale", "proofread", "m", "v1",
+            "p_stale",
+            "proofread",
+            "m",
+            "v1",
             "===PARAGRAPH 1===\n<p>Stale proofread</p>",
             meta={"chunk_id": "ch99_c99"},
         )
 
         # Also put valid data for the real chunk
         cache.put(
-            "t1", "translate", "m", "v1",
+            "t1",
+            "translate",
+            "m",
+            "v1",
             "===PARAGRAPH 1===\n<p>T1</p>\n===PARAGRAPH 2===\n<p>T2</p>",
             meta={"chunk_id": "ch01_c01"},
         )
         cache.put(
-            "p1", "proofread", "m", "v1",
+            "p1",
+            "proofread",
+            "m",
+            "v1",
             "===PARAGRAPH 1===\n<p>P1</p>\n===PARAGRAPH 2===\n<p>P2</p>",
             meta={"chunk_id": "ch01_c01"},
         )
@@ -1091,12 +1254,18 @@ class TestRehydrateBookFromWaterfall:
         chunk_set = self._make_book_and_chunks(None)
 
         cache.put(
-            "t1", "translate", "m", "v1",
+            "t1",
+            "translate",
+            "m",
+            "v1",
             "===PARAGRAPH 1===\n<p>Translate</p>\n===PARAGRAPH 2===\n<p>T2</p>",
             meta={"chunk_id": "ch01_c01"},
         )
         cache.put(
-            "p1", "proofread", "m", "v1",
+            "p1",
+            "proofread",
+            "m",
+            "v1",
             "===PARAGRAPH 1===\n<p>Proofread</p>\n===PARAGRAPH 2===\n<p>P2</p>",
             meta={"chunk_id": "ch01_c01"},
         )
@@ -1115,12 +1284,9 @@ class TestRehydrateBookFromWaterfall:
 
 class TestGetStagesForChunksBulk:
     def test_returns_all_stages_for_multiple_chunks(self, cache: Cache):
-        cache.put("t1", "translate", "m", "v1", "content1",
-                  meta={"chunk_id": "ch01_c01"})
-        cache.put("p1", "proofread", "m", "v1", "content2",
-                  meta={"chunk_id": "ch01_c01"})
-        cache.put("t2", "translate", "m", "v1", "content3",
-                  meta={"chunk_id": "ch01_c02"})
+        cache.put("t1", "translate", "m", "v1", "content1", meta={"chunk_id": "ch01_c01"})
+        cache.put("p1", "proofread", "m", "v1", "content2", meta={"chunk_id": "ch01_c01"})
+        cache.put("t2", "translate", "m", "v1", "content3", meta={"chunk_id": "ch01_c02"})
 
         result = cache.get_stages_for_chunks_bulk(["ch01_c01", "ch01_c02"])
 
@@ -1143,7 +1309,11 @@ class TestGetStagesForChunksBulk:
         """Test batching works for > 500 chunks."""
         for i in range(600):
             cache.put(
-                f"key_{i}", "translate", "m", "v1", f"content_{i}",
+                f"key_{i}",
+                "translate",
+                "m",
+                "v1",
+                f"content_{i}",
                 meta={"chunk_id": f"ch{i:04d}"},
             )
 

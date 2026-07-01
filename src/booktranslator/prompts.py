@@ -27,7 +27,6 @@ from typing import Any
 import frontmatter
 from jinja2 import Environment, StrictUndefined
 
-
 _SECTION_RE = re.compile(r"^# (System|User)\s*$", re.MULTILINE)
 
 
@@ -38,6 +37,7 @@ class Prompt:
     model: str | None
     temperature: float
     max_tokens: int | None
+    reasoning_effort: str | None  # none|low|medium|high; None => don't send the param
     system_tmpl: str
     user_tmpl: str
 
@@ -71,6 +71,7 @@ def load_prompt(path: Path) -> Prompt:
         model=fm.get("model"),
         temperature=float(fm.get("temperature", 0.3)),
         max_tokens=fm.get("max_tokens"),
+        reasoning_effort=fm.get("reasoning_effort"),
         system_tmpl=system_tmpl,
         user_tmpl=user_tmpl,
     )
