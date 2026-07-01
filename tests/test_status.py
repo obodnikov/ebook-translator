@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import tempfile
 from pathlib import Path
 
 import pytest
@@ -25,26 +24,63 @@ def cache_with_data(tmp_path: Path) -> Cache:
     cache = Cache(tmp_path / "test.sqlite")
     # 3 translated chunks
     for i in range(1, 4):
-        cache.put(f"t{i}", "translate", "sonnet", "v1", f"Translation {i}",
-                  input_tokens=1000, output_tokens=500, cost_usd=0.05,
-                  meta={"chunk_id": f"ch01_c{i:02d}"})
+        cache.put(
+            f"t{i}",
+            "translate",
+            "sonnet",
+            "v1",
+            f"Translation {i}",
+            input_tokens=1000,
+            output_tokens=500,
+            cost_usd=0.05,
+            meta={"chunk_id": f"ch01_c{i:02d}"},
+        )
     # Judge scores for all 3
-    cache.put("j1", "judge", "haiku", "v1",
-              json.dumps({"score": 5, "issues": []}),
-              input_tokens=500, output_tokens=50, cost_usd=0.001,
-              meta={"chunk_id": "ch01_c01"})
-    cache.put("j2", "judge", "haiku", "v1",
-              json.dumps({"score": 2, "issues": ["calque", "omission"]}),
-              input_tokens=500, output_tokens=50, cost_usd=0.001,
-              meta={"chunk_id": "ch01_c02"})
-    cache.put("j3", "judge", "haiku", "v1",
-              json.dumps({"score": 4, "issues": ["minor phrasing"]}),
-              input_tokens=500, output_tokens=50, cost_usd=0.001,
-              meta={"chunk_id": "ch01_c03"})
+    cache.put(
+        "j1",
+        "judge",
+        "haiku",
+        "v1",
+        json.dumps({"score": 5, "issues": []}),
+        input_tokens=500,
+        output_tokens=50,
+        cost_usd=0.001,
+        meta={"chunk_id": "ch01_c01"},
+    )
+    cache.put(
+        "j2",
+        "judge",
+        "haiku",
+        "v1",
+        json.dumps({"score": 2, "issues": ["calque", "omission"]}),
+        input_tokens=500,
+        output_tokens=50,
+        cost_usd=0.001,
+        meta={"chunk_id": "ch01_c02"},
+    )
+    cache.put(
+        "j3",
+        "judge",
+        "haiku",
+        "v1",
+        json.dumps({"score": 4, "issues": ["minor phrasing"]}),
+        input_tokens=500,
+        output_tokens=50,
+        cost_usd=0.001,
+        meta={"chunk_id": "ch01_c03"},
+    )
     # Reflect for chunk 2 (low score)
-    cache.put("r2", "reflect", "sonnet", "v1", "Improved translation 2",
-              input_tokens=2000, output_tokens=600, cost_usd=0.08,
-              meta={"chunk_id": "ch01_c02"})
+    cache.put(
+        "r2",
+        "reflect",
+        "sonnet",
+        "v1",
+        "Improved translation 2",
+        input_tokens=2000,
+        output_tokens=600,
+        cost_usd=0.08,
+        meta={"chunk_id": "ch01_c02"},
+    )
     return cache
 
 
@@ -128,66 +164,100 @@ class TestGetScores:
 
     def test_score_as_string_coerced_to_int(self, tmp_path: Path):
         cache = Cache(tmp_path / "str_score.sqlite")
-        cache.put("j1", "judge", "m", "v1",
-                  json.dumps({"score": "3", "issues": []}),
-                  meta={"chunk_id": "c1"})
+        cache.put(
+            "j1",
+            "judge",
+            "m",
+            "v1",
+            json.dumps({"score": "3", "issues": []}),
+            meta={"chunk_id": "c1"},
+        )
         scores = get_scores(cache)
         assert scores[0].score == 3
 
     def test_score_as_none_becomes_zero(self, tmp_path: Path):
         cache = Cache(tmp_path / "none_score.sqlite")
-        cache.put("j1", "judge", "m", "v1",
-                  json.dumps({"score": None, "issues": []}),
-                  meta={"chunk_id": "c1"})
+        cache.put(
+            "j1",
+            "judge",
+            "m",
+            "v1",
+            json.dumps({"score": None, "issues": []}),
+            meta={"chunk_id": "c1"},
+        )
         scores = get_scores(cache)
         assert scores[0].score == 0
 
     def test_score_as_float_coerced(self, tmp_path: Path):
         cache = Cache(tmp_path / "float_score.sqlite")
-        cache.put("j1", "judge", "m", "v1",
-                  json.dumps({"score": 3.7, "issues": []}),
-                  meta={"chunk_id": "c1"})
+        cache.put(
+            "j1",
+            "judge",
+            "m",
+            "v1",
+            json.dumps({"score": 3.7, "issues": []}),
+            meta={"chunk_id": "c1"},
+        )
         scores = get_scores(cache)
         assert scores[0].score == 3
 
     def test_issues_as_none_becomes_empty_list(self, tmp_path: Path):
         cache = Cache(tmp_path / "none_issues.sqlite")
-        cache.put("j1", "judge", "m", "v1",
-                  json.dumps({"score": 4, "issues": None}),
-                  meta={"chunk_id": "c1"})
+        cache.put(
+            "j1",
+            "judge",
+            "m",
+            "v1",
+            json.dumps({"score": 4, "issues": None}),
+            meta={"chunk_id": "c1"},
+        )
         scores = get_scores(cache)
         assert scores[0].issues == []
 
     def test_issues_as_string_becomes_list(self, tmp_path: Path):
         cache = Cache(tmp_path / "str_issues.sqlite")
-        cache.put("j1", "judge", "m", "v1",
-                  json.dumps({"score": 2, "issues": "single issue"}),
-                  meta={"chunk_id": "c1"})
+        cache.put(
+            "j1",
+            "judge",
+            "m",
+            "v1",
+            json.dumps({"score": 2, "issues": "single issue"}),
+            meta={"chunk_id": "c1"},
+        )
         scores = get_scores(cache)
         assert scores[0].issues == ["single issue"]
 
     def test_issues_as_object_becomes_stringified(self, tmp_path: Path):
         cache = Cache(tmp_path / "obj_issues.sqlite")
-        cache.put("j1", "judge", "m", "v1",
-                  json.dumps({"score": 1, "issues": {"type": "critical"}}),
-                  meta={"chunk_id": "c1"})
+        cache.put(
+            "j1",
+            "judge",
+            "m",
+            "v1",
+            json.dumps({"score": 1, "issues": {"type": "critical"}}),
+            meta={"chunk_id": "c1"},
+        )
         scores = get_scores(cache)
         assert len(scores[0].issues) == 1
         assert "critical" in scores[0].issues[0]
 
     def test_malformed_json_content(self, tmp_path: Path):
         cache = Cache(tmp_path / "bad_json.sqlite")
-        cache.put("j1", "judge", "m", "v1", "not json at all",
-                  meta={"chunk_id": "c1"})
+        cache.put("j1", "judge", "m", "v1", "not json at all", meta={"chunk_id": "c1"})
         scores = get_scores(cache)
         assert scores[0].score == 0
         assert "parse error" in scores[0].issues
 
     def test_issues_list_with_non_string_items(self, tmp_path: Path):
         cache = Cache(tmp_path / "mixed_issues.sqlite")
-        cache.put("j1", "judge", "m", "v1",
-                  json.dumps({"score": 3, "issues": [42, None, "text"]}),
-                  meta={"chunk_id": "c1"})
+        cache.put(
+            "j1",
+            "judge",
+            "m",
+            "v1",
+            json.dumps({"score": 3, "issues": [42, None, "text"]}),
+            meta={"chunk_id": "c1"},
+        )
         scores = get_scores(cache)
         assert scores[0].issues == ["42", "None", "text"]
 
@@ -311,8 +381,7 @@ class TestMixedData:
     def test_report_with_mixed_data(self, tmp_path: Path):
         """Full report handles mixed data correctly."""
         cache = Cache(tmp_path / "mixed.sqlite")
-        cache.put("k1", "translate", "m", "v1", "text1",
-                  cost_usd=0.05, meta={"chunk_id": "c1"})
+        cache.put("k1", "translate", "m", "v1", "text1", cost_usd=0.05, meta={"chunk_id": "c1"})
         cache.put("k2", "translate", "m", "v1", "text2", cost_usd=0.05)  # legacy
         report = build_status_report(cache, tmp_path)
         assert report.total_chunks == 2
@@ -329,9 +398,14 @@ class TestScoreFilteringEdgeCases:
     def test_below_zero_filters_everything(self, tmp_path: Path):
         """--below 0 should filter all chunks (all scores >= 0)."""
         cache = Cache(tmp_path / "scores.sqlite")
-        cache.put("j1", "judge", "m", "v1",
-                  json.dumps({"score": 0, "issues": []}),
-                  meta={"chunk_id": "c1"})
+        cache.put(
+            "j1",
+            "judge",
+            "m",
+            "v1",
+            json.dumps({"score": 0, "issues": []}),
+            meta={"chunk_id": "c1"},
+        )
         scores = get_scores(cache)
         assert scores is not None
         # Filter with below=0: score < 0 -> nothing passes
@@ -342,12 +416,22 @@ class TestScoreFilteringEdgeCases:
     def test_below_one_catches_zero_scores(self, tmp_path: Path):
         """--below 1 should catch chunks with score 0."""
         cache = Cache(tmp_path / "scores.sqlite")
-        cache.put("j1", "judge", "m", "v1",
-                  json.dumps({"score": 0, "issues": ["broken"]}),
-                  meta={"chunk_id": "c1"})
-        cache.put("j2", "judge", "m", "v1",
-                  json.dumps({"score": 1, "issues": []}),
-                  meta={"chunk_id": "c2"})
+        cache.put(
+            "j1",
+            "judge",
+            "m",
+            "v1",
+            json.dumps({"score": 0, "issues": ["broken"]}),
+            meta={"chunk_id": "c1"},
+        )
+        cache.put(
+            "j2",
+            "judge",
+            "m",
+            "v1",
+            json.dumps({"score": 1, "issues": []}),
+            meta={"chunk_id": "c2"},
+        )
         scores = get_scores(cache)
         filtered = [s for s in scores if s.score < 1]
         assert len(filtered) == 1

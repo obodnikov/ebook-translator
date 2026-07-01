@@ -282,7 +282,8 @@ class TestJudgeChunks:
         translations = {"c1": "<p>А</p>", "c2": "<p>Б</p>"}
 
         judge.judge_chunks(
-            originals, translations,
+            originals,
+            translations,
             on_progress=on_progress,
             parallelism=1,
         )
@@ -341,8 +342,7 @@ class TestJudgeCacheIntegration:
     def test_judge_does_not_affect_waterfall(self, judge: Judge, mock_provider, cache: Cache):
         """Judge stage is metadata — it should not appear in waterfall resolution."""
         # Put a translate entry
-        cache.put("t1", "translate", "m", "v1", "translated text",
-                  meta={"chunk_id": "ch01_c01"})
+        cache.put("t1", "translate", "m", "v1", "translated text", meta={"chunk_id": "ch01_c01"})
 
         # Judge it
         mock_provider.complete.return_value = CompletionResult(

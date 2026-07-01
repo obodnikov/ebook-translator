@@ -63,6 +63,7 @@ class CachedEntry:
 @dataclass
 class ChunkStageInfo:
     """Summary of what's in the cache for a given chunk_id and stage."""
+
     chunk_id: str
     stage: str
     model: str
@@ -98,10 +99,7 @@ class Cache:
         self.conn.executescript(SCHEMA_PIPELINE_META)
 
         # Migration: add chunk_id column if missing (legacy DBs)
-        cols = {
-            row[1]
-            for row in self.conn.execute("PRAGMA table_info(cache)").fetchall()
-        }
+        cols = {row[1] for row in self.conn.execute("PRAGMA table_info(cache)").fetchall()}
         if "chunk_id" not in cols:
             self.conn.execute("ALTER TABLE cache ADD COLUMN chunk_id TEXT")
             # Try to backfill chunk_id from meta_json
@@ -124,8 +122,7 @@ class Cache:
 
         # Ensure index exists (after migration so column is guaranteed present)
         self.conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_cache_chunk_stage "
-            "ON cache(chunk_id, stage)"
+            "CREATE INDEX IF NOT EXISTS idx_cache_chunk_stage ON cache(chunk_id, stage)"
         )
         self.conn.commit()
 
@@ -193,9 +190,7 @@ class Cache:
 
     def list_stages(self) -> dict[str, int]:
         """Return {stage: count} for all entries in the cache."""
-        rows = self.conn.execute(
-            "SELECT stage, COUNT(*) FROM cache GROUP BY stage"
-        ).fetchall()
+        rows = self.conn.execute("SELECT stage, COUNT(*) FROM cache GROUP BY stage").fetchall()
         return {row[0]: row[1] for row in rows}
 
     def stage_stats(self, stage: str) -> dict[str, Any]:
@@ -223,21 +218,21 @@ class Cache:
         ).fetchall()
         results = []
         for row in rows:
-            results.append(ChunkStageInfo(
-                chunk_id=chunk_id,
-                stage=row[0],
-                model=row[1],
-                cost_usd=row[2] or 0.0,
-                input_tokens=row[3] or 0,
-                output_tokens=row[4] or 0,
-                created_at=row[5] or "",
-                content=row[6],
-            ))
+            results.append(
+                ChunkStageInfo(
+                    chunk_id=chunk_id,
+                    stage=row[0],
+                    model=row[1],
+                    cost_usd=row[2] or 0.0,
+                    input_tokens=row[3] or 0,
+                    output_tokens=row[4] or 0,
+                    created_at=row[5] or "",
+                    content=row[6],
+                )
+            )
         return results
 
-    def get_stages_for_chunks_bulk(
-        self, chunk_ids: list[str]
-    ) -> dict[str, list[ChunkStageInfo]]:
+    def get_stages_for_chunks_bulk(self, chunk_ids: list[str]) -> dict[str, list[ChunkStageInfo]]:
         """Get all cached stages for multiple chunks in one query.
 
         Returns {chunk_id: [ChunkStageInfo, ...]} for each chunk that
@@ -251,7 +246,7 @@ class Cache:
         all_rows: list[tuple] = []
 
         for i in range(0, len(chunk_ids), batch_size):
-            batch = chunk_ids[i:i + batch_size]
+            batch = chunk_ids[i : i + batch_size]
             placeholders = ",".join("?" * len(batch))
             rows = self.conn.execute(
                 f"SELECT chunk_id, stage, model, cost_usd, input_tokens, "
@@ -288,8 +283,7 @@ class Cache:
         count_stage().
         """
         rows = self.conn.execute(
-            "SELECT DISTINCT chunk_id FROM cache "
-            "WHERE stage = ? AND chunk_id IS NOT NULL",
+            "SELECT DISTINCT chunk_id FROM cache WHERE stage = ? AND chunk_id IS NOT NULL",
             (stage,),
         ).fetchall()
         return [r[0] for r in rows]
@@ -310,8 +304,7 @@ class Cache:
         separately.
         """
         row = self.conn.execute(
-            "SELECT COUNT(DISTINCT chunk_id) FROM cache "
-            "WHERE stage = ? AND chunk_id IS NOT NULL",
+            "SELECT COUNT(DISTINCT chunk_id) FROM cache WHERE stage = ? AND chunk_id IS NOT NULL",
             (stage,),
         ).fetchone()
         return row[0] or 0
@@ -319,8 +312,7 @@ class Cache:
     def count_legacy_rows(self, stage: str) -> int:
         """Count rows with NULL chunk_id for a stage (legacy/untracked)."""
         row = self.conn.execute(
-            "SELECT COUNT(*) FROM cache "
-            "WHERE stage = ? AND chunk_id IS NULL",
+            "SELECT COUNT(*) FROM cache WHERE stage = ? AND chunk_id IS NULL",
             (stage,),
         ).fetchone()
         return row[0] or 0
@@ -451,7 +443,7 @@ class Cache:
         all_pref_rows: list[tuple[str, str]] = []
 
         for i in range(0, len(chunk_ids), batch_size):
-            batch = chunk_ids[i:i + batch_size]
+            batch = chunk_ids[i : i + batch_size]
             placeholders = ",".join("?" * len(batch))
 
             rows = self.conn.execute(

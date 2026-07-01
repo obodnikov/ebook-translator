@@ -62,14 +62,13 @@ class WorkDir:
         return PipelineState.model_validate(data)
 
     def save_state(self, state: PipelineState) -> None:
-        self.state_path.write_text(
-            state.model_dump_json(indent=2), encoding="utf-8"
-        )
+        self.state_path.write_text(state.model_dump_json(indent=2), encoding="utf-8")
 
     def mark_stage(self, state: PipelineState, stage: Stage) -> None:
         state.current_stage = stage
         if stage not in state.completed_stages and stage not in (
-            Stage.PAUSE_1, Stage.PAUSE_2,
+            Stage.PAUSE_1,
+            Stage.PAUSE_2,
         ):
             state.completed_stages.append(stage)
         self.save_state(state)

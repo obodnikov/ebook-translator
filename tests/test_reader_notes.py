@@ -5,19 +5,14 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from io import BytesIO
 
-import pytest
 from lxml import etree
 
 from booktranslator.models import ReaderNotesConfig, SeriesGlossary, SeriesGlossaryEntry
 from booktranslator.reader_notes import (
-    InjectionStats,
-    NoteCandidate,
     _build_candidates,
     _find_and_wrap_first_match,
-    _get_text_content,
     inject_reader_notes,
 )
-
 
 XHTML_NS = "http://www.w3.org/1999/xhtml"
 EPUB_NS = "http://www.idpf.org/2007/ops"
@@ -73,14 +68,28 @@ def _make_glossary(entries: list[dict]) -> SeriesGlossary:
 
 class TestBuildCandidates:
     def test_filters_by_type(self):
-        glossary = _make_glossary([
-            {"original": "vestigium", "translation": "вестигиум",
-             "type": "concept", "notes": "Magical trace left by spells."},
-            {"original": "Peter Grant", "translation": "Питер Грант",
-             "type": "person", "notes": "Main character."},
-            {"original": "DCI", "translation": "DCI",
-             "type": "term", "notes": "Detective Chief Inspector."},
-        ])
+        glossary = _make_glossary(
+            [
+                {
+                    "original": "vestigium",
+                    "translation": "вестигиум",
+                    "type": "concept",
+                    "notes": "Magical trace left by spells.",
+                },
+                {
+                    "original": "Peter Grant",
+                    "translation": "Питер Грант",
+                    "type": "person",
+                    "notes": "Main character.",
+                },
+                {
+                    "original": "DCI",
+                    "translation": "DCI",
+                    "type": "term",
+                    "notes": "Detective Chief Inspector.",
+                },
+            ]
+        )
         config = ReaderNotesConfig(enabled=True, types=["concept", "term"])
         candidates = _build_candidates(glossary, config)
         assert len(candidates) == 2
@@ -88,34 +97,54 @@ class TestBuildCandidates:
         assert originals == {"vestigium", "DCI"}
 
     def test_skips_entries_without_notes(self):
-        glossary = _make_glossary([
-            {"original": "forma", "translation": "форма",
-             "type": "concept", "notes": None},
-            {"original": "vestigium", "translation": "вестигиум",
-             "type": "concept", "notes": "Magical trace."},
-        ])
+        glossary = _make_glossary(
+            [
+                {"original": "forma", "translation": "форма", "type": "concept", "notes": None},
+                {
+                    "original": "vestigium",
+                    "translation": "вестигиум",
+                    "type": "concept",
+                    "notes": "Magical trace.",
+                },
+            ]
+        )
         config = ReaderNotesConfig(enabled=True, types=["concept"])
         candidates = _build_candidates(glossary, config)
         assert len(candidates) == 1
         assert candidates[0].entry.original == "vestigium"
 
     def test_skips_empty_translation(self):
-        glossary = _make_glossary([
-            {"original": "vestigium", "translation": "",
-             "type": "concept", "notes": "Magical trace."},
-        ])
+        glossary = _make_glossary(
+            [
+                {
+                    "original": "vestigium",
+                    "translation": "",
+                    "type": "concept",
+                    "notes": "Magical trace.",
+                },
+            ]
+        )
         config = ReaderNotesConfig(enabled=True, types=["concept"])
         candidates = _build_candidates(glossary, config)
         assert len(candidates) == 0
 
     def test_sorted_by_length_descending(self):
-        glossary = _make_glossary([
-            {"original": "DCI", "translation": "DCI",
-             "type": "term", "notes": "Detective Chief Inspector."},
-            {"original": "Detective Chief Inspector",
-             "translation": "старший инспектор уголовного розыска",
-             "type": "term", "notes": "Senior detective rank."},
-        ])
+        glossary = _make_glossary(
+            [
+                {
+                    "original": "DCI",
+                    "translation": "DCI",
+                    "type": "term",
+                    "notes": "Detective Chief Inspector.",
+                },
+                {
+                    "original": "Detective Chief Inspector",
+                    "translation": "старший инспектор уголовного розыска",
+                    "type": "term",
+                    "notes": "Senior detective rank.",
+                },
+            ]
+        )
         config = ReaderNotesConfig(enabled=True, types=["term"])
         candidates = _build_candidates(glossary, config)
         assert len(candidates) == 2
@@ -130,7 +159,9 @@ class TestBuildCandidates:
 
 class TestFindAndWrap:
     def test_wraps_simple_text(self):
-        tree = _make_xhtml_tree('<p xmlns="http://www.w3.org/1999/xhtml">Он почувствовал вестигиум в воздухе.</p>')
+        tree = _make_xhtml_tree(
+            '<p xmlns="http://www.w3.org/1999/xhtml">Он почувствовал вестигиум в воздухе.</p>'
+        )
         root = tree.getroot()
         para = root.find(f".//{{{XHTML_NS}}}p")
 
@@ -156,9 +187,9 @@ class TestFindAndWrap:
         serialized = etree.tostring(para, encoding="unicode")
         # Structure should be: ...вестигиум<sup><a ...>[1]</a></sup> в воздухе.
         # The trailing " в воздухе." must be AFTER </sup>, not inside it.
-        assert "</a></sup> в воздухе." in serialized.replace(
-            f"{{{XHTML_NS}}}", ""
-        ).replace("ns0:", "").replace(":ns0", "")
+        assert "</a></sup> в воздухе." in serialized.replace(f"{{{XHTML_NS}}}", "").replace(
+            "ns0:", ""
+        ).replace(":ns0", "")
 
         # More robust: check sup element's tail contains trailing text
         sup = para.find(f".//{{{XHTML_NS}}}sup")
@@ -180,7 +211,9 @@ class TestFindAndWrap:
         assert result is True
 
     def test_no_match_returns_false(self):
-        tree = _make_xhtml_tree('<p xmlns="http://www.w3.org/1999/xhtml">Обычный текст без терминов.</p>')
+        tree = _make_xhtml_tree(
+            '<p xmlns="http://www.w3.org/1999/xhtml">Обычный текст без терминов.</p>'
+        )
         root = tree.getroot()
         para = root.find(f".//{{{XHTML_NS}}}p")
 
@@ -261,7 +294,7 @@ class TestFindAndWrap:
         tree = _make_xhtml_tree(
             '<p xmlns="http://www.w3.org/1999/xhtml">'
             '<a href="ch02.xhtml">See вестигиум chapter</a> for details.'
-            '</p>'
+            "</p>"
         )
         root = tree.getroot()
         para = root.find(f".//{{{XHTML_NS}}}p")
@@ -274,7 +307,7 @@ class TestFindAndWrap:
         tree = _make_xhtml_tree(
             f'<p xmlns="{XHTML_NS}" xmlns:epub="{EPUB_NS}">'
             f'<aside epub:type="footnote">вестигиум is magic</aside> text.'
-            f'</p>'
+            f"</p>"
         )
         root = tree.getroot()
         para = root.find(f".//{{{XHTML_NS}}}p")
@@ -287,7 +320,7 @@ class TestFindAndWrap:
         tree = _make_xhtml_tree(
             f'<p xmlns="{XHTML_NS}">'
             f'Term<sup class="reader-note"><a href="#n1">вестигиум [1]</a></sup> text.'
-            f'</p>'
+            f"</p>"
         )
         root = tree.getroot()
         para = root.find(f".//{{{XHTML_NS}}}p")
@@ -307,13 +340,17 @@ class TestInjectReaderNotes:
             '<p xmlns="http://www.w3.org/1999/xhtml">Он почувствовал вестигиум в комнате.</p>'
             '<p xmlns="http://www.w3.org/1999/xhtml">Это был сильный вестигиум.</p>'
         )
-        glossary = _make_glossary([
-            {"original": "vestigium", "translation": "вестигиум",
-             "type": "concept", "notes": "Magical trace left by spells."},
-        ])
-        config = ReaderNotesConfig(
-            enabled=True, types=["concept"], scope="first-in-chapter"
+        glossary = _make_glossary(
+            [
+                {
+                    "original": "vestigium",
+                    "translation": "вестигиум",
+                    "type": "concept",
+                    "notes": "Magical trace left by spells.",
+                },
+            ]
         )
+        config = ReaderNotesConfig(enabled=True, types=["concept"], scope="first-in-chapter")
 
         stats = inject_reader_notes([chapter], glossary, config)
         assert stats.notes_injected == 1
@@ -327,19 +364,19 @@ class TestInjectReaderNotes:
         assert asides[0].get("id") == "reader-note-1"
 
     def test_first_in_chapter_scope(self):
-        ch1 = _make_chapter(
-            '<p xmlns="http://www.w3.org/1999/xhtml">Вестигиум здесь.</p>'
+        ch1 = _make_chapter('<p xmlns="http://www.w3.org/1999/xhtml">Вестигиум здесь.</p>')
+        ch2 = _make_chapter('<p xmlns="http://www.w3.org/1999/xhtml">Ещё один вестигиум.</p>')
+        glossary = _make_glossary(
+            [
+                {
+                    "original": "vestigium",
+                    "translation": "вестигиум",
+                    "type": "concept",
+                    "notes": "Magical trace.",
+                },
+            ]
         )
-        ch2 = _make_chapter(
-            '<p xmlns="http://www.w3.org/1999/xhtml">Ещё один вестигиум.</p>'
-        )
-        glossary = _make_glossary([
-            {"original": "vestigium", "translation": "вестигиум",
-             "type": "concept", "notes": "Magical trace."},
-        ])
-        config = ReaderNotesConfig(
-            enabled=True, types=["concept"], scope="first-in-chapter"
-        )
+        config = ReaderNotesConfig(enabled=True, types=["concept"], scope="first-in-chapter")
 
         stats = inject_reader_notes([ch1, ch2], glossary, config)
         # Should inject in both chapters (first in each chapter)
@@ -347,19 +384,19 @@ class TestInjectReaderNotes:
         assert stats.chapters_modified == 2
 
     def test_first_in_book_scope(self):
-        ch1 = _make_chapter(
-            '<p xmlns="http://www.w3.org/1999/xhtml">Вестигиум здесь.</p>'
+        ch1 = _make_chapter('<p xmlns="http://www.w3.org/1999/xhtml">Вестигиум здесь.</p>')
+        ch2 = _make_chapter('<p xmlns="http://www.w3.org/1999/xhtml">Ещё один вестигиум.</p>')
+        glossary = _make_glossary(
+            [
+                {
+                    "original": "vestigium",
+                    "translation": "вестигиум",
+                    "type": "concept",
+                    "notes": "Magical trace.",
+                },
+            ]
         )
-        ch2 = _make_chapter(
-            '<p xmlns="http://www.w3.org/1999/xhtml">Ещё один вестигиум.</p>'
-        )
-        glossary = _make_glossary([
-            {"original": "vestigium", "translation": "вестигиум",
-             "type": "concept", "notes": "Magical trace."},
-        ])
-        config = ReaderNotesConfig(
-            enabled=True, types=["concept"], scope="first-in-book"
-        )
+        config = ReaderNotesConfig(enabled=True, types=["concept"], scope="first-in-book")
 
         stats = inject_reader_notes([ch1, ch2], glossary, config)
         # Should inject only once in the whole book
@@ -371,29 +408,35 @@ class TestInjectReaderNotes:
             '<p xmlns="http://www.w3.org/1999/xhtml">Вестигиум здесь.</p>'
             '<p xmlns="http://www.w3.org/1999/xhtml">Ещё один вестигиум.</p>'
         )
-        glossary = _make_glossary([
-            {"original": "vestigium", "translation": "вестигиум",
-             "type": "concept", "notes": "Magical trace."},
-        ])
-        config = ReaderNotesConfig(
-            enabled=True, types=["concept"], scope="all"
+        glossary = _make_glossary(
+            [
+                {
+                    "original": "vestigium",
+                    "translation": "вестигиум",
+                    "type": "concept",
+                    "notes": "Magical trace.",
+                },
+            ]
         )
+        config = ReaderNotesConfig(enabled=True, types=["concept"], scope="all")
 
         stats = inject_reader_notes([chapter], glossary, config)
         # Should inject in every paragraph where found
         assert stats.notes_injected == 2
 
     def test_no_candidates_returns_empty_stats(self):
-        chapter = _make_chapter(
-            '<p xmlns="http://www.w3.org/1999/xhtml">Обычный текст.</p>'
+        chapter = _make_chapter('<p xmlns="http://www.w3.org/1999/xhtml">Обычный текст.</p>')
+        glossary = _make_glossary(
+            [
+                {
+                    "original": "Peter",
+                    "translation": "Питер",
+                    "type": "person",
+                    "notes": "Main character.",
+                },
+            ]
         )
-        glossary = _make_glossary([
-            {"original": "Peter", "translation": "Питер",
-             "type": "person", "notes": "Main character."},
-        ])
-        config = ReaderNotesConfig(
-            enabled=True, types=["concept"], scope="first-in-chapter"
-        )
+        config = ReaderNotesConfig(enabled=True, types=["concept"], scope="first-in-chapter")
 
         stats = inject_reader_notes([chapter], glossary, config)
         assert stats.notes_injected == 0
@@ -402,18 +445,26 @@ class TestInjectReaderNotes:
     def test_multiple_terms_in_same_paragraph(self):
         chapter = _make_chapter(
             '<p xmlns="http://www.w3.org/1999/xhtml">'
-            'Он почувствовал вестигиум и применил форму.'
-            '</p>'
+            "Он почувствовал вестигиум и применил форму."
+            "</p>"
         )
-        glossary = _make_glossary([
-            {"original": "vestigium", "translation": "вестигиум",
-             "type": "concept", "notes": "Magical trace."},
-            {"original": "forma", "translation": "форму",
-             "type": "concept", "notes": "A spell shape."},
-        ])
-        config = ReaderNotesConfig(
-            enabled=True, types=["concept"], scope="first-in-chapter"
+        glossary = _make_glossary(
+            [
+                {
+                    "original": "vestigium",
+                    "translation": "вестигиум",
+                    "type": "concept",
+                    "notes": "Magical trace.",
+                },
+                {
+                    "original": "forma",
+                    "translation": "форму",
+                    "type": "concept",
+                    "notes": "A spell shape.",
+                },
+            ]
         )
+        config = ReaderNotesConfig(enabled=True, types=["concept"], scope="first-in-chapter")
 
         stats = inject_reader_notes([chapter], glossary, config)
         assert stats.notes_injected == 2
@@ -423,13 +474,17 @@ class TestInjectReaderNotes:
             tree=_make_xhtml_tree(""),
             paragraphs=[],
         )
-        glossary = _make_glossary([
-            {"original": "vestigium", "translation": "вестигиум",
-             "type": "concept", "notes": "Magical trace."},
-        ])
-        config = ReaderNotesConfig(
-            enabled=True, types=["concept"], scope="first-in-chapter"
+        glossary = _make_glossary(
+            [
+                {
+                    "original": "vestigium",
+                    "translation": "вестигиум",
+                    "type": "concept",
+                    "notes": "Magical trace.",
+                },
+            ]
         )
+        config = ReaderNotesConfig(enabled=True, types=["concept"], scope="first-in-chapter")
 
         stats = inject_reader_notes([chapter], glossary, config)
         assert stats.notes_injected == 0

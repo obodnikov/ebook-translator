@@ -10,12 +10,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .cache import STAGE_WATERFALL, Cache
+from .cache import Cache
 
 
 @dataclass
 class StageOverview:
     """Summary of one stage's presence in the cache."""
+
     stage: str
     count: int
     total_chunks: int
@@ -27,6 +28,7 @@ class StageOverview:
 @dataclass
 class ScoreEntry:
     """One chunk's judge result."""
+
     chunk_id: str
     score: int
     issues: list[str]
@@ -36,6 +38,7 @@ class ScoreEntry:
 @dataclass
 class AssemblyChoice:
     """Which stage will be used for a chunk at assembly time."""
+
     chunk_id: str
     stage: str
     reason: str  # "waterfall", "preference"
@@ -44,6 +47,7 @@ class AssemblyChoice:
 @dataclass
 class StatusReport:
     """Full status report for a book's work directory."""
+
     work_dir: Path
     total_chunks: int
     stages: list[StageOverview]
@@ -70,23 +74,27 @@ def get_stage_overviews(cache: Cache, total_chunks: int) -> list[StageOverview]:
         count = cache.count_chunks_total(stage)
         if count > 0:
             stats = cache.stage_stats(stage)
-            overviews.append(StageOverview(
-                stage=stage,
-                count=count,
-                total_chunks=total_chunks,
-                cost_usd=stats["cost_usd"],
-                input_tokens=stats["input_tokens"],
-                output_tokens=stats["output_tokens"],
-            ))
+            overviews.append(
+                StageOverview(
+                    stage=stage,
+                    count=count,
+                    total_chunks=total_chunks,
+                    cost_usd=stats["cost_usd"],
+                    input_tokens=stats["input_tokens"],
+                    output_tokens=stats["output_tokens"],
+                )
+            )
         else:
-            overviews.append(StageOverview(
-                stage=stage,
-                count=0,
-                total_chunks=total_chunks,
-                cost_usd=0.0,
-                input_tokens=0,
-                output_tokens=0,
-            ))
+            overviews.append(
+                StageOverview(
+                    stage=stage,
+                    count=0,
+                    total_chunks=total_chunks,
+                    cost_usd=0.0,
+                    input_tokens=0,
+                    output_tokens=0,
+                )
+            )
 
     return overviews
 
@@ -121,12 +129,14 @@ def get_scores(cache: Cache) -> list[ScoreEntry] | None:
         else:
             issues = [str(raw_issues)]
 
-        entries.append(ScoreEntry(
-            chunk_id=chunk_id,
-            score=score,
-            issues=issues,
-            reflected=chunk_id in reflected_ids,
-        ))
+        entries.append(
+            ScoreEntry(
+                chunk_id=chunk_id,
+                score=score,
+                issues=issues,
+                reflected=chunk_id in reflected_ids,
+            )
+        )
 
     # Sort by score ascending (worst first), then by chunk_id
     entries.sort(key=lambda e: (e.score, e.chunk_id))
@@ -179,7 +189,9 @@ def build_status_report(cache: Cache, work_dir: Path) -> StatusReport:
     )
 
 
-def get_chunk_diff(cache: Cache, chunk_id: str, stages_filter: list[str] | None = None) -> list[dict[str, Any]]:
+def get_chunk_diff(
+    cache: Cache, chunk_id: str, stages_filter: list[str] | None = None
+) -> list[dict[str, Any]]:
     """Get all stage contents for a chunk, optionally filtered to specific stages."""
     all_stages = cache.get_chunk_stages(chunk_id)
 
@@ -209,6 +221,7 @@ _GRID_STAGES_WITH_REFLECT = ["translate", "reflect", "proofread", "style", "veri
 @dataclass
 class GridCell:
     """Status of one chunk in one stage."""
+
     present: bool
     changed: bool | None  # None if not applicable (e.g. translate has no "previous")
 
@@ -237,7 +250,7 @@ def build_grid(cache: Cache) -> list[GridRow]:
 
     # Get judge scores
     judge_scores: dict[str, int] = {}
-    decoder = _json.JSONDecoder()
+    _json.JSONDecoder()
     judge_rows = cache.get_judge_scores()
     for jr in judge_rows:
         cid = jr.get("chunk_id", "")
@@ -276,10 +289,12 @@ def build_grid(cache: Cache) -> list[GridRow]:
                     changed = stage_content[stage].strip() != prev_content.strip()
                     cells[stage] = GridCell(present=True, changed=changed)
 
-        rows.append(GridRow(
-            chunk_id=chunk_id,
-            judge_score=judge_scores.get(chunk_id),
-            cells=cells,
-        ))
+        rows.append(
+            GridRow(
+                chunk_id=chunk_id,
+                judge_score=judge_scores.get(chunk_id),
+                cells=cells,
+            )
+        )
 
     return rows

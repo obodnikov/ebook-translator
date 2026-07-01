@@ -50,9 +50,7 @@ class TestChunkerMetadataLifecycle:
 
         # Simulate judge with different config
         with pytest.raises(ChunkerConfigMismatchError):
-            verify_chunker_params(
-                cache, target_words=3000, overlap_paragraphs=1
-            )
+            verify_chunker_params(cache, target_words=3000, overlap_paragraphs=1)
         cache.close()
 
     def test_retranslate_same_params_is_idempotent(self, tmp_path: Path):
@@ -69,9 +67,7 @@ class TestChunkerMetadataLifecycle:
         save_chunker_params(cache, target_words=2000, overlap_paragraphs=1)
 
         with pytest.raises(ChunkerConfigMismatchError, match="conflict"):
-            save_chunker_params(
-                cache, target_words=1500, overlap_paragraphs=2
-            )
+            save_chunker_params(cache, target_words=1500, overlap_paragraphs=2)
         cache.close()
 
     def test_legacy_cache_allows_any_params(self, tmp_path: Path):
@@ -111,8 +107,11 @@ class TestJudgeStrictParsing:
         # Return score=0 (out of range)
         mock_provider.complete.return_value = CompletionResult(
             text='{"score": 0, "issues": []}',
-            input_tokens=100, output_tokens=20,
-            total_tokens=120, model="m", raw={},
+            input_tokens=100,
+            output_tokens=20,
+            total_tokens=120,
+            model="m",
+            raw={},
         )
 
         judge = Judge(
@@ -153,8 +152,11 @@ class TestJudgeStrictParsing:
         mock_provider = MagicMock()
         mock_provider.complete.return_value = CompletionResult(
             text='{"issues": ["something"]}',  # no score field
-            input_tokens=100, output_tokens=20,
-            total_tokens=120, model="m", raw={},
+            input_tokens=100,
+            output_tokens=20,
+            total_tokens=120,
+            model="m",
+            raw={},
         )
 
         judge = Judge(
@@ -345,14 +347,12 @@ class TestCacheResourceManagement:
         """After close(), another connection can open the same DB."""
         db_path = tmp_path / "cache.sqlite"
         cache1 = Cache(db_path)
-        cache1.put("k1", "translate", "m", "v1", "text",
-                   meta={"chunk_id": "c1"})
+        cache1.put("k1", "translate", "m", "v1", "text", meta={"chunk_id": "c1"})
         cache1.close()
 
         # Should be able to open and write without "database is locked"
         cache2 = Cache(db_path)
-        cache2.put("k2", "translate", "m", "v1", "text2",
-                   meta={"chunk_id": "c2"})
+        cache2.put("k2", "translate", "m", "v1", "text2", meta={"chunk_id": "c2"})
         assert cache2.count_stage("translate") == 2
         cache2.close()
 
@@ -361,8 +361,7 @@ class TestCacheResourceManagement:
         db_path = tmp_path / "cache.sqlite"
         for i in range(5):
             cache = Cache(db_path)
-            cache.put(f"k{i}", "translate", "m", "v1", f"text{i}",
-                      meta={"chunk_id": f"c{i}"})
+            cache.put(f"k{i}", "translate", "m", "v1", f"text{i}", meta={"chunk_id": f"c{i}"})
             cache.close()
 
         # Final check
@@ -395,10 +394,8 @@ class TestReflectAllWithoutJudge:
                 return [f"<p>Original {chunk.id}</p>"]
 
         cache = Cache(tmp_path / "cache.sqlite")
-        cache.put("k1", "translate", "m", "v1", "Translation 1",
-                  meta={"chunk_id": "c1"})
-        cache.put("k2", "translate", "m", "v1", "Translation 2",
-                  meta={"chunk_id": "c2"})
+        cache.put("k1", "translate", "m", "v1", "Translation 1", meta={"chunk_id": "c1"})
+        cache.put("k2", "translate", "m", "v1", "Translation 2", meta={"chunk_id": "c2"})
 
         cs = MockChunkSet()
 
@@ -431,10 +428,8 @@ class TestReflectAllWithoutJudge:
                 return [f"<p>Text {chunk.id}</p>"]
 
         cache = Cache(tmp_path / "cache.sqlite")
-        cache.put("k1", "translate", "m", "v1", "T1",
-                  meta={"chunk_id": "c1"})
-        cache.put("k2", "translate", "m", "v1", "T2",
-                  meta={"chunk_id": "c2"})
+        cache.put("k1", "translate", "m", "v1", "T1", meta={"chunk_id": "c1"})
+        cache.put("k2", "translate", "m", "v1", "T2", meta={"chunk_id": "c2"})
 
         cs = MockChunkSet()
 

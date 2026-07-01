@@ -19,7 +19,6 @@ from lxml import etree
 
 from .provider import ImageGenerationResult, OpenRouterProvider
 
-
 # ---------------------------------------------------------------------------
 # Data types
 # ---------------------------------------------------------------------------
@@ -129,10 +128,7 @@ def _extract_cover_item(
     # Strip leading slash from href (some EPUBs use absolute-looking paths)
     clean_href = href.lstrip("/")
 
-    if opf_dir:
-        resolved = PurePosixPath(opf_dir, clean_href)
-    else:
-        resolved = PurePosixPath(clean_href)
+    resolved = PurePosixPath(opf_dir, clean_href) if opf_dir else PurePosixPath(clean_href)
     # Normalize: collapse ".." and "." segments
     parts: list[str] = []
     for part in resolved.parts:
@@ -198,10 +194,7 @@ def replace_cover(
         )
     cover = find_cover_in_epub(source_epub)
     if cover is None:
-        raise ValueError(
-            f"No cover image found in {source_epub.name}. "
-            "Cannot replace cover."
-        )
+        raise ValueError(f"No cover image found in {source_epub.name}. Cannot replace cover.")
 
     # Validate media type compatibility.
     # If new_media_type is provided and differs from the original, reject it.
@@ -221,27 +214,26 @@ def replace_cover(
 
     dest_epub.parent.mkdir(parents=True, exist_ok=True)
 
-    with zipfile.ZipFile(source_epub, "r") as src:
-        with zipfile.ZipFile(dest_epub, "w") as dst:
-            # mimetype first, uncompressed (EPUB spec)
-            dst.writestr(
-                zipfile.ZipInfo("mimetype"),
-                "application/epub+zip",
-                compress_type=zipfile.ZIP_STORED,
-            )
-            for info in src.infolist():
-                if info.filename == "mimetype":
-                    continue
-                if info.filename == cover.archive_path:
-                    # Replace cover image
-                    dst.writestr(
-                        info.filename,
-                        new_image,
-                        compress_type=zipfile.ZIP_DEFLATED,
-                    )
-                else:
-                    with src.open(info) as fh:
-                        dst.writestr(info, fh.read())
+    with zipfile.ZipFile(source_epub, "r") as src, zipfile.ZipFile(dest_epub, "w") as dst:
+        # mimetype first, uncompressed (EPUB spec)
+        dst.writestr(
+            zipfile.ZipInfo("mimetype"),
+            "application/epub+zip",
+            compress_type=zipfile.ZIP_STORED,
+        )
+        for info in src.infolist():
+            if info.filename == "mimetype":
+                continue
+            if info.filename == cover.archive_path:
+                # Replace cover image
+                dst.writestr(
+                    info.filename,
+                    new_image,
+                    compress_type=zipfile.ZIP_DEFLATED,
+                )
+            else:
+                with src.open(info) as fh:
+                    dst.writestr(info, fh.read())
 
     return cover
 
@@ -362,10 +354,7 @@ def translate_cover(
     """
     cover = find_cover_in_epub(source_epub)
     if cover is None:
-        raise ValueError(
-            f"No cover image found in {source_epub.name}. "
-            "Cannot translate cover."
-        )
+        raise ValueError(f"No cover image found in {source_epub.name}. Cannot translate cover.")
 
     # Build the prompt
     if prompt_template is None:
@@ -465,39 +454,38 @@ def _replace_cover_with_manifest_update(
             "manifest cannot be updated."
         )
 
-    with zipfile.ZipFile(source_epub, "r") as src:
-        with zipfile.ZipFile(dest_epub, "w") as dst:
-            # mimetype first, uncompressed (EPUB spec)
-            dst.writestr(
-                zipfile.ZipInfo("mimetype"),
-                "application/epub+zip",
-                compress_type=zipfile.ZIP_STORED,
-            )
-            for info in src.infolist():
-                if info.filename == "mimetype":
-                    continue
-                if info.filename == cover.archive_path:
-                    # Replace cover image bytes
-                    dst.writestr(
-                        info.filename,
-                        new_image,
-                        compress_type=zipfile.ZIP_DEFLATED,
-                    )
-                elif info.filename == opf_path:
-                    # Update OPF manifest media-type for the cover item.
-                    # Uses manifest_href for exact matching.
-                    opf_bytes = src.read(info.filename)
-                    updated_opf = _update_opf_cover_media_type(
-                        opf_bytes, cover.manifest_href, new_media_type
-                    )
-                    dst.writestr(
-                        info.filename,
-                        updated_opf,
-                        compress_type=zipfile.ZIP_DEFLATED,
-                    )
-                else:
-                    with src.open(info) as fh:
-                        dst.writestr(info, fh.read())
+    with zipfile.ZipFile(source_epub, "r") as src, zipfile.ZipFile(dest_epub, "w") as dst:
+        # mimetype first, uncompressed (EPUB spec)
+        dst.writestr(
+            zipfile.ZipInfo("mimetype"),
+            "application/epub+zip",
+            compress_type=zipfile.ZIP_STORED,
+        )
+        for info in src.infolist():
+            if info.filename == "mimetype":
+                continue
+            if info.filename == cover.archive_path:
+                # Replace cover image bytes
+                dst.writestr(
+                    info.filename,
+                    new_image,
+                    compress_type=zipfile.ZIP_DEFLATED,
+                )
+            elif info.filename == opf_path:
+                # Update OPF manifest media-type for the cover item.
+                # Uses manifest_href for exact matching.
+                opf_bytes = src.read(info.filename)
+                updated_opf = _update_opf_cover_media_type(
+                    opf_bytes, cover.manifest_href, new_media_type
+                )
+                dst.writestr(
+                    info.filename,
+                    updated_opf,
+                    compress_type=zipfile.ZIP_DEFLATED,
+                )
+            else:
+                with src.open(info) as fh:
+                    dst.writestr(info, fh.read())
 
 
 def _update_opf_cover_media_type(

@@ -8,12 +8,12 @@ to the neighbouring paragraphs used as read-only context.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from dataclasses import dataclass, field
-from typing import Iterator
 
 from lxml import etree
 
-from .epub_io import ChapterDoc, StructuredBook
+from .epub_io import StructuredBook
 
 
 def _element_to_xhtml_fragment(el: etree._Element) -> str:
@@ -28,6 +28,7 @@ def _element_to_xhtml_fragment(el: etree._Element) -> str:
     """
     # Deep copy so we don't mutate the live tree.
     import copy
+
     clone = copy.deepcopy(el)
 
     # Strip XHTML namespace prefixes from this subtree.
@@ -46,9 +47,9 @@ def _element_word_count(el: etree._Element) -> int:
 
 @dataclass
 class Chunk:
-    id: str                                 # e.g. "ch03_c02"
-    chapter_index: int                      # 0-based index in StructuredBook.chapters
-    paragraph_indexes: list[int]            # indexes within ChapterDoc.paragraphs
+    id: str  # e.g. "ch03_c02"
+    chapter_index: int  # 0-based index in StructuredBook.chapters
+    paragraph_indexes: list[int]  # indexes within ChapterDoc.paragraphs
     word_count: int
     # Overlap (context only, NOT translated). Indices within ChapterDoc.paragraphs.
     prev_overlap_indexes: list[int] = field(default_factory=list)
@@ -67,24 +68,13 @@ class ChunkSet:
     def render_main(self, chunk: Chunk) -> list[str]:
         """XHTML fragments for each paragraph in the chunk (to translate)."""
         ch = self.book.chapters[chunk.chapter_index]
-        return [
-            _element_to_xhtml_fragment(ch.paragraphs[i])
-            for i in chunk.paragraph_indexes
-        ]
+        return [_element_to_xhtml_fragment(ch.paragraphs[i]) for i in chunk.paragraph_indexes]
 
-    def render_overlap(
-        self, chunk: Chunk, side: str
-    ) -> list[str]:
+    def render_overlap(self, chunk: Chunk, side: str) -> list[str]:
         """XHTML fragments for the before/after overlap (context only)."""
         ch = self.book.chapters[chunk.chapter_index]
-        indexes = (
-            chunk.prev_overlap_indexes if side == "prev"
-            else chunk.next_overlap_indexes
-        )
-        return [
-            _element_to_xhtml_fragment(ch.paragraphs[i])
-            for i in indexes
-        ]
+        indexes = chunk.prev_overlap_indexes if side == "prev" else chunk.next_overlap_indexes
+        return [_element_to_xhtml_fragment(ch.paragraphs[i]) for i in indexes]
 
 
 def chunk_book(
@@ -131,14 +121,16 @@ def chunk_book(
                 next_ov = next_pool[:overlap_paragraphs]
 
             chunk_id = f"ch{ch_idx + 1:02d}_c{c_i + 1:02d}"
-            all_chunks.append(Chunk(
-                id=chunk_id,
-                chapter_index=ch_idx,
-                paragraph_indexes=para_indexes,
-                word_count=wc,
-                prev_overlap_indexes=prev_ov,
-                next_overlap_indexes=next_ov,
-            ))
+            all_chunks.append(
+                Chunk(
+                    id=chunk_id,
+                    chapter_index=ch_idx,
+                    paragraph_indexes=para_indexes,
+                    word_count=wc,
+                    prev_overlap_indexes=prev_ov,
+                    next_overlap_indexes=next_ov,
+                )
+            )
 
     return ChunkSet(book=book, chunks=all_chunks)
 

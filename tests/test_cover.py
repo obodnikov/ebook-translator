@@ -10,14 +10,12 @@ import pytest
 from lxml import etree
 
 from booktranslator.cover import (
-    CoverInfo,
     _build_default_prompt,
     _normalize_image_mime,
     find_cover_in_epub,
     replace_cover,
     replace_cover_from_file,
 )
-
 
 # ---------------------------------------------------------------------------
 # Fixtures: minimal EPUB archives for testing
@@ -370,33 +368,41 @@ class TestNormalizeMime:
 class TestDetectImageMime:
     def test_jpeg_bytes(self):
         from booktranslator.cover import _detect_image_mime_from_bytes
+
         # Real JPEG magic bytes
         assert _detect_image_mime_from_bytes(b"\xff\xd8\xff\xe0" + b"\x00" * 100) == "image/jpeg"
 
     def test_png_bytes(self):
         from booktranslator.cover import _detect_image_mime_from_bytes
+
         assert _detect_image_mime_from_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 100) == "image/png"
 
     def test_webp_bytes(self):
         from booktranslator.cover import _detect_image_mime_from_bytes
-        assert _detect_image_mime_from_bytes(b"RIFF\x00\x00\x00\x00WEBP" + b"\x00" * 100) == "image/webp"
+
+        result = _detect_image_mime_from_bytes(b"RIFF\x00\x00\x00\x00WEBP" + b"\x00" * 100)
+        assert result == "image/webp"
 
     def test_gif_bytes(self):
         from booktranslator.cover import _detect_image_mime_from_bytes
+
         assert _detect_image_mime_from_bytes(b"GIF89a" + b"\x00" * 100) == "image/gif"
 
     def test_unknown_bytes(self):
         from booktranslator.cover import _detect_image_mime_from_bytes
+
         assert _detect_image_mime_from_bytes(b"NOT_AN_IMAGE_FORMAT") is None
 
     def test_empty_bytes(self):
         from booktranslator.cover import _detect_image_mime_from_bytes
+
         assert _detect_image_mime_from_bytes(b"") is None
         assert _detect_image_mime_from_bytes(b"\x00") is None
 
     def test_mislabeled_file_detected_correctly(self, tmp_path: Path):
         """A PNG file with .jpg extension should be detected as PNG."""
         from booktranslator.cover import _detect_image_mime_from_bytes
+
         png_bytes = b"\x89PNG\r\n\x1a\n" + b"\x00" * 100
         # Even though we might call it .jpg, bytes say PNG
         assert _detect_image_mime_from_bytes(png_bytes) == "image/png"
@@ -455,7 +461,6 @@ class TestProviderImageParsing:
     def test_parse_valid_response(self):
         """Verify base64 data URL parsing from a mocked response."""
         import base64
-        from booktranslator.provider import ImageGenerationResult
 
         # Simulate what the provider returns after parsing
         fake_image = b"FAKE_IMAGE_BYTES"
@@ -478,23 +483,20 @@ class TestProviderImageParsing:
     def test_non_image_mime_rejected(self):
         """MIME types that don't start with image/ should be rejected."""
         import base64
-        from unittest.mock import patch, MagicMock
 
         from booktranslator.provider import OpenRouterProvider
 
         # Build a fake response with text/plain MIME
         fake_data = base64.b64encode(b"not an image").decode()
         fake_response = {
-            "choices": [{
-                "message": {
-                    "content": "",
-                    "images": [{
-                        "image_url": {
-                            "url": f"data:text/plain;base64,{fake_data}"
-                        }
-                    }]
+            "choices": [
+                {
+                    "message": {
+                        "content": "",
+                        "images": [{"image_url": {"url": f"data:text/plain;base64,{fake_data}"}}],
+                    }
                 }
-            }]
+            ]
         }
 
         provider = OpenRouterProvider(api_key="test-key")
@@ -518,21 +520,18 @@ class TestProviderImageParsing:
 
     def test_empty_payload_rejected(self):
         """Empty base64 payload should be rejected."""
-        from unittest.mock import patch, MagicMock
 
         from booktranslator.provider import OpenRouterProvider
 
         fake_response = {
-            "choices": [{
-                "message": {
-                    "content": "",
-                    "images": [{
-                        "image_url": {
-                            "url": "data:image/png;base64,"
-                        }
-                    }]
+            "choices": [
+                {
+                    "message": {
+                        "content": "",
+                        "images": [{"image_url": {"url": "data:image/png;base64,"}}],
+                    }
                 }
-            }]
+            ]
         }
 
         provider = OpenRouterProvider(api_key="test-key")
@@ -556,17 +555,11 @@ class TestProviderImageParsing:
 
     def test_no_images_in_response_rejected(self):
         """Response without images array should raise RuntimeError."""
-        from unittest.mock import patch, MagicMock
 
         from booktranslator.provider import OpenRouterProvider
 
         fake_response = {
-            "choices": [{
-                "message": {
-                    "content": "I cannot generate images",
-                    "images": []
-                }
-            }]
+            "choices": [{"message": {"content": "I cannot generate images", "images": []}}]
         }
 
         provider = OpenRouterProvider(api_key="test-key")
@@ -599,8 +592,6 @@ class TestTranslateCover:
 
     def test_translate_same_format(self, tmp_path: Path):
         """AI returns same format as original — simple replacement."""
-        import base64
-        from unittest.mock import MagicMock
         from booktranslator.provider import ImageGenerationResult
 
         jpeg_bytes = b"\xff\xd8\xff\xe0" + b"\x00" * 100
@@ -617,6 +608,7 @@ class TestTranslateCover:
         )
 
         from booktranslator.cover import translate_cover
+
         result = translate_cover(
             source_epub=epub,
             dest_epub=dest,
@@ -635,7 +627,6 @@ class TestTranslateCover:
 
     def test_translate_different_format_updates_manifest(self, tmp_path: Path):
         """AI returns PNG when original is JPEG — OPF manifest must be updated."""
-        from unittest.mock import MagicMock
         from booktranslator.provider import ImageGenerationResult
 
         jpeg_bytes = b"\xff\xd8\xff\xe0" + b"\x00" * 100
@@ -652,7 +643,8 @@ class TestTranslateCover:
         )
 
         from booktranslator.cover import translate_cover
-        result = translate_cover(
+
+        translate_cover(
             source_epub=epub,
             dest_epub=dest,
             provider=mock_provider,
@@ -671,7 +663,6 @@ class TestTranslateCover:
 
     def test_translate_no_cover_raises(self, tmp_path: Path):
         """translate_cover on EPUB without cover should raise ValueError."""
-        from unittest.mock import MagicMock
         from booktranslator.cover import translate_cover
 
         epub = _make_epub_no_cover(tmp_path)
@@ -690,7 +681,6 @@ class TestTranslateCover:
 
     def test_translate_invalid_provider_output_raises(self, tmp_path: Path):
         """Provider returning non-image bytes should raise RuntimeError."""
-        from unittest.mock import MagicMock
         from booktranslator.provider import ImageGenerationResult
 
         epub = _make_epub2_with_cover(tmp_path, b"\xff\xd8\xff\xe0ORIGINAL")
@@ -705,6 +695,7 @@ class TestTranslateCover:
         )
 
         from booktranslator.cover import translate_cover
+
         with pytest.raises(RuntimeError, match="not a recognized image format"):
             translate_cover(
                 source_epub=epub,
@@ -716,7 +707,6 @@ class TestTranslateCover:
 
     def test_translate_empty_provider_output_raises(self, tmp_path: Path):
         """Provider returning empty bytes should raise RuntimeError."""
-        from unittest.mock import MagicMock
         from booktranslator.provider import ImageGenerationResult
 
         epub = _make_epub2_with_cover(tmp_path, b"\xff\xd8\xff\xe0ORIGINAL")
@@ -731,6 +721,7 @@ class TestTranslateCover:
         )
 
         from booktranslator.cover import translate_cover
+
         with pytest.raises(RuntimeError, match="empty image data"):
             translate_cover(
                 source_epub=epub,
@@ -742,7 +733,6 @@ class TestTranslateCover:
 
     def test_translate_auto_mode_no_title(self, tmp_path: Path):
         """Without --title, prompt should instruct model to translate itself."""
-        from unittest.mock import MagicMock
         from booktranslator.provider import ImageGenerationResult
 
         jpeg_bytes = b"\xff\xd8\xff\xe0" + b"\x00" * 100
@@ -759,6 +749,7 @@ class TestTranslateCover:
         )
 
         from booktranslator.cover import translate_cover
+
         translate_cover(
             source_epub=epub,
             dest_epub=dest,
@@ -783,7 +774,6 @@ class TestManifestUpdate:
 
     def test_relative_href_manifest_update(self, tmp_path: Path):
         """Cover with relative href (../images/cover.jpg) should update correctly."""
-        from unittest.mock import MagicMock
         from booktranslator.provider import ImageGenerationResult
 
         epub = _make_epub_relative_path_cover(tmp_path)
@@ -799,6 +789,7 @@ class TestManifestUpdate:
         )
 
         from booktranslator.cover import translate_cover
+
         translate_cover(
             source_epub=epub,
             dest_epub=dest,
@@ -859,7 +850,6 @@ class TestManifestUpdate:
         # and the other one still has image/jpeg
         assert 'id="other"' in result_str
         # Parse to verify precisely
-        from lxml import etree
         tree = etree.fromstring(result)
         items = tree.findall(".//{http://www.idpf.org/2007/opf}item")
         for item in items:
@@ -877,6 +867,7 @@ class TestManifestUpdate:
 class TestMimeToExtension:
     def test_known_types(self):
         from booktranslator.cli import _mime_to_extension
+
         assert _mime_to_extension("image/jpeg") == ".jpg"
         assert _mime_to_extension("image/png") == ".png"
         assert _mime_to_extension("image/webp") == ".webp"
@@ -884,32 +875,38 @@ class TestMimeToExtension:
 
     def test_unknown_type_returns_jpg(self):
         from booktranslator.cli import _mime_to_extension
+
         assert _mime_to_extension("image/x-unknown") == ".jpg"
 
     def test_none_returns_jpg(self):
         from booktranslator.cli import _mime_to_extension
+
         assert _mime_to_extension(None) == ".jpg"
 
     def test_empty_string_returns_jpg(self):
         from booktranslator.cli import _mime_to_extension
+
         assert _mime_to_extension("") == ".jpg"
 
     def test_mime_with_parameters(self):
         from booktranslator.cli import _mime_to_extension
+
         assert _mime_to_extension("image/png; charset=binary") == ".png"
         assert _mime_to_extension("image/jpeg; quality=high") == ".jpg"
 
     def test_svg(self):
         from booktranslator.cli import _mime_to_extension
+
         assert _mime_to_extension("image/svg+xml") == ".svg"
 
 
 class TestCoverExtractCLI:
     def test_extract_success_default_output(self, tmp_path: Path):
         """Extract should save cover with auto-generated filename."""
+
         from typer.testing import CliRunner
+
         from booktranslator.cli import app
-        import os
 
         cover_data = b"\xff\xd8\xff\xe0" + b"COVER_JPEG" + b"\x00" * 90
         epub = _make_epub2_with_cover(tmp_path, cover_data)
@@ -927,6 +924,7 @@ class TestCoverExtractCLI:
     def test_extract_no_cover_exits_1(self, tmp_path: Path):
         """Extract on EPUB without cover should exit with code 1."""
         from typer.testing import CliRunner
+
         from booktranslator.cli import app
 
         epub = _make_epub_no_cover(tmp_path)
@@ -940,6 +938,7 @@ class TestCoverExtractCLI:
     def test_extract_out_is_directory_exits_2(self, tmp_path: Path):
         """--out pointing to a directory should exit with code 2."""
         from typer.testing import CliRunner
+
         from booktranslator.cli import app
 
         cover_data = b"\xff\xd8\xff\xe0" + b"\x00" * 100
@@ -956,6 +955,7 @@ class TestCoverExtractCLI:
     def test_extract_custom_out_path(self, tmp_path: Path):
         """--out should save to the specified path."""
         from typer.testing import CliRunner
+
         from booktranslator.cli import app
 
         cover_data = b"\x89PNG\r\n\x1a\n" + b"PNG_COVER" + b"\x00" * 91
@@ -972,6 +972,7 @@ class TestCoverExtractCLI:
     def test_extract_existing_file_without_force_fails(self, tmp_path: Path):
         """Existing output file without --force should fail."""
         from typer.testing import CliRunner
+
         from booktranslator.cli import app
 
         cover_data = b"\xff\xd8\xff\xe0" + b"\x00" * 100
@@ -990,6 +991,7 @@ class TestCoverExtractCLI:
     def test_extract_existing_file_with_force_overwrites(self, tmp_path: Path):
         """Existing output file with --force should be overwritten."""
         from typer.testing import CliRunner
+
         from booktranslator.cli import app
 
         cover_data = b"\xff\xd8\xff\xe0" + b"NEW_COVER" + b"\x00" * 91
@@ -998,7 +1000,9 @@ class TestCoverExtractCLI:
         out_file.write_bytes(b"OLD_DATA")
 
         runner = CliRunner()
-        result = runner.invoke(app, ["cover", "extract", str(epub), "--out", str(out_file), "--force"])
+        result = runner.invoke(
+            app, ["cover", "extract", str(epub), "--out", str(out_file), "--force"]
+        )
 
         assert result.exit_code == 0
         assert out_file.read_bytes() == cover_data

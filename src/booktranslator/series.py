@@ -25,7 +25,6 @@ from .models import (
     SeriesGlossaryEntry,
 )
 
-
 # ---------------------------------------------------------------------------
 # Workdir for a series
 # ---------------------------------------------------------------------------
@@ -82,9 +81,7 @@ def init_series(
     """Create an empty series at work/<slug>-series/."""
     wd = SeriesWorkDir.for_series(base, slug)
     if wd.exists():
-        raise FileExistsError(
-            f"Series {slug!r} already exists at {wd.glossary_path}"
-        )
+        raise FileExistsError(f"Series {slug!r} already exists at {wd.glossary_path}")
     wd.ensure()
     glossary = SeriesGlossary(
         series_slug=slug,
@@ -110,9 +107,7 @@ class PromoteReport:
     conflicts: list[tuple[str, str, str]]  # (original, series_value, book_value)
 
 
-def _entry_to_series(
-    book_entry: GlossaryEntry, origin_book: str
-) -> SeriesGlossaryEntry:
+def _entry_to_series(book_entry: GlossaryEntry, origin_book: str) -> SeriesGlossaryEntry:
     return SeriesGlossaryEntry(
         original=book_entry.original,
         translation=book_entry.translation,
@@ -140,9 +135,7 @@ def promote(
         translation differs, a conflict is reported (human decides).
     """
     index = series.index_by_original()
-    report = PromoteReport(
-        added=[], skipped_existing=[], skipped_unapproved=[], conflicts=[]
-    )
+    report = PromoteReport(added=[], skipped_existing=[], skipped_unapproved=[], conflicts=[])
 
     for e in book_glossary.entries:
         if require_approved and not e.approved_by_human:
@@ -157,17 +150,13 @@ def promote(
             report.added.append(e.original)
         else:
             if existing.translation != e.translation:
-                report.conflicts.append(
-                    (e.original, existing.translation, e.translation)
-                )
+                report.conflicts.append((e.original, existing.translation, e.translation))
             else:
                 report.skipped_existing.append(e.original)
 
     # Keep entries sorted for stable diffs: by type, then by original.
     type_order = {"person": 0, "place": 1, "concept": 2, "term": 3, "other": 4}
-    series.entries.sort(
-        key=lambda x: (type_order.get(x.type, 99), x.original.lower())
-    )
+    series.entries.sort(key=lambda x: (type_order.get(x.type, 99), x.original.lower()))
     return series, report
 
 
