@@ -37,3 +37,4 @@ Thumbs.db
 .sync_journal.*
 
 .kiro/
+.claude/settings.json
