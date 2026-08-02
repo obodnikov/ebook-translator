@@ -277,6 +277,69 @@ class TestFindAndWrap:
         result = _find_and_wrap_first_match(para, "вестигиум", "reader-note-1", XHTML_NS)
         assert result is True
 
+    def test_marker_goes_after_inflected_ending(self):
+        """The marker must follow the whole word, not split off its ending."""
+        tree = _make_xhtml_tree(
+            '<p xmlns="http://www.w3.org/1999/xhtml">Биоформы носят скафандры.</p>'
+        )
+        root = tree.getroot()
+        para = root.find(f".//{{{XHTML_NS}}}p")
+
+        result = _find_and_wrap_first_match(para, "биоформ", "reader-note-2", XHTML_NS)
+        assert result is True
+
+        # Text before <sup> ends with the full word, tail starts with a space
+        sup = para.find(f".//{{{XHTML_NS}}}sup")
+        assert para.text == "Биоформы"
+        assert sup.tail == " носят скафандры."
+
+    def test_marker_after_multi_letter_ending(self):
+        """A three-letter case ending is still part of the matched word."""
+        tree = _make_xhtml_tree(
+            '<p xmlns="http://www.w3.org/1999/xhtml">Он говорил с биоформами вчера.</p>'
+        )
+        root = tree.getroot()
+        para = root.find(f".//{{{XHTML_NS}}}p")
+
+        result = _find_and_wrap_first_match(para, "биоформ", "reader-note-1", XHTML_NS)
+        assert result is True
+
+        sup = para.find(f".//{{{XHTML_NS}}}sup")
+        assert para.text == "Он говорил с биоформами"
+        assert sup.tail == " вчера."
+
+    def test_no_match_when_tail_is_too_long(self):
+        """A tail longer than an inflection means a different word entirely."""
+        tree = _make_xhtml_tree(
+            '<p xmlns="http://www.w3.org/1999/xhtml">Марсианская адаптационная инженерия.</p>'
+        )
+        root = tree.getroot()
+        para = root.find(f".//{{{XHTML_NS}}}p")
+
+        # Company name "АдАпт" must not attach itself to "адаптационная"
+        result = _find_and_wrap_first_match(para, "адапт", "reader-note-1", XHTML_NS)
+        assert result is False
+
+    def test_falls_back_to_later_occurrence(self):
+        """When the first occurrence is unusable, a later one is used."""
+        tree = _make_xhtml_tree(
+            '<p xmlns="http://www.w3.org/1999/xhtml">'
+            '<a href="ch02.xhtml">См. главу вестигиум</a>, где вестигиум описан.'
+            "</p>"
+        )
+        root = tree.getroot()
+        para = root.find(f".//{{{XHTML_NS}}}p")
+
+        result = _find_and_wrap_first_match(para, "вестигиум", "reader-note-1", XHTML_NS)
+        assert result is True
+
+        # The noteref must sit outside the link, on the second occurrence
+        link = para.find(f".//{{{XHTML_NS}}}a[@href='ch02.xhtml']")
+        assert link.find(f".//{{{XHTML_NS}}}sup") is None
+        sup = para.find(f".//{{{XHTML_NS}}}sup")
+        assert link.tail == ", где вестигиум"
+        assert sup.tail == " описан."
+
     def test_wraps_in_element_with_children(self):
         tree = _make_xhtml_tree(
             '<p xmlns="http://www.w3.org/1999/xhtml">Он <i>почувствовал</i> вестигиум.</p>'

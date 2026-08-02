@@ -142,39 +142,44 @@ def _find_and_wrap_first_match(
     full_lower = full_text.lower()
     # Use left word boundary to avoid matching inside larger words
     # (e.g. "форма" should not match inside "информация").
-    # For short terms (≤4 chars), use both boundaries to prevent
-    # false positives (e.g. "art" matching "article").
-    # For longer terms, right boundary is relaxed to allow inflected
-    # forms in Russian (e.g. "вестигиум" matches "вестигиуме").
+    # For short terms (≤4 chars), match the bare word only — a suffix would
+    # produce false positives (e.g. "art" matching "article").
+    # For longer terms, allow a short inflectional ending so the term is found
+    # in its declined forms ("вестигиум" in "вестигиуме", "биоформ" in
+    # "биоформами"). Russian case/number endings are at most three letters;
+    # a longer tail means a different word altogether ("АдАпт" inside
+    # "адаптационная"), and that occurrence is rejected.
+    # The ending is part of the match, so the marker always lands after the
+    # whole word rather than inside it.
     escaped = re.escape(search_lower)
-    if len(search_lower) <= 4:
-        pattern = re.compile(r"(?<!\w)" + escaped + r"(?!\w)", re.IGNORECASE)
-    else:
-        pattern = re.compile(r"(?<!\w)" + escaped, re.IGNORECASE)
-    m = pattern.search(full_lower)
-    if m is None:
-        return False
-    match_pos = m.start()
+    suffix = r"" if len(search_lower) <= 4 else r"\w{0,3}"
+    pattern = re.compile(r"(?<!\w)" + escaped + suffix + r"(?!\w)", re.IGNORECASE)
 
-    # Find which text node contains match_pos
-    offset = 0
-    for node_el, attr, text_val in text_nodes:
-        node_start = offset
-        node_end = offset + len(text_val)
-        if node_start <= match_pos < node_end:
+    for m in pattern.finditer(full_lower):
+        match_pos = m.start()
+        match_len = m.end() - m.start()
+
+        # Find which text node contains match_pos
+        offset = 0
+        for node_el, attr, text_val in text_nodes:
+            node_start = offset
+            node_end = offset + len(text_val)
+            offset = node_end
+            if not (node_start <= match_pos < node_end):
+                continue
+
             # Skip matches that land in forbidden regions (inside <a>, footnotes)
             if attr == "skip" or node_el is None:
-                return False
+                break
 
             # Match starts in this text node
             local_pos = match_pos - node_start
-            match_len = len(search_lower)
 
             # Only handle matches that fit entirely within one text node
             # (simplification — covers vast majority of cases)
             if local_pos + match_len > len(text_val):
-                # Match spans multiple nodes — skip for now
-                return False
+                # Match spans multiple nodes — try the next occurrence
+                break
 
             # Split: before_match + matched_word + after_match
             before = text_val[: local_pos + match_len]
@@ -203,13 +208,12 @@ def _find_and_wrap_first_match(
                 node_el.tail = before
                 parent = node_el.getparent()
                 if parent is None:
-                    return False
+                    break
                 # Insert sup right after node_el
                 idx = list(parent).index(node_el)
                 parent.insert(idx + 1, sup)
 
             return True
-        offset = node_end
 
     return False
 
