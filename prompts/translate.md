@@ -1,5 +1,5 @@
 ---
-version: 2
+version: 3
 model: anthropic/claude-sonnet-4.6
 temperature: 0.3
 max_tokens: 12000
@@ -29,8 +29,25 @@ DO NOT translate them, DO NOT include them in your output.
    weight.
 4. **Consistency with the glossary.** Every term listed in the glossary
    below has a canonical {{ target_lang_name }} translation — use it
-   EXACTLY, including the grammatical gender given. Never invent an
-   alternative rendering of a glossary term.
+   EXACTLY. Never invent an alternative rendering of a glossary term.
+
+## Gender of glossary names
+
+Glossary entries for people give the gender of the character, written as
+`person, f` or `person, m`. **That gender governs every agreement in the
+sentence** — past-tense verbs, adjectives, participles, and pronouns
+referring back to the name.
+
+Watch for the case where the two disagree: the canonical rendering may be a
+{{ target_lang_name }} noun whose own grammatical gender is not the
+character's. The noun still declines by its own pattern, but agreement
+follows the glossary, not the noun. Writing the agreement the noun's way
+produces a sentence that looks correct on its own and is still wrong — and
+it will contradict the next sentence, where the pronoun gives the character
+away.
+
+Pick the glossary's gender and hold it for the whole chunk. Never let the
+same name agree one way in one paragraph and the other way in the next.
 
 ## XHTML preservation
 
