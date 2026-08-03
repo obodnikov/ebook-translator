@@ -192,11 +192,14 @@ class OpenRouterProvider:
         )
 
     def _warn_if_near_response_ceiling(self, text: str, reasoning: str, model: str) -> None:
-        """Log a warning when a response approaches the provider's ceiling.
+        """Log a warning when a response approaches the configured size limit.
 
-        Reasoning and answer share one budget, so both are counted. Silence
-        here means nothing: the next, slightly longer chunk may be the one
-        that comes back empty.
+        `max_response_bytes` is a cautious threshold, not the provider's exact
+        limit: a 23 644-byte response came back whole while a 26 825-byte one
+        was cut off mid-JSON, and the real limit looks to be counted in tokens
+        rather than bytes. Reasoning and answer share the budget, so both are
+        counted here. Silence means nothing on its own — the next, slightly
+        longer chunk may be the one that comes back empty.
         """
         if not self._max_response_bytes:
             return
@@ -204,12 +207,12 @@ class OpenRouterProvider:
         if used < self._max_response_bytes * RESPONSE_SIZE_WARN_RATIO:
             return
         logger.warning(
-            "Response from %s is %d bytes (%.0f%% of the %d-byte ceiling; "
-            "%d of them reasoning). Shrink chunker.target_words or lower "
-            "reasoning_effort before this starts coming back empty.",
+            "Response from %s is %d bytes, past the %d-byte warning threshold "
+            "set for this provider (%d of them reasoning). Shrink "
+            "chunker.target_words or lower reasoning_effort before responses "
+            "start coming back empty.",
             model,
             used,
-            used / self._max_response_bytes * 100,
             self._max_response_bytes,
             len(reasoning.encode("utf-8")),
         )

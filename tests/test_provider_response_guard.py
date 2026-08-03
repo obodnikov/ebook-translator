@@ -148,8 +148,8 @@ class TestReasoningField:
         assert result.reasoning == ""
 
 
-class TestResponseCeilingWarning:
-    def test_warns_when_near_the_ceiling(self, caplog):
+class TestResponseSizeWarning:
+    def test_warns_when_past_the_threshold(self, caplog):
         provider = _make_provider(max_response_bytes=1000)
         response = _make_mock_response(content="x" * 900)
         with (
@@ -157,10 +157,10 @@ class TestResponseCeilingWarning:
             caplog.at_level(logging.WARNING),
         ):
             provider.complete(model="m", system="s", user="u")
-        assert "ceiling" in caplog.text
+        assert "warning threshold" in caplog.text
         assert "target_words" in caplog.text
 
-    def test_reasoning_counts_towards_the_ceiling(self, caplog):
+    def test_reasoning_counts_towards_the_threshold(self, caplog):
         """Reasoning and answer share one budget, so both must be counted."""
         provider = _make_provider(max_response_bytes=1000)
         response = _make_mock_response(content="x" * 100, reasoning_content="y" * 800)
@@ -169,7 +169,7 @@ class TestResponseCeilingWarning:
             caplog.at_level(logging.WARNING),
         ):
             provider.complete(model="m", system="s", user="u")
-        assert "ceiling" in caplog.text
+        assert "warning threshold" in caplog.text
 
     def test_silent_when_well_under(self, caplog):
         provider = _make_provider(max_response_bytes=1000)
@@ -182,7 +182,7 @@ class TestResponseCeilingWarning:
         assert caplog.text == ""
 
     def test_silent_when_no_ceiling_configured(self, caplog):
-        """OpenRouter has no known ceiling — it must not be warned about."""
+        """OpenRouter has no known limit — it must not be warned about."""
         provider = _make_provider(max_response_bytes=None)
         response = _make_mock_response(content="x" * 100_000)
         with (
