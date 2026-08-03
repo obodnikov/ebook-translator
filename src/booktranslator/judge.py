@@ -18,7 +18,7 @@ from pathlib import Path
 from .cache import Cache
 from .models import SeriesGlossary
 from .prompts import Prompt, load_prompt, render_prompt
-from .provider import OpenRouterProvider
+from .provider import EmptyCompletionError, OpenRouterProvider
 from .series import render_for_prompt
 
 logger = logging.getLogger(__name__)
@@ -182,14 +182,14 @@ class Judge:
                 reasoning_effort=self.prompt.reasoning_effort,
             )
             raw_text = result.text
-            # Guard: empty content means the provider routed the answer
-            # elsewhere (tool call / reasoning_content). Raise BEFORE caching so
-            # a poisoned empty response is never written to the cache.
+            # Belt and braces: provider.complete() already raises on an empty
+            # response, but a stubbed provider might not, and an empty verdict
+            # must never reach the cache.
             if not raw_text.strip():
-                raise ValueError(
+                raise EmptyCompletionError(
                     "Judge model returned empty content "
-                    f"(finish_reason={result.finish_reason!r}). Check "
-                    "WEB_SEARCH_ENABLED / FAKE_REASONING on the gateway."
+                    f"(finish_reason={result.finish_reason!r}). Reasoning shares the "
+                    "response budget with the answer — lower reasoning_effort."
                 )
 
         # Validate BEFORE caching: _parse_judge_response raises on invalid JSON,

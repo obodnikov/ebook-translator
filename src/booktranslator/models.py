@@ -18,6 +18,11 @@ class ProviderConfig(BaseModel):
     base_url: str = "https://openrouter.ai/api/v1"
     api_key_env: str = "OPENROUTER_API_KEY"
     extra_headers: dict[str, str] = Field(default_factory=dict)
+    # Largest response this endpoint can return, in bytes. Reasoning and answer
+    # share it. None means no known ceiling (OpenRouter). kiro-gateway caps
+    # around 23 000 and gives no warning of its own — see
+    # docs/design/2026-08-03-judge-repair-stage-and-reasoning-on-gateway.md §4.
+    max_response_bytes: int | None = None
 
 
 class ProvidersConfig(BaseModel):
