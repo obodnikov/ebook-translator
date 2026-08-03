@@ -47,7 +47,7 @@ CREATE TABLE IF NOT EXISTS pipeline_meta (
 """
 
 # Waterfall order: later stages take priority over earlier ones.
-STAGE_WATERFALL = ["translate", "reflect", "proofread", "style", "verify"]
+STAGE_WATERFALL = ["translate", "reflect", "proofread", "style", "verify", "repair"]
 
 
 @dataclass

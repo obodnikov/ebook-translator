@@ -12,8 +12,11 @@ correctness requirement, not caution.
 
 from __future__ import annotations
 
+import pytest
+
 from booktranslator.repair import (
     MECHANICAL_CATEGORIES,
+    Repairer,
     Skip,
     apply_candidates,
     parse_issue,
@@ -184,3 +187,72 @@ class TestScope:
         out, out_paras = repaired(paras, [])
         assert out_paras == paras
         assert not out.candidates
+
+
+# ---------------------------------------------------------------------------
+# The stage class: verdict parsing and how it decides what to apply
+# ---------------------------------------------------------------------------
+
+
+class TestVerdictParsing:
+    def test_parses_a_plain_array(self):
+        out = Repairer.parse_verdicts(
+            '[{"n": 1, "verdict": "accept", "why": "род"},'
+            ' {"n": 2, "verdict": "reject", "why": "смысл"}]'
+        )
+        assert out == {1: (True, "род"), 2: (False, "смысл")}
+
+    def test_strips_code_fences(self):
+        out = Repairer.parse_verdicts('```json\n[{"n": 1, "verdict": "accept"}]\n```')
+        assert out[1][0] is True
+
+    def test_ignores_surrounding_commentary(self):
+        out = Repairer.parse_verdicts('Вот разбор:\n[{"n": 1, "verdict": "reject"}]\nГотово.')
+        assert out[1][0] is False
+
+    def test_unparseable_response_raises(self):
+        """A verdict list we cannot read must never mean "accept everything"."""
+        with pytest.raises(ValueError):
+            Repairer.parse_verdicts("Не могу выполнить эту задачу.")
+
+    def test_malformed_json_raises(self):
+        with pytest.raises(ValueError):
+            Repairer.parse_verdicts('[{"n": 1, "verdict": ]')
+
+    def test_entry_without_a_number_is_dropped(self):
+        out = Repairer.parse_verdicts('[{"verdict": "accept"}, {"n": 2, "verdict": "accept"}]')
+        assert out == {2: (True, "")}
+
+    def test_unknown_verdict_word_is_not_acceptance(self):
+        out = Repairer.parse_verdicts('[{"n": 1, "verdict": "maybe"}]')
+        assert out[1][0] is False
+
+
+class TestApplyingVerdicts:
+    """The decision rule, exercised without a provider."""
+
+    @staticmethod
+    def _decide(candidates, verdicts):
+        accepted = [c for i, c in enumerate(candidates, 1) if verdicts.get(i, (False, ""))[0]]
+        return apply_candidates(
+            ["<p>Рой мёртв.</p>", "<p>Ей было тридцать одного года.</p>"], accepted
+        )
+
+    def test_only_accepted_candidates_are_applied(self):
+        paras = ["<p>Рой мёртв.</p>", "<p>Ей было тридцать одного года.</p>"]
+        cands = propose(paras, [GENDER, NUMERAL]).candidates
+        out = self._decide(cands, {1: (True, ""), 2: (False, "")})
+        assert out[0] == "<p>Рой мертва.</p>"
+        assert out[1] == paras[1]
+
+    def test_a_missing_verdict_means_reject(self):
+        """Silence is not consent: an unanswered candidate is left alone."""
+        paras = ["<p>Рой мёртв.</p>", "<p>Ей было тридцать одного года.</p>"]
+        cands = propose(paras, [GENDER, NUMERAL]).candidates
+        out = self._decide(cands, {1: (True, "")})
+        assert out[1] == paras[1]
+
+    def test_rejecting_everything_leaves_the_chunk_untouched(self):
+        paras = ["<p>Рой мёртв.</p>", "<p>Ей было тридцать одного года.</p>"]
+        cands = propose(paras, [GENDER, NUMERAL]).candidates
+        assert self._decide(cands, {}) == paras

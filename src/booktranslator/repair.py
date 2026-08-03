@@ -22,9 +22,23 @@ Design: docs/design/2026-08-03-judge-repair-stage-and-reasoning-on-gateway.md §
 
 from __future__ import annotations
 
+import json
+import logging
 import re
+import threading
 from dataclasses import dataclass, field
 from enum import StrEnum
+from pathlib import Path
+
+from .cache import Cache
+from .models import SeriesGlossary
+from .prompts import Prompt, load_prompt, render_prompt
+from .provider import OpenRouterProvider
+from .series import render_for_prompt
+
+logger = logging.getLogger(__name__)
+
+LANG_NAMES = {"en": "English", "ru": "Russian", "hu": "Hungarian"}
 
 # Issue shape produced by prompts/judge.md v3:
 #   "grammar: p.11 «было тридцать одного года» → «было тридцать один год»"
@@ -183,3 +197,208 @@ def apply_candidates(paragraphs: list[str], candidates: list[Candidate]) -> list
             continue
         out[idx] = out[idx].replace(c.old, c.new, 1)
     return out
+
+
+# ---------------------------------------------------------------------------
+# The stage: propose, have a model vet each candidate, apply what survives
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class RepairStats:
+    chunks_total: int = 0
+    chunks_cached: int = 0
+    chunks_repaired: int = 0
+    chunks_failed: int = 0
+    candidates: int = 0
+    accepted: int = 0
+    rejected: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    # Issues nothing can act on yet: those whose fix belongs in the glossary,
+    # and those the deterministic pass could not turn into a substitution.
+    glossary_issues: list[tuple[str, str]] = field(default_factory=list)
+    unhandled: list[tuple[str, str]] = field(default_factory=list)
+
+
+@dataclass
+class RepairResult:
+    chunk_id: str
+    paragraphs: list[str]
+    accepted: list[tuple[Candidate, str]] = field(default_factory=list)
+    rejected: list[tuple[Candidate, str]] = field(default_factory=list)
+
+    @property
+    def changed(self) -> bool:
+        return bool(self.accepted)
+
+
+class Repairer:
+    """Applies the judge's mechanical corrections, one vetted candidate at a time."""
+
+    def __init__(
+        self,
+        provider: OpenRouterProvider,
+        prompt_path: Path,
+        cache: Cache,
+        glossary: SeriesGlossary | None,
+        *,
+        model: str,
+        categories: tuple[str, ...] = MECHANICAL_CATEGORIES,
+        source_lang: str = "en",
+        target_lang: str = "ru",
+    ):
+        self.provider = provider
+        self.prompt: Prompt = load_prompt(prompt_path)
+        self.cache = cache
+        self.model = model
+        self.categories = categories
+        self.source_lang = source_lang
+        self.target_lang = target_lang
+        self._glossary_block = render_for_prompt(glossary) if glossary else "(no glossary provided)"
+        self._lock = threading.Lock()
+
+    # -- response parsing ---------------------------------------------------
+
+    @staticmethod
+    def parse_verdicts(text: str) -> dict[int, tuple[bool, str]]:
+        """Parse the gatekeeper's JSON array into {n: (accepted, why)}.
+
+        Raises ValueError on anything unparseable: a verdict list we cannot
+        read must not be silently treated as "accept everything".
+        """
+        t = text.strip()
+        if t.startswith("```"):
+            t = "\n".join(ln for ln in t.splitlines() if not ln.startswith("```")).strip()
+        m = re.search(r"\[.*]", t, re.S)
+        if not m:
+            raise ValueError(f"Repair verdicts are not a JSON array. First 200 chars: {t[:200]!r}")
+        try:
+            data = json.loads(m.group(0))
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Repair verdicts are not valid JSON: {e}") from e
+
+        out: dict[int, tuple[bool, str]] = {}
+        for entry in data:
+            if not isinstance(entry, dict) or "n" not in entry:
+                continue
+            try:
+                n = int(entry["n"])
+            except (TypeError, ValueError):
+                continue
+            verdict = str(entry.get("verdict", "")).strip().lower()
+            out[n] = (verdict.startswith("accept"), str(entry.get("why", "")))
+        return out
+
+    # -- one chunk ----------------------------------------------------------
+
+    def repair_chunk(
+        self,
+        chunk_id: str,
+        paragraphs: list[str],
+        issues: list[str],
+        original_text: str,
+        stats: RepairStats,
+    ) -> RepairResult | None:
+        """Vet and apply the mechanical corrections for one chunk.
+
+        Returns None when there is nothing to do. Paragraph count is preserved
+        by construction — only quoted fragments are ever substituted.
+        """
+        proposal = propose(paragraphs, issues, self.categories)
+
+        with self._lock:
+            for issue in proposal.deferred:
+                stats.unhandled.append((chunk_id, issue.raw))
+
+        if not proposal.candidates:
+            return None
+
+        context = {
+            "source_lang": self.source_lang,
+            "source_lang_name": LANG_NAMES.get(self.source_lang, self.source_lang),
+            "target_lang": self.target_lang,
+            "target_lang_name": LANG_NAMES.get(self.target_lang, self.target_lang),
+            "glossary_block": self._glossary_block,
+            "original_text": original_text,
+            "candidates": [
+                {
+                    "paragraph": c.paragraph,
+                    "note": c.issue.raw,
+                    "paragraph_text": paragraphs[c.paragraph - 1],
+                    "old": c.old,
+                    "new": c.new,
+                }
+                for c in proposal.candidates
+            ],
+        }
+        system, user = render_prompt(self.prompt, context)
+
+        # The issue list is part of the key: re-running the judge must not
+        # serve a repair made from its previous verdicts.
+        cache_key = Cache.make_key("repair", self.model, self.prompt.version, system, user)
+        with self._lock:
+            cached = self.cache.get(cache_key)
+
+        if cached is not None:
+            raw_text = cached.content
+            result = None
+            with self._lock:
+                stats.chunks_cached += 1
+        else:
+            result = self.provider.complete(
+                model=self.model,
+                system=system,
+                user=user,
+                temperature=self.prompt.temperature,
+                max_tokens=self.prompt.max_tokens,
+                reasoning_effort=self.prompt.reasoning_effort,
+            )
+            raw_text = result.text
+
+        # Validate before caching, so an unreadable verdict list is never stored.
+        verdicts = self.parse_verdicts(raw_text)
+
+        accepted: list[tuple[Candidate, str]] = []
+        rejected: list[tuple[Candidate, str]] = []
+        for i, c in enumerate(proposal.candidates, 1):
+            ok, why = verdicts.get(i, (False, "нет вердикта — считаем отказом"))
+            (accepted if ok else rejected).append((c, why))
+
+        out_paragraphs = apply_candidates(paragraphs, [c for c, _ in accepted])
+        if len(out_paragraphs) != len(paragraphs):  # pragma: no cover - defensive
+            raise ValueError(
+                f"repair changed the paragraph count for {chunk_id}: "
+                f"{len(paragraphs)} -> {len(out_paragraphs)}"
+            )
+
+        if result is not None and accepted:
+            with self._lock:
+                self.cache.put(
+                    key=cache_key,
+                    stage="repair",
+                    model=self.model,
+                    prompt_version=self.prompt.version,
+                    content="\n".join(
+                        f"===PARAGRAPH {i}===\n{p}" for i, p in enumerate(out_paragraphs, 1)
+                    ),
+                    input_tokens=result.input_tokens,
+                    output_tokens=result.output_tokens,
+                    meta={"chunk_id": chunk_id, "accepted": len(accepted)},
+                )
+
+        with self._lock:
+            stats.candidates += len(proposal.candidates)
+            stats.accepted += len(accepted)
+            stats.rejected += len(rejected)
+            if result is not None:
+                stats.input_tokens += result.input_tokens
+                stats.output_tokens += result.output_tokens
+            if accepted:
+                stats.chunks_repaired += 1
+        for c, why in rejected:
+            logger.info("repair %s p.%d rejected: «%s» — %s", chunk_id, c.paragraph, c.old, why)
+
+        return RepairResult(
+            chunk_id=chunk_id, paragraphs=out_paragraphs, accepted=accepted, rejected=rejected
+        )

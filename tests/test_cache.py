@@ -228,12 +228,24 @@ class TestWaterfallResolution:
         assert cache.resolve_stage_for_chunk("ch01_c01") == "reflect"
 
     def test_full_waterfall(self, fresh_cache: Cache):
+        """With every stage present, the last one in the waterfall wins.
+
+        Asserted against the constant rather than a literal name, so adding a
+        stage does not need this test edited — only that the property holds.
+        """
         cache = fresh_cache
         for stage in STAGE_WATERFALL:
             cache.put(
                 f"k_{stage}", stage, "m", "v1", f"text_{stage}", meta={"chunk_id": "ch01_c01"}
             )
-        assert cache.resolve_stage_for_chunk("ch01_c01") == "verify"
+        assert cache.resolve_stage_for_chunk("ch01_c01") == STAGE_WATERFALL[-1]
+
+    def test_repair_beats_verify(self, fresh_cache: Cache):
+        """Repair is the final say: it edits what verify produced."""
+        cache = fresh_cache
+        cache.put("k1", "verify", "m", "v1", "v", meta={"chunk_id": "ch01_c01"})
+        cache.put("k2", "repair", "m", "v1", "r", meta={"chunk_id": "ch01_c01"})
+        assert cache.resolve_stage_for_chunk("ch01_c01") == "repair"
 
     def test_preference_overrides_waterfall(self, fresh_cache: Cache):
         cache = fresh_cache
