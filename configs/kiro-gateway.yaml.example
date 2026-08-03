@@ -65,6 +65,13 @@ providers:
     base_url: "https://openrouter.ai/api/v1"
     api_key_env: "OPENROUTER_API_KEY"
 
+  # Починка отвечает списком вердиктов «принять/отклонить» — ответ крошечный.
+  # Ей нужен оригинал и способность заметить, что грамматически убедительная
+  # правка переворачивает смысл, поэтому здесь важно размышление.
+  repair:
+    base_url: "https://openrouter.ai/api/v1"
+    api_key_env: "OPENROUTER_API_KEY"
+
   image:
     base_url: "https://openrouter.ai/api/v1"
     api_key_env: "OPENROUTER_API_KEY"
@@ -93,6 +100,7 @@ models:
   proofread:  anthropic/claude-haiku-4.5
   style:      claude-sonnet-4.6
   verify:     claude-sonnet-4.6
+  repair:     anthropic/claude-sonnet-4.6
 
 reflection:
   # Новый оценщик (промпт v3) строже прежнего: тройку получили 53 чанка из 81.
@@ -120,6 +128,14 @@ notifications:
 
 cost:
   hard_limit_usd: 50.0
+
+repair:
+  # Категории замечаний оценщика, которые стадия чинит. По умолчанию только те,
+  # где исправление — подстановка, а не суждение о вкусе. Замерено, что
+  # register и naturalness автоматике не по зубам, а accuracy слишком
+  # разнородна, чтобы включать её целиком.
+  enabled: true
+  categories: [grammar, glossary, markup]
 
 reader_notes:
   enabled: true
