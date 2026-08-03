@@ -1,59 +1,95 @@
-# Example: text/translation stages via kiro-gateway, glossary and image via OpenRouter.
+# Пример: тяжёлые по объёму стадии идут через локальный kiro-gateway,
+# короткие — через OpenRouter.
 #
-# Copy this to configs/default.yaml (or use --config path) to route
-# translation stages through kiro-gateway while keeping OpenRouter for
-# glossary extraction (needs full book context, no truncation) and cover
-# image generation.
+# Скопируйте этот файл в configs/default.yaml (или укажите путь через --config).
 #
-# Requires:
-#   - kiro-gateway running on localhost:9000
-#   - KIRO_GATEWAY_API_KEY set in .env (your PROXY_API_KEY from kiro-gateway)
-#   - OPENROUTER_API_KEY set in .env (for glossary + cover image generation)
+# Раскладка стадий по провайдерам не произвольная — она получена замерами,
+# описанными в docs/design/2026-08-03-judge-repair-stage-and-reasoning-on-gateway.md
+# §4. Коротко: у шлюза жёсткий предел на размер ответа, поэтому туда уходит то,
+# что даёт длинный ответ и не требует размышления, а на OpenRouter — то, что
+# отвечает коротко и выигрывает от размышления. Дорогая по объёму работа
+# остаётся бесплатной, платной становится дешёвая.
+#
+# Что нужно для работы:
+#   - kiro-gateway, запущенный на localhost:9000;
+#   - KIRO_GATEWAY_API_KEY в файле .env (это ваш PROXY_API_KEY из kiro-gateway);
+#   - OPENROUTER_API_KEY в .env (для глоссария, оценки, корректуры и обложки);
+#   - FAKE_REASONING=false в настройках самого шлюза — см. ниже, это
+#     обязательное условие.
+#
+# ВАЖНО: FAKE_REASONING на шлюзе должен быть выключен.
+# У Kiro нет отдельного канала для размышлений модели, поэтому шлюз подделывает
+# их: подмешивает в запрос служебные теги и вырезает из ответа помеченный кусок.
+# Размышление при этом расходует тот же бюджет ответа, что и сам текст. На
+# переводе оно съедает бюджет целиком, и ответ приходит пустым — проверено и при
+# 2000, и при 1200 слов в чанке. Параметр reasoning_effort от этого не спасает:
+# он отменяет вставку указаний, но разборщик ответа продолжает работать, пока
+# включён глобальный выключатель.
 
 source_lang: en
 target_lang: ru
 
 providers:
-  text:                       # default for all text stages (translate, judge, reflect, ...)
+  # Значение по умолчанию для всех текстовых стадий, у которых нет своей записи.
+  # Сюда попадают translate, style, verify и reflect — стадии с длинным ответом,
+  # которым размышление не помогает (замерено: у style и verify правки с ним и
+  # без него совпали дословно).
+  text:
     base_url: "http://localhost:9000/v1"
     api_key_env: "KIRO_GATEWAY_API_KEY"
-    # Ответ шлюза ограничен примерно 23 КБ, и размышление делит этот бюджет
-    # с самим ответом. Шлюз об обрыве не предупреждает: finish_reason приходит
-    # "stop" даже когда ответ пустой. Отсюда предупреждение в лог при
-    # приближении к пределу. Подробности и замеры — в
-    # docs/design/2026-08-03-judge-repair-stage-and-reasoning-on-gateway.md §4.
-    max_response_bytes: 23000
-  glossary:                   # whole book -> needs large context without truncation
+    # Порог предупреждения о размере ответа, в байтах.
+    # Это не точный предел шлюза, а осторожная граница: полный ответ на
+    # 23 644 байта проходил, а ответ на 26 825 байт обрывался посреди JSON.
+    # Настоящий предел, судя по всему, считается в токенах, а не в байтах,
+    # поэтому для русского текста он наступает раньше — кириллица занимает
+    # два байта на знак.
+    # Шлюз об обрыве не сообщает: finish_reason приходит "stop" даже когда
+    # ответ пустой. Отсюда и предупреждение в журнале при приближении к границе.
+    max_response_bytes: 24000
+
+  # Глоссарий читает книгу целиком и отдаёт список на сотню статей. Через шлюз
+  # такой ответ обрывается — проверено, оборвалось на 26 825 байтах посреди JSON.
+  glossary:
     base_url: "https://openrouter.ai/api/v1"
     api_key_env: "OPENROUTER_API_KEY"
-  judge:                   # whole book -> needs large context without truncation
+
+  # Оценщик отвечает коротким разбором (около полутора килобайт), поэтому стоит
+  # копейки. Размышление ему нужно: без него он ставил пятёрки почти всему.
+  judge:
     base_url: "https://openrouter.ai/api/v1"
     api_key_env: "OPENROUTER_API_KEY"
-  reflect:                   # whole book -> needs large context without truncation
+
+  # Корректор отдаёт только изменённые абзацы — тоже дёшево. Размышление даёт
+  # измеримый выигрыш: три найденные ошибки согласования из трёх против двух.
+  proofread:
     base_url: "https://openrouter.ai/api/v1"
     api_key_env: "OPENROUTER_API_KEY"
-  proofread:                   # whole book -> needs large context without truncation
-    base_url: "https://openrouter.ai/api/v1"
-    api_key_env: "OPENROUTER_API_KEY"
+
   image:
     base_url: "https://openrouter.ai/api/v1"
     api_key_env: "OPENROUTER_API_KEY"
 
 chunker:
+  # Меньше, чем в конфигурации по умолчанию, именно из-за предела на размер
+  # ответа у шлюза. При 2000 слов перевод занимал до 99,9% этого предела —
+  # запаса не оставалось совсем. При 1200 самый крупный чанк книги дал 14 224
+  # байта, то есть около 60%.
+  # Менять это значение задним числом дорого: сдвигаются границы чанков, и весь
+  # накопленный перевод в кэше обесценивается.
   target_words: 1200
   overlap_paragraphs: 1
 
 translate:
   parallelism: 1
 
-# Model names must match your provider's format.
-# - kiro-gateway: short names without prefix (claude-sonnet-4.6)
-# - OpenRouter: anthropic/ prefix required (anthropic/claude-sonnet-4.6)
+# Имена моделей должны быть записаны в формате своего провайдера:
+#   - kiro-gateway — короткое имя без приставки (claude-sonnet-4.6);
+#   - OpenRouter — с приставкой anthropic/ (anthropic/claude-sonnet-4.6).
 models:
   glossary:   anthropic/claude-sonnet-4.6
   translate:  claude-sonnet-4.6
   judge:      anthropic/claude-haiku-4.5
-  reflect:    anthropic/claude-sonnet-4.6
+  reflect:    claude-sonnet-4.6
   proofread:  anthropic/claude-haiku-4.5
   style:      claude-sonnet-4.6
   verify:     claude-sonnet-4.6
