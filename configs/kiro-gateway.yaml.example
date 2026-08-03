@@ -17,6 +17,12 @@ providers:
   text:                       # default for all text stages (translate, judge, reflect, ...)
     base_url: "http://localhost:9000/v1"
     api_key_env: "KIRO_GATEWAY_API_KEY"
+    # Ответ шлюза ограничен примерно 23 КБ, и размышление делит этот бюджет
+    # с самим ответом. Шлюз об обрыве не предупреждает: finish_reason приходит
+    # "stop" даже когда ответ пустой. Отсюда предупреждение в лог при
+    # приближении к пределу. Подробности и замеры — в
+    # docs/design/2026-08-03-judge-repair-stage-and-reasoning-on-gateway.md §4.
+    max_response_bytes: 23000
   glossary:                   # whole book -> needs large context without truncation
     base_url: "https://openrouter.ai/api/v1"
     api_key_env: "OPENROUTER_API_KEY"
@@ -34,7 +40,7 @@ providers:
     api_key_env: "OPENROUTER_API_KEY"
 
 chunker:
-  target_words: 2000
+  target_words: 1200
   overlap_paragraphs: 1
 
 translate:

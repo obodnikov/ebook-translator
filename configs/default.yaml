@@ -19,7 +19,7 @@ providers:
     api_key_env: "OPENROUTER_API_KEY"
 
 chunker:
-  target_words: 2000
+  target_words: 1200
   overlap_paragraphs: 1
 
 translate:
