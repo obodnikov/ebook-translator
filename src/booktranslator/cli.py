@@ -1661,6 +1661,163 @@ def verify_cmd(
     )
 
 
+@app.command("repair")
+def repair_cmd(
+    epub: Path = typer.Argument(..., exists=True, dir_okay=False, help="Source EPUB."),
+    series: str | None = typer.Option(
+        None, "--series", "-s", help="Series slug for glossary context."
+    ),
+    glossary_path: Path | None = typer.Option(
+        None,
+        "--glossary",
+        "-g",
+        exists=True,
+        dir_okay=False,
+        help="Path to a single-book glossary.json.",
+    ),
+    config_path: Path = typer.Option(DEFAULT_CONFIG, "--config", "-c", help="YAML config file."),
+    work_dir: Path = typer.Option(
+        DEFAULT_WORK_DIR, "--work", "-w", help="Base directory for artifacts."
+    ),
+    model: str | None = typer.Option(None, "--model", "-m", help="Override the repair model."),
+    categories: str | None = typer.Option(
+        None,
+        "--categories",
+        help="Comma-separated judge categories to act on (default: grammar,glossary,markup).",
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Show what would be proposed without calling a model or writing anything.",
+    ),
+) -> None:
+    """Apply the judge's mechanical corrections, one vetted fix at a time.
+
+    Each correction the judge quoted is turned into a candidate substitution,
+    and a model holding the original decides whether it preserves the meaning.
+    Rejected candidates are left alone: a wrong correction is printed in a
+    book, a missed one is not.
+
+    Requires a judge pass. Reads the latest available stage and stores results
+    as stage='repair'.
+    """
+    from .pipeline_helpers import (
+        collect_chunk_originals,
+        collect_waterfall_paragraphs,
+        normalize_judge_map,
+        verify_chunker_params,
+    )
+    from .repair import Repairer, RepairStats, propose
+
+    cfg = load_config(config_path if config_path.exists() else None)
+    wanted = tuple(
+        c.strip() for c in (categories.split(",") if categories else cfg.repair.categories)
+    )
+
+    console.print(f"[bold]Reading EPUB:[/bold] {epub}")
+    book = read_book_structured(epub)
+    console.print(f"[bold]Book:[/bold] {book.meta.title}")
+
+    glossary = _resolve_glossary(series, glossary_path, work_dir, cfg, book)
+    wd = WorkDir.for_book(work_dir, book.meta.title)
+    cache = Cache(wd.cache_path)
+
+    try:
+        judge_map = normalize_judge_map(cache.get_judge_scores())
+        if not judge_map:
+            console.print("[red]No judge results found. Run 'btrans judge' first.[/red]")
+            raise typer.Exit(code=1)
+
+        try:
+            verify_chunker_params(cache, cfg.chunker.target_words, cfg.chunker.overlap_paragraphs)
+        except ChunkerConfigMismatchError as e:
+            console.print(f"[red]Error:[/red] {e}")
+            raise typer.Exit(code=1) from e
+
+        chunk_set = chunk_book(
+            book,
+            target_words=cfg.chunker.target_words,
+            overlap_paragraphs=cfg.chunker.overlap_paragraphs,
+        )
+        paragraph_counts = {chunk.id: len(chunk.paragraph_indexes) for chunk in chunk_set.chunks}
+        chunk_ids = [c.id for c in chunk_set.chunks if c.id in judge_map]
+        waterfall = collect_waterfall_paragraphs(cache, chunk_ids, "repair", paragraph_counts)
+        if not waterfall:
+            console.print("[yellow]No chunks with parseable translations to repair.[/yellow]")
+            return
+
+        console.print(f"[bold]Categories:[/bold] {', '.join(wanted)}")
+
+        if dry_run:
+            total = sum(
+                len(propose(paras, judge_map[cid]["issues"], wanted).candidates)
+                for cid, paras in waterfall.items()
+            )
+            console.print(
+                f"[bold]Dry run:[/bold] {total} candidate substitutions across "
+                f"{len(waterfall)} chunks. Nothing called, nothing written."
+            )
+            return
+
+        originals = collect_chunk_originals(chunk_set, list(waterfall))
+        chosen_model = model or cfg.models.repair
+        console.print(f"[bold]Model:[/bold] {chosen_model}\n")
+
+        repairer = Repairer(
+            provider=create_stage_provider(cfg, "repair"),
+            prompt_path=Path("prompts/repair.md"),
+            cache=cache,
+            glossary=glossary,
+            model=chosen_model,
+            categories=wanted,
+            source_lang=cfg.source_lang,
+            target_lang=cfg.target_lang,
+        )
+
+        stats = RepairStats(chunks_total=len(waterfall))
+        with Progress(
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            MofNCompleteColumn(),
+            TimeElapsedColumn(),
+            console=console,
+        ) as progress:
+            task = progress.add_task("repair", total=len(waterfall))
+            for done, (cid, paras) in enumerate(sorted(waterfall.items()), 1):
+                try:
+                    repairer.repair_chunk(
+                        cid, paras, judge_map[cid]["issues"], originals.get(cid, ""), stats
+                    )
+                except Exception as e:  # noqa: BLE001
+                    stats.chunks_failed += 1
+                    console.print(f"[yellow]{cid}: {type(e).__name__}: {e}[/yellow]")
+                progress.update(
+                    task,
+                    completed=done,
+                    description=(
+                        f"repair | accepted {stats.accepted} "
+                        f"rejected {stats.rejected} failed {stats.chunks_failed}"
+                    ),
+                )
+
+        console.print(
+            f"\n[bold]Repair results:[/bold]\n"
+            f"  Candidates: {stats.candidates}\n"
+            f"  Applied:    {stats.accepted}\n"
+            f"  Rejected:   {stats.rejected}\n"
+            f"  Chunks changed: {stats.chunks_repaired}/{stats.chunks_total}\n"
+            f"  Failed: {stats.chunks_failed}\n"
+            f"[dim]Tokens: {stats.input_tokens:,} in, {stats.output_tokens:,} out.[/dim]"
+        )
+        if stats.unhandled:
+            console.print(
+                f"\n[dim]{len(stats.unhandled)} issues could not be turned into a "
+                f"substitution and were left for a human.[/dim]"
+            )
+    finally:
+        cache.close()
+
+
 # ---------------------------------------------------------------------------
 # shared postprocess runner
 # ---------------------------------------------------------------------------

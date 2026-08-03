@@ -49,6 +49,7 @@ _TEXT_STAGES = (
     "proofread",
     "style",
     "verify",
+    "repair",
 )
 
 

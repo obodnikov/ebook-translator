@@ -40,6 +40,7 @@ class ProvidersConfig(BaseModel):
     proofread: ProviderConfig | None = None
     style: ProviderConfig | None = None
     verify: ProviderConfig | None = None
+    repair: ProviderConfig | None = None
 
 
 class ModelsConfig(BaseModel):
@@ -50,6 +51,7 @@ class ModelsConfig(BaseModel):
     proofread: str = "anthropic/claude-haiku-4.5"
     style: str = "anthropic/claude-sonnet-4.6"
     verify: str = "anthropic/claude-sonnet-4.6"
+    repair: str = "anthropic/claude-sonnet-4.6"
     cover: str = "google/gemini-3.1-flash-image-preview"
 
 
@@ -125,6 +127,20 @@ _LANG_NAME_MAP: dict[str, str] = {
 }
 
 
+class RepairConfig(BaseModel):
+    """Targeted repair of the judge's findings.
+
+    `categories` lists which judge issue categories the stage acts on. The
+    default is the mechanical three, where a correction is a substitution
+    rather than a judgement call: register and naturalness were measured to be
+    beyond automatic repair, and accuracy is too mixed to enable wholesale
+    (docs/design/2026-08-03-judge-repair-stage-and-reasoning-on-gateway.md §5).
+    """
+
+    enabled: bool = True
+    categories: list[str] = Field(default_factory=lambda: ["grammar", "glossary", "markup"])
+
+
 class Config(BaseModel):
     source_lang: str = "en"
     target_lang: str = "ru"
@@ -141,6 +157,7 @@ class Config(BaseModel):
     retry: RetryConfig = Field(default_factory=RetryConfig)
     notifications: NotificationsConfig = Field(default_factory=NotificationsConfig)
     reader_notes: ReaderNotesConfig = Field(default_factory=ReaderNotesConfig)
+    repair: RepairConfig = Field(default_factory=RepairConfig)
     cost: CostConfig = Field(default_factory=CostConfig)
 
     def resolved_target_lang_name(self) -> str | None:
