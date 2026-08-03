@@ -25,6 +25,7 @@ models:
   proofread:  anthropic/claude-haiku-4.5
   style:      anthropic/claude-sonnet-4.6
   verify:     anthropic/claude-sonnet-4.6
+  repair:     anthropic/claude-sonnet-4.6
 
 reflection:
   # Порог 2, а не 3: оценщик стал строже, и при 3 на полную переделку уходит
@@ -50,6 +51,15 @@ notifications:
 
 cost:
   hard_limit_usd: 50.0
+
+repair:
+  # Точечная починка замечаний оценщика: правится только названная им фраза.
+  # Категории по умолчанию — те, где исправление сводится к подстановке,
+  # а не к суждению о вкусе.
+  enabled: true
+  # Оценщик выдаёт шесть категорий: grammar, accuracy, naturalness, register,
+  # glossary, markup. Включены три механические.
+  categories: [grammar, glossary, markup]
 
 reader_notes:
   enabled: true
