@@ -37,7 +37,9 @@ models:
   verify:     anthropic/claude-sonnet-4.6
 
 reflection:
-  trigger_score: 3
+  # Порог 2, а не 3: оценщик стал строже, и при 3 на полную переделку уходит
+  # большая часть книги ради одной-двух фраз.
+  trigger_score: 2
 
 pauses:
   after_glossary: true
