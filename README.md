@@ -126,6 +126,7 @@ OPENROUTER_API_KEY=sk-or-v1-...
 | `proofread` | корректура |
 | `style` | стилистика |
 | `verify` | сверка |
+| `repair` | починка замечаний оценщика |
 
 > ⚠️ Имя стадии должно **совпадать точно**. Незнакомые ключи в `providers`
 > молча игнорируются (стадия тихо уйдёт на `text`) — сверяйтесь с таблицей.
@@ -242,6 +243,7 @@ providers:
 | `glossary` | OpenRouter | на шлюзе ответ обрывается |
 | `judge` | OpenRouter | ответ около 1,5 КБ, значит дёшево; размышление нужно |
 | `proofread` | OpenRouter | правки мелкие, значит дёшево; размышление нужно |
+| `repair` | OpenRouter | ответ — короткий список «принять/отклонить»; размышление нужно |
 
 Готовый пример такой раскладки — [`configs/kiro-gateway.yaml.example`](configs/kiro-gateway.yaml.example).
 
@@ -259,6 +261,7 @@ providers:
 | `btrans proofread` | `proofread` → иначе `text` |
 | `btrans style` | `style` → иначе `text` |
 | `btrans verify` | `verify` → иначе `text` |
+| `btrans repair` | `repair` → иначе `text` |
 | `btrans translate --cover` | **`image`** (opt-in) |
 | `btrans cover translate` | **`image`** |
 | `btrans cover replace` / `extract` | — (не вызывает LLM) |
@@ -722,6 +725,45 @@ btrans verify books/extracted/broken-homes-ben-aaronovitch.epub \
 Результаты хранятся как отдельные этапы в кэше. Ничего не
 перезаписывается — можно откатить через `btrans prefer`.
 
+### Точечная починка замечаний оценщика (`repair`)
+
+Три прохода выше переписывают текст целиком и могут задеть то, что было в
+порядке. Починка работает иначе: она берёт замечания, которые оценщик уже
+сформулировал, и меняет **только процитированную фразу**, не трогая остальной
+абзац.
+
+Требуется пройденная оценка (`btrans judge`) — без неё чинить нечего.
+
+```bash
+# Посмотреть, что было бы предложено, ничего не вызывая и не записывая
+btrans repair books/extracted/broken-homes-ben-aaronovitch.epub \
+  --series rivers-of-london --dry-run
+
+# Применить
+btrans repair books/extracted/broken-homes-ben-aaronovitch.epub \
+  --series rivers-of-london
+```
+
+Как это устроено. Каждое замечание разбирается в тройку «абзац, что заменить,
+на что». Берутся только те, где процитированная фраза встречается в названном
+абзаце **ровно один раз** — иначе непонятно, что именно менять. Дальше по
+каждому кандидату модель, у которой на руках оригинал, решает, сохраняется ли
+смысл. Отклонённое остаётся как было: неверная правка попадает в напечатанную
+книгу, пропущенная — нет. Кандидат, по которому вердикта не пришло, считается
+отклонённым — молчание не согласие.
+
+Категории замечаний задаются в конфигурации (`repair.categories`) или ключом
+`--categories`. По умолчанию включены три механические — `grammar`, `glossary`,
+`markup`, — где исправление сводится к подстановке. Оценщик выдаёт ещё три:
+`accuracy`, `naturalness`, `register`. Их автоматика не тянет: замеры показали,
+что вкусовые правки она делает хуже, чем не делает вовсе.
+
+> ⚠️ Починка не запустится, если `chunker.target_words` в конфигурации не
+> совпадает с тем, при котором книга переводилась: границы фрагментов сдвинутся
+> и накопленный кэш не состыкуется. Это же значит, что **починить нынешнюю
+> книгу и перевести её заново с другим размером фрагмента — взаимоисключающие
+> вещи.**
+
 ### Управление сборкой (prefer / assemble)
 
 ```bash
@@ -743,6 +785,10 @@ btrans assemble work/broken-homes/ --from reflect --epub book.epub --out reflect
 btrans assemble work/broken-homes/ --from proofread --epub book.epub --out proofread.epub
 btrans assemble work/broken-homes/ --from style --epub book.epub --out styled.epub
 ```
+
+Цепочка этапов при сборке: `translate` → `reflect` → `proofread` → `style` →
+`verify` → `repair`. Берётся последний доступный, поэтому починка, если она
+проходила, побеждает сверку.
 
 ### Читательские сноски из словаря (reader notes)
 
@@ -1035,7 +1081,8 @@ ebook-translator/
 ├── configs/
 │   ├── default.yaml              # активный конфиг (загружается по умолчанию)
 │   ├── default.yaml.example      # шаблон: всё через OpenRouter
-│   └── kiro-gateway.yaml.example # шаблон: text→kiro-gateway, glossary+image→OpenRouter
+│   └── kiro-gateway.yaml.example # шаблон: длинные ответы→kiro-gateway,
+│                                 #   короткие с размышлением + image→OpenRouter
 ├── prompts/
 │   ├── glossary_extract.md
 │   ├── translate.md
@@ -1044,6 +1091,7 @@ ebook-translator/
 │   ├── proofread.md
 │   ├── style.md
 │   ├── verify.md
+│   ├── repair.md
 │   └── cover_translate.md
 ├── src/booktranslator/      # исходный код пакета
 ├── tools/split_epub.py      # отдельный скрипт для антологий
