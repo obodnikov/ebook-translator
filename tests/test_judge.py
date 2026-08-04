@@ -359,3 +359,79 @@ class TestJudgeCacheIntegration:
         # Waterfall should still resolve to translate (judge is not in waterfall)
         resolved = cache.resolve_stage_for_chunk("ch01_c01")
         assert resolved == "translate"
+
+
+class TestFreshRunKeepsEarlierVerdicts:
+    """`--no-cache` starts a run id that joins the cache key, so scoring the
+    same text twice measures the judge's own spread instead of overwriting the
+    first answer with the second.
+    """
+
+    @staticmethod
+    def _judge(provider, prompt_path, cache, run_id=None):
+        return Judge(
+            provider=provider,
+            prompt_path=prompt_path,
+            cache=cache,
+            glossary=None,
+            model="anthropic/claude-haiku-4.5",
+            source_lang="en",
+            target_lang="ru",
+            judged_stage="translate",
+            run_id=run_id,
+        )
+
+    @staticmethod
+    def _reply(text):
+        r = MagicMock()
+        r.text = text
+        r.input_tokens = 10
+        r.output_tokens = 10
+        r.finish_reason = "stop"
+        return r
+
+    def test_second_run_adds_a_verdict_instead_of_replacing_it(
+        self, mock_provider, judge_prompt_path, cache
+    ):
+        from booktranslator.judge import JudgeStats
+
+        mock_provider.complete.return_value = self._reply('{"score": 2, "issues": ["a"]}')
+        first = self._judge(mock_provider, judge_prompt_path, cache)
+        first.judge_chunk("c1", "original", "перевод", JudgeStats(chunks_total=1))
+
+        mock_provider.complete.return_value = self._reply('{"score": 4, "issues": []}')
+        second = self._judge(mock_provider, judge_prompt_path, cache, run_id="run-x")
+        second.judge_chunk("c1", "original", "перевод", JudgeStats(chunks_total=1))
+
+        scores = sorted(s["score"] for s in cache.get_judge_scores())
+        assert scores == [2, 4], "both verdicts on the same text must survive"
+
+    def test_without_a_run_id_the_same_text_is_served_from_cache(
+        self, mock_provider, judge_prompt_path, cache
+    ):
+        from booktranslator.judge import JudgeStats
+
+        mock_provider.complete.return_value = self._reply('{"score": 2, "issues": []}')
+        j = self._judge(mock_provider, judge_prompt_path, cache)
+        j.judge_chunk("c1", "original", "перевод", JudgeStats(chunks_total=1))
+
+        stats = JudgeStats(chunks_total=1)
+        j.judge_chunk("c1", "original", "перевод", stats)
+        assert stats.chunks_cached == 1
+        assert mock_provider.complete.call_count == 1
+
+    def test_the_same_run_id_resumes_rather_than_re_asking(
+        self, mock_provider, judge_prompt_path, cache
+    ):
+        """An interrupted measurement restarts without paying twice."""
+        from booktranslator.judge import JudgeStats
+
+        mock_provider.complete.return_value = self._reply('{"score": 3, "issues": []}')
+        j = self._judge(mock_provider, judge_prompt_path, cache, run_id="run-x")
+        j.judge_chunk("c1", "original", "перевод", JudgeStats(chunks_total=1))
+
+        stats = JudgeStats(chunks_total=1)
+        again = self._judge(mock_provider, judge_prompt_path, cache, run_id="run-x")
+        again.judge_chunk("c1", "original", "перевод", stats)
+        assert stats.chunks_cached == 1
+        assert mock_provider.complete.call_count == 1

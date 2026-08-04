@@ -65,6 +65,7 @@ class Judge:
         source_lang: str = "en",
         target_lang: str = "ru",
         judged_stage: str = "translate",
+        run_id: str | None = None,
     ):
         self.provider = provider
         self.prompt: Prompt = load_prompt(prompt_path)
@@ -77,6 +78,11 @@ class Judge:
         # scoring a second stage does not leave the cache holding two verdicts
         # per chunk with no way to tell them apart.
         self.judged_stage = judged_stage
+        # Set to start a fresh measurement: it joins the cache key, so this
+        # run neither reads nor overwrites earlier verdicts on the same text.
+        # Reusing the same id resumes that run from its own cached rows, which
+        # is what makes an interrupted variance measurement restartable.
+        self.run_id = run_id
 
         self._glossary_block = render_for_prompt(glossary) if glossary else "(no glossary provided)"
         self._lock = threading.Lock()
@@ -161,13 +167,10 @@ class Judge:
         context = self._build_context(original_text, translated_text)
         system, user = render_prompt(self.prompt, context)
 
-        cache_key = Cache.make_key(
-            "judge",
-            self.model,
-            self.prompt.version,
-            system,
-            user,
-        )
+        key_parts = ["judge", self.model, self.prompt.version, system, user]
+        if self.run_id:
+            key_parts.append(self.run_id)
+        cache_key = Cache.make_key(*key_parts)
 
         with self._lock:
             cached = self.cache.get(cache_key)
@@ -212,7 +215,11 @@ class Judge:
                     content=raw_text,
                     input_tokens=result.input_tokens,
                     output_tokens=result.output_tokens,
-                    meta={"chunk_id": chunk_id, "judged_stage": self.judged_stage},
+                    meta={
+                        "chunk_id": chunk_id,
+                        "judged_stage": self.judged_stage,
+                        **({"run": self.run_id} if self.run_id else {}),
+                    },
                 )
                 stats.chunks_judged += 1
                 stats.input_tokens += result.input_tokens

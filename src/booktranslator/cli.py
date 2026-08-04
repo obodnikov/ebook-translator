@@ -11,6 +11,7 @@ Commands:
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime
 from pathlib import Path
 
 import click
@@ -1166,6 +1167,20 @@ def judge_cmd(
         "-j",
         help="Number of chunks to judge concurrently.",
     ),
+    no_cache: bool = typer.Option(
+        False,
+        "--no-cache",
+        help=(
+            "Score every chunk again, ignoring cached verdicts. Results are stored "
+            "under a fresh run id, so the existing verdicts survive — this is how the "
+            "judge's own spread gets measured: score the same text twice and compare."
+        ),
+    ),
+    limit_chunks: int | None = typer.Option(
+        None,
+        "--limit-chunks",
+        help=("Score only the first N chunks. Sampling instead of paying for the whole book."),
+    ),
     from_stage: str = typer.Option(
         "translate",
         "--from",
@@ -1233,6 +1248,12 @@ def judge_cmd(
         chunk_translations = collect_stage_translations(cache, stage_ids, stage=from_stage)
 
     judgeable_ids = sorted(set(chunk_originals.keys()) & set(chunk_translations.keys()))
+    if limit_chunks is not None:
+        judgeable_ids = judgeable_ids[:limit_chunks]
+
+    run_id = f"run-{datetime.now(UTC):%Y%m%dT%H%M%SZ}" if no_cache else None
+    if run_id:
+        console.print(f"[bold]Fresh run:[/bold] {run_id} (cached verdicts left untouched)")
     console.print(f"[bold]Judging stage:[/bold] {from_stage}")
     console.print(f"[bold]Chunks to judge:[/bold] {len(judgeable_ids)}")
     if from_stage != "translate":
@@ -1255,6 +1276,7 @@ def judge_cmd(
         source_lang=cfg.source_lang,
         target_lang=cfg.target_lang,
         judged_stage=from_stage,
+        run_id=run_id,
     )
 
     if parallelism is not None and parallelism < 1:
