@@ -53,13 +53,16 @@ cost:
   hard_limit_usd: 50.0
 
 repair:
-  # Точечная починка замечаний оценщика: правится только названная им фраза.
-  # Категории по умолчанию — те, где исправление сводится к подстановке,
-  # а не к суждению о вкусе.
-  enabled: true
+  # Точечная починка замечаний оценщика: правится только названная им фраза,
+  # остальной абзац не трогается.
+  #
   # Оценщик выдаёт шесть категорий: grammar, accuracy, naturalness, register,
-  # glossary, markup. Включены три механические.
-  categories: [grammar, glossary, markup]
+  # glossary, markup. Включены три, где исправление сводится к подстановке.
+  # Замер на «Bear Head» (36 кандидатов через привратника): отклонено 3 из 11
+  # у grammar, 7 из 20 у accuracy, 4 из 5 у glossary — поэтому accuracy в
+  # списке, а glossary нет. register и naturalness автоматике не по зубам.
+  enabled: true
+  categories: [grammar, markup, accuracy]
 
 reader_notes:
   enabled: true

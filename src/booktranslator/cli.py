@@ -1696,7 +1696,7 @@ def repair_cmd(
     categories: str | None = typer.Option(
         None,
         "--categories",
-        help="Comma-separated judge categories to act on (default: grammar,glossary,markup).",
+        help="Comma-separated judge categories to act on (default: grammar,markup,accuracy).",
     ),
     dry_run: bool = typer.Option(
         False,

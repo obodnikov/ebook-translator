@@ -66,13 +66,13 @@ repair:
   # Точечная починка замечаний оценщика: правится только названная им фраза,
   # остальной абзац не трогается.
   #
-  # Оценщик выдаёт шесть категорий замечаний: grammar, accuracy, naturalness,
-  # register, glossary, markup. По умолчанию починка берётся за три
-  # механические — те, где исправление сводится к подстановке, а не к суждению
-  # о вкусе. Замерено, что register и naturalness автоматике не по зубам,
-  # а accuracy слишком разнородна, чтобы включать её целиком.
+  # Оценщик выдаёт шесть категорий: grammar, accuracy, naturalness, register,
+  # glossary, markup. Включены три, где исправление сводится к подстановке.
+  # Замер на «Bear Head» (36 кандидатов через привратника): отклонено 3 из 11
+  # у grammar, 7 из 20 у accuracy, 4 из 5 у glossary — поэтому accuracy в
+  # списке, а glossary нет. register и naturalness автоматике не по зубам.
   enabled: true
-  categories: [grammar, glossary, markup]
+  categories: [grammar, markup, accuracy]
 
 reader_notes:
   enabled: false

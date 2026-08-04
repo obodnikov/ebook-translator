@@ -131,14 +131,18 @@ class RepairConfig(BaseModel):
     """Targeted repair of the judge's findings.
 
     `categories` lists which judge issue categories the stage acts on. The
-    default is the mechanical three, where a correction is a substitution
-    rather than a judgement call: register and naturalness were measured to be
-    beyond automatic repair, and accuracy is too mixed to enable wholesale
-    (docs/design/2026-08-03-judge-repair-stage-and-reasoning-on-gateway.md §5).
+    default holds those where a correction is a substitution rather than a
+    judgement call. Register and naturalness were measured to be beyond
+    automatic repair and stay out.
+
+    Accuracy was excluded on the assumption that it was "too mixed"; measuring
+    it disproved that, and the same run disqualified glossary instead — see
+    docs/design/2026-08-03-judge-repair-stage-and-reasoning-on-gateway.md §5
+    for the counts.
     """
 
     enabled: bool = True
-    categories: list[str] = Field(default_factory=lambda: ["grammar", "glossary", "markup"])
+    categories: list[str] = Field(default_factory=lambda: ["grammar", "markup", "accuracy"])
 
 
 class Config(BaseModel):

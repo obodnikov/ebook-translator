@@ -49,7 +49,15 @@ _PAIR_RE = re.compile(r"«([^«»]{2,})»\s*(?:→|->)\s*«([^«»]{1,})»")
 
 # Categories the first pass acts on. Kept here as the default; callers may
 # narrow or widen it from config without touching this module.
-MECHANICAL_CATEGORIES = ("grammar", "glossary", "markup")
+#
+# Measured on Bear Head, 36 candidates through the gatekeeper: grammar was
+# rejected 3 of 11, accuracy 7 of 20, glossary 4 of 5. Accuracy behaves like
+# grammar and carries the most defects, so it is in. Glossary is out: the
+# judge's glossary notes tend to be judgement calls (reordering a character's
+# name, swapping one coined term for another) rather than substitutions.
+# Re-enable it for a
+# single run with --categories when a book leans on its glossary.
+MECHANICAL_CATEGORIES = ("grammar", "markup", "accuracy")
 
 
 class Skip(StrEnum):

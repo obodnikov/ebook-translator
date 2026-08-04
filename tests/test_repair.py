@@ -171,7 +171,18 @@ class TestDeferral:
 
 class TestScope:
     def test_default_categories_are_the_mechanical_three(self):
-        assert MECHANICAL_CATEGORIES == ("grammar", "glossary", "markup")
+        # Set by measurement, not taste: on Bear Head the gatekeeper rejected
+        # 3 of 11 grammar candidates, 7 of 20 accuracy, and 4 of 5 glossary.
+        # Accuracy behaves like grammar; glossary's notes are judgement calls.
+        assert MECHANICAL_CATEGORIES == ("grammar", "markup", "accuracy")
+
+    def test_glossary_is_not_repaired_by_default(self):
+        paras = ["<p>Мартен Джеймс Каспиан</p>"]
+        out, out_paras = repaired(
+            paras, ["glossary: p.1 «Мартен Джеймс Каспиан» → «Джеймс Каспиан Мартен»"]
+        )
+        assert out_paras == paras
+        assert not out.candidates
 
     def test_scope_can_be_widened_by_the_caller(self):
         paras = ["<p>куда больше</p>"]
