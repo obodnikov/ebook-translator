@@ -1,5 +1,5 @@
 ---
-version: 4
+version: 5
 model: anthropic/claude-haiku-4.5
 temperature: 0.2
 max_tokens: 16000
@@ -17,7 +17,10 @@ You will receive a translated text as XHTML paragraphs (marked
 
 1. **Spelling errors** — typos, wrong letters.
 2. **Punctuation** — missing or misplaced commas, periods, dashes,
-   quotation marks (use « » for {{ target_lang_name }} dialogue).
+   quotation marks. Never change how dialogue is marked: a paragraph that
+   opens with an em dash keeps its em dash. Guillemets « » are for speech
+   quoted inline, titles and quoted words — and carry no space inside them
+   («так», not « так »).
 3. **Grammar** — agreement errors, wrong case, wrong verb form.
 4. **Typographical issues** — double spaces, wrong dash type (use —
    for em-dash), missing non-breaking spaces where required.

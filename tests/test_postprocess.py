@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -1399,3 +1400,69 @@ class TestCacheLifecycle:
         assert entry is not None
         assert entry.content == "test"
         cache2.close()
+
+
+class TestDialogueDashIsProtected:
+    """Russian dialogue opens a paragraph with an em dash; guillemets are for
+    speech quoted inline. The proofread prompt asked for « » outright, models
+    obliged, and 8 paragraphs of Bear Head lost their dashes. The prompt says
+    the opposite now (v5); this refuses the change if a model does it anyway.
+
+    One patch is dropped, not the whole chunk: rejecting everything would throw
+    away the pass's real corrections over a punctuation slip.
+    """
+
+    @pytest.mark.parametrize(
+        "before,after",
+        [
+            # the three shapes seen in the book
+            (
+                '<p class="indent">— Он своё получит.</p>',
+                '<p class="indent">« Он своё получит.»</p>',
+            ),
+            ("<p>— Выйти из машины!</p>", "<p>« Выйти из машины! »</p>"),
+            (
+                "<p>— Доктор — он своё получит, — пробормотал Бойо.</p>",
+                "<p>« Доктор — он своё получит, — пробормотал Бойо.</p>",
+            ),
+        ],
+    )
+    def test_patch_is_dropped_and_paragraph_kept(self, proofreader: PostProcessor, before, after):
+        paragraphs = [before, "<p>Второй абзац.</p>"]
+        patches = json.dumps([{"p": 1, "text": after}])
+        out, changed = proofreader._parse_delta_response(patches, paragraphs)
+        assert out[0] == before
+        assert changed is False
+
+    def test_other_patches_in_the_same_chunk_still_apply(self, proofreader: PostProcessor):
+        paragraphs = ["<p>— Он своё получит.</p>", "<p>Опечатка тут.</p>"]
+        patches = json.dumps(
+            [
+                {"p": 1, "text": "<p>« Он своё получит. »</p>"},
+                {"p": 2, "text": "<p>Опечатки тут нет.</p>"},
+            ]
+        )
+        out, changed = proofreader._parse_delta_response(patches, paragraphs)
+        assert out[0] == paragraphs[0], "the damaging patch was refused"
+        assert out[1] == "<p>Опечатки тут нет.</p>", "the good patch went through"
+        assert changed is True
+
+    @pytest.mark.parametrize(
+        "before,after",
+        [
+            # edits that must not be mistaken for the defect
+            ("<p>— Ну, это совсем не так.</p>", "<p>— Ну, это совсем не так!</p>"),
+            ("<p>Он сказал «да» и ушёл.</p>", "<p>Он сказал «нет» и ушёл.</p>"),
+            (
+                "<p>«Правда» — так называлась газета.</p>",
+                "<p>«Известия» — так называлась газета.</p>",
+            ),
+            ("<p>Он сказал.</p>", "<p>— Он сказал.</p>"),
+        ],
+    )
+    def test_legitimate_edits_are_untouched(self, proofreader: PostProcessor, before, after):
+        out, changed = proofreader._parse_delta_response(
+            json.dumps([{"p": 1, "text": after}]), [before]
+        )
+        assert out[0] == after
+        assert changed is True

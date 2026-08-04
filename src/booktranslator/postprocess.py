@@ -56,6 +56,19 @@ _FENCED_BLOCK_RE = re.compile(r"```[^\n]*\n(.*?)```", re.DOTALL)
 _NO_CHANGES_RE = re.compile(r"\A`*\s*NO[_ ]?CHANGES\s*`*\Z", re.IGNORECASE)
 
 
+# A paragraph of dialogue opens with an em dash in Russian; guillemets belong
+# to speech quoted inline. The proofread prompt used to ask for « » outright
+# and models obliged, costing 8 paragraphs of Bear Head. The prompt says the
+# opposite now, and this refuses the change if a model does it anyway.
+_OPENS_WITH_DASH = re.compile(r"^\s*(?:<[^>]+>\s*)*[—–]\s")
+_OPENS_WITH_GUILLEMET = re.compile(r"^\s*(?:<[^>]+>\s*)*«")
+
+
+def _breaks_dialogue_dash(before: str, after: str) -> bool:
+    """True when a patch replaces a paragraph's opening dash with guillemets."""
+    return bool(_OPENS_WITH_DASH.match(before)) and bool(_OPENS_WITH_GUILLEMET.match(after))
+
+
 def _is_no_changes(text: str) -> bool:
     """True when the response says "nothing to change", however it is wrapped.
 
@@ -280,9 +293,21 @@ class PostProcessor:
             idx = int(p_idx) - 1
             if idx < 0 or idx >= n:
                 raise ValueError(f"Patch paragraph index {p_idx} out of range 1..{n}")
-            output[idx] = str(p_text).strip()
+            new_text = str(p_text).strip()
+            if _breaks_dialogue_dash(input_paragraphs[idx], new_text):
+                # Refuse this one patch and keep the paragraph. Rejecting the
+                # whole chunk would throw away the pass's good work over a
+                # punctuation slip, and accepting it prints the slip.
+                logger.warning(
+                    "%s: patch for paragraph %s turns a dialogue dash into "
+                    "guillemets — keeping the original paragraph",
+                    self.stage,
+                    p_idx,
+                )
+                continue
+            output[idx] = new_text
 
-        return output, True
+        return output, output != list(input_paragraphs)
 
     def _is_delta_response(self, text: str) -> bool:
         """Heuristic: does this response look like delta format?
