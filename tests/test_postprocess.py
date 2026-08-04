@@ -169,6 +169,57 @@ class TestParseResponse:
         assert fragments[0] == "<p>Spaced.</p>"
 
 
+class TestNoChangesRecognition:
+    """The delta prompts print NO_CHANGES inside a code fence and call it
+    `NO_CHANGES` in the rules, so models copy those shapes back. Rejecting
+    them threw away correct verdicts on the Bear Head run: style ch19_c05
+    answered with commentary plus a fenced NO_CHANGES, verify ch25_c03 with
+    a back-quoted one. Both were logged as parse failures.
+    """
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "NO_CHANGES",
+            "no changes",
+            "NOCHANGES",
+            "```\nNO_CHANGES\n```",
+            "```NO_CHANGES```",
+            "`NO_CHANGES`",  # verify ch25_c03
+            "  NO_CHANGES  \n",
+            # style ch19_c05: a sentence of commentary, then the fenced verdict
+            "Перечитал абзац. Текст живой, канцелярита нет.\n\n```\nNO_CHANGES\n```",
+        ],
+    )
+    def test_accepted_forms_leave_paragraphs_untouched(self, proofreader: PostProcessor, text):
+        paragraphs = ["<p>Первый.</p>", "<p>Второй.</p>"]
+        out, changed = proofreader._parse_delta_response(text, paragraphs)
+        assert out == paragraphs
+        assert changed is False
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            # A response carrying patches is never read as "nothing to change",
+            # even when it mentions NO_CHANGES in passing — edits must not be
+            # silently dropped.
+            "Сначала думал ответить NO_CHANGES, но нет.\n"
+            '```json\n[{"p": 1, "text": "<p>Правка.</p>"}]\n```',
+            '[{"p": 1, "text": "<p>Правка.</p>"}]',
+        ],
+    )
+    def test_patches_win_over_a_mention_of_no_changes(self, proofreader: PostProcessor, text):
+        paragraphs = ["<p>Первый.</p>", "<p>Второй.</p>"]
+        out, changed = proofreader._parse_delta_response(text, paragraphs)
+        assert changed is True
+        assert out[0] == "<p>Правка.</p>"
+        assert out[1] == "<p>Второй.</p>"
+
+    def test_unparseable_response_still_raises(self, proofreader: PostProcessor):
+        with pytest.raises(ValueError, match="not valid JSON or NO_CHANGES"):
+            proofreader._parse_delta_response("Ответа нет вовсе.", ["<p>Первый.</p>"])
+
+
 # ---------------------------------------------------------------------------
 # Process single chunk — proofread
 # ---------------------------------------------------------------------------

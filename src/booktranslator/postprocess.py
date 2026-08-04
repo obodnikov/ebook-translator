@@ -47,6 +47,29 @@ _BARE_AMPERSAND_RE = re.compile(r"&(?!(?:amp|lt|gt|quot|apos|#\d+|#x[0-9a-fA-F]+
 
 PostprocessStage = Literal["proofread", "style", "verify"]
 
+# The delta prompts print NO_CHANGES inside a code fence and refer to it as
+# `NO_CHANGES` in the rules, so models return it fenced, back-quoted, or after
+# a sentence of commentary. All of those mean the same thing, and rejecting
+# them threw away correct verdicts: style ch19_c05 and verify ch25_c03 both
+# failed this way on the Bear Head run.
+_FENCED_BLOCK_RE = re.compile(r"```[^\n]*\n(.*?)```", re.DOTALL)
+_NO_CHANGES_RE = re.compile(r"\A`*\s*NO[_ ]?CHANGES\s*`*\Z", re.IGNORECASE)
+
+
+def _is_no_changes(text: str) -> bool:
+    """True when the response says "nothing to change", however it is wrapped.
+
+    Accepts the bare word, any number of surrounding backticks, and a fenced
+    NO_CHANGES that follows commentary. A response that also carries a JSON
+    array is never read this way: patches win, so a contradictory answer
+    cannot silently drop edits the model asked for.
+    """
+    if _NO_CHANGES_RE.match(text.strip()):
+        return True
+    if "[" in text:
+        return False
+    return any(_NO_CHANGES_RE.match(block.strip()) for block in _FENCED_BLOCK_RE.findall(text))
+
 
 @dataclass
 class PostprocessResult:
@@ -171,6 +194,12 @@ class PostProcessor:
         """
         text = raw_text.strip()
 
+        # Check for NO_CHANGES before touching fences: the helper understands
+        # every wrapping the prompts invite, while the fence stripper below
+        # would flatten a single-line ```NO_CHANGES``` to nothing.
+        if _is_no_changes(text):
+            return list(input_paragraphs), False
+
         # Strip code fences if present
         if text.startswith("```"):
             lines = text.splitlines()
@@ -179,10 +208,6 @@ class PostProcessor:
             if lines and lines[-1].startswith("```"):
                 lines = lines[:-1]
             text = "\n".join(lines).strip()
-
-        # Check for NO_CHANGES
-        if text.upper().replace("_", "").replace(" ", "") == "NOCHANGES":
-            return list(input_paragraphs), False
 
         # Parse JSON array of patches
         # First, try to find JSON array in the text (model may prepend reasoning)
