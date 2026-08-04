@@ -36,6 +36,7 @@ from .pipeline_helpers import (
     ChunkerConfigMismatchError,
     build_reflect_input,
     collect_chunk_originals,
+    collect_preferred_translations,
     collect_stage_translations,
     collect_waterfall_paragraphs,
     create_image_provider,
@@ -1165,6 +1166,15 @@ def judge_cmd(
         "-j",
         help="Number of chunks to judge concurrently.",
     ),
+    from_stage: str = typer.Option(
+        "translate",
+        "--from",
+        help=(
+            "Which stage to score: translate (default), reflect, proofread, style, "
+            "verify, repair — or 'final' for the text the book would be assembled "
+            "from, honouring `btrans prefer`."
+        ),
+    ),
 ) -> None:
     """Run the judge pass on already-translated chunks.
 
@@ -1208,10 +1218,29 @@ def judge_cmd(
 
     # Collect originals and translations using shared helpers
     chunk_originals = collect_chunk_originals(chunk_set, translate_ids)
-    chunk_translations = collect_stage_translations(cache, translate_ids, stage="translate")
+    if from_stage == "final":
+        # What `btrans assemble` would use, `btrans prefer` overrides included.
+        chunk_translations = collect_preferred_translations(cache, translate_ids)
+    else:
+        stage_ids = cache.get_all_chunk_ids_for_stage(from_stage)
+        if not stage_ids:
+            console.print(
+                f"[red]No chunks cached for stage {from_stage!r}.[/red]\n"
+                f"[dim]Known stages: {', '.join(STAGE_WATERFALL)}, or 'final'.[/dim]"
+            )
+            cache.close()
+            raise typer.Exit(code=1)
+        chunk_translations = collect_stage_translations(cache, stage_ids, stage=from_stage)
 
     judgeable_ids = sorted(set(chunk_originals.keys()) & set(chunk_translations.keys()))
+    console.print(f"[bold]Judging stage:[/bold] {from_stage}")
     console.print(f"[bold]Chunks to judge:[/bold] {len(judgeable_ids)}")
+    if from_stage != "translate":
+        console.print(
+            "[yellow]Note:[/yellow] verdicts are tagged with the stage they describe, "
+            "but `btrans repair` and `btrans status` read every verdict, so this cache "
+            "will now hold more than one per chunk."
+        )
 
     judge_model = model or cfg.models.judge
     console.print(f"[bold]Model:[/bold] {judge_model}")
@@ -1225,6 +1254,7 @@ def judge_cmd(
         model=judge_model,
         source_lang=cfg.source_lang,
         target_lang=cfg.target_lang,
+        judged_stage=from_stage,
     )
 
     if parallelism is not None and parallelism < 1:

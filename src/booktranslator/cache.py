@@ -50,6 +50,17 @@ CREATE TABLE IF NOT EXISTS pipeline_meta (
 STAGE_WATERFALL = ["translate", "reflect", "proofread", "style", "verify", "repair"]
 
 
+def _judged_stage_of(meta_json: str | None) -> str:
+    """Which stage a judge row describes. Rows predating the field are
+    'translate' — that is the only stage the judge could score back then."""
+    if not meta_json:
+        return "translate"
+    try:
+        return json.loads(meta_json).get("judged_stage", "translate")
+    except (json.JSONDecodeError, AttributeError):
+        return "translate"
+
+
 @dataclass
 class CachedEntry:
     key: str
@@ -326,11 +337,21 @@ class Cache:
         """
         return self.count_distinct_chunks(stage) + self.count_legacy_rows(stage)
 
-    def get_judge_scores(self) -> list[dict[str, Any]]:
-        """Get all judge results as parsed dicts with chunk_id, score, issues."""
+    def get_judge_scores(self, judged_stage: str | None = None) -> list[dict[str, Any]]:
+        """Get all judge results as parsed dicts with chunk_id, score, issues.
+
+        `judged_stage` narrows the result to verdicts describing that stage's
+        text — the value the judge recorded in meta. Rows written before that
+        field existed count as 'translate', which is what they were. Without
+        it, every verdict is returned, which mixes stages once more than one
+        has been scored.
+        """
         rows = self.conn.execute(
-            "SELECT chunk_id, content FROM cache WHERE stage = 'judge'"
+            "SELECT chunk_id, content, meta_json FROM cache WHERE stage = 'judge'"
         ).fetchall()
+        if judged_stage is not None:
+            rows = [r for r in rows if _judged_stage_of(r[2]) == judged_stage]
+        rows = [(r[0], r[1]) for r in rows]
         results = []
         decoder = json.JSONDecoder()
         for chunk_id, content in rows:

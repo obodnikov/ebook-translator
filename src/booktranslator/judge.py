@@ -64,6 +64,7 @@ class Judge:
         model: str,
         source_lang: str = "en",
         target_lang: str = "ru",
+        judged_stage: str = "translate",
     ):
         self.provider = provider
         self.prompt: Prompt = load_prompt(prompt_path)
@@ -72,6 +73,10 @@ class Judge:
         self.model = model
         self.source_lang = source_lang
         self.target_lang = target_lang
+        # Which stage's text these verdicts describe. Recorded on every row so
+        # scoring a second stage does not leave the cache holding two verdicts
+        # per chunk with no way to tell them apart.
+        self.judged_stage = judged_stage
 
         self._glossary_block = render_for_prompt(glossary) if glossary else "(no glossary provided)"
         self._lock = threading.Lock()
@@ -207,7 +212,7 @@ class Judge:
                     content=raw_text,
                     input_tokens=result.input_tokens,
                     output_tokens=result.output_tokens,
-                    meta={"chunk_id": chunk_id},
+                    meta={"chunk_id": chunk_id, "judged_stage": self.judged_stage},
                 )
                 stats.chunks_judged += 1
                 stats.input_tokens += result.input_tokens
