@@ -67,7 +67,14 @@ class TranslateConfig(BaseModel):
 
 
 class ReflectionConfig(BaseModel):
-    trigger_score: int = 3
+    # Reflect pays off only on the worst chunks. Measured per score band on
+    # Bear Head, each against its own noise control (same text, judged twice),
+    # in issues per chunk: at 2 it removes 0.88 beyond noise, at 3 it removes
+    # 0.26 — indistinguishable from nothing — and at 5 it *adds* 0.67, because
+    # it rewrites 87% of paragraphs whether or not there is anything to fix.
+    # See docs/design/2026-08-03-judge-repair-stage-and-reasoning-on-gateway.md
+    # §5.8-bis.
+    trigger_score: int = 2
 
 
 class PausesConfig(BaseModel):
