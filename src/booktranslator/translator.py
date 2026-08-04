@@ -268,6 +268,12 @@ class Translator:
         # parallel chunks don't race when mutating lxml elements (even
         # though they target different subtrees, we stay on the safe
         # side).
+        #
+        # NOTE: this replaces the source paragraphs in place, so once
+        # translation has run, `chunk_set` no longer holds the original text —
+        # asking it for originals returns the translation. Any stage that
+        # compares against the source (judge, reflect, verify) must read from a
+        # separately built ChunkSet; see `source_chunk_set` in cli.translate.
         with self._lock:
             chapter = chunk_set.book.chapters[chunk.chapter_index]
             for para_idx, frag_str in zip(chunk.paragraph_indexes, fragments, strict=False):

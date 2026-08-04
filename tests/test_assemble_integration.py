@@ -19,6 +19,7 @@ from typer.testing import CliRunner
 from booktranslator.cache import Cache
 from booktranslator.cli import app
 from booktranslator.models import SeriesGlossary, SeriesGlossaryEntry
+from tests.epub_fixtures import write_minimal_epub
 
 runner = CliRunner()
 
@@ -27,57 +28,11 @@ runner = CliRunner()
 # Fixtures
 # ---------------------------------------------------------------------------
 
-MINIMAL_XHTML = """\
-<?xml version="1.0" encoding="utf-8"?>
-<html xmlns="http://www.w3.org/1999/xhtml">
-<head><title>Test</title></head>
-<body>
-<p>This is a test paragraph about vestigium.</p>
-<p>Another paragraph with DCI Seawoll.</p>
-</body>
-</html>"""
-
-MINIMAL_OPF = """\
-<?xml version="1.0" encoding="utf-8"?>
-<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="uid">
-  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
-    <dc:title>Test Book</dc:title>
-    <dc:creator>Test Author</dc:creator>
-    <dc:language>en</dc:language>
-    <dc:identifier id="uid">test-uid-123</dc:identifier>
-  </metadata>
-  <manifest>
-    <item id="ch01" href="ch01.xhtml" media-type="application/xhtml+xml"/>
-  </manifest>
-  <spine>
-    <itemref idref="ch01"/>
-  </spine>
-</package>"""
-
-MINIMAL_CONTAINER = """\
-<?xml version="1.0" encoding="utf-8"?>
-<container xmlns="urn:oasis:names:tc:opendocument:xmlns:container" version="1.0">
-  <rootfiles>
-    <rootfile full-path="content.opf" media-type="application/oebps-package+xml"/>
-  </rootfiles>
-</container>"""
-
 
 @pytest.fixture
 def minimal_epub(tmp_path: Path) -> Path:
     """Create a minimal valid EPUB file for testing."""
-    epub_path = tmp_path / "test-book.epub"
-    with zipfile.ZipFile(epub_path, "w") as zf:
-        # mimetype must be first and uncompressed
-        zf.writestr(
-            zipfile.ZipInfo("mimetype"),
-            "application/epub+zip",
-            compress_type=zipfile.ZIP_STORED,
-        )
-        zf.writestr("META-INF/container.xml", MINIMAL_CONTAINER)
-        zf.writestr("content.opf", MINIMAL_OPF)
-        zf.writestr("ch01.xhtml", MINIMAL_XHTML)
-    return epub_path
+    return write_minimal_epub(tmp_path / "test-book.epub")
 
 
 @pytest.fixture

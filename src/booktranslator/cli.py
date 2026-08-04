@@ -627,6 +627,19 @@ def translate(
         f"{cfg.chunker.overlap_paragraphs} paragraphs)"
     )
 
+    # The translator splices each translated paragraph into the live tree
+    # (translator.py:_splice_fragments), so `chunk_set` stops holding the
+    # source text the moment translation starts. Judge, reflect and verify all
+    # need the real original to compare against, so they read it from a second
+    # copy of the book that nothing writes to. Re-reading costs ~0.03s.
+    source_chunk_set = chunk_book(
+        read_book_structured(epub),
+        target_words=cfg.chunker.target_words,
+        overlap_paragraphs=cfg.chunker.overlap_paragraphs,
+    )
+    if limit_chunks is not None:
+        source_chunk_set.chunks = source_chunk_set.chunks[:limit_chunks]
+
     effective_parallelism = parallelism if parallelism is not None else cfg.translate.parallelism
     if effective_parallelism > 1:
         console.print(f"[bold]Parallelism:[/bold] {effective_parallelism} chunks")
@@ -700,7 +713,7 @@ def translate(
         # Collect original and translated texts
         translate_ids = cache.get_all_chunk_ids_for_stage("translate")
         if translate_ids:
-            chunk_originals = collect_chunk_originals(chunk_set, translate_ids)
+            chunk_originals = collect_chunk_originals(source_chunk_set, translate_ids)
             chunk_translations = collect_stage_translations(cache, translate_ids, stage="translate")
 
             # Only judge chunks that have both original and translation
@@ -815,7 +828,7 @@ def translate(
                 ]
             )
             chunks_to_reflect_data = build_reflect_input(
-                chunk_set,
+                source_chunk_set,
                 cache,
                 {r.chunk_id for r in chunks_to_reflect_results},
                 judge_by_id,
@@ -908,7 +921,7 @@ def translate(
         originals_for_verify: dict[str, str] | None = None
         if pp_stage == "verify":
             originals_for_verify = collect_chunk_originals(
-                chunk_set, list(waterfall_paragraphs.keys())
+                source_chunk_set, list(waterfall_paragraphs.keys())
             )
 
         for cid, paragraphs in sorted(waterfall_paragraphs.items()):
