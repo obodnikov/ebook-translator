@@ -1413,7 +1413,9 @@ def reflect_cmd(
     cache = Cache(wd.cache_path)
 
     # Get judge scores
-    judge_scores = cache.get_judge_scores()
+    # Reflect re-does the translate stage, so it reads verdicts about
+    # that stage — not about a later one, and not from a measurement run.
+    judge_scores = cache.get_judge_scores(judged_stage="translate")
     if not judge_scores and not all_chunks:
         console.print(
             "[red]No judge scores found. Run 'btrans judge' first, "
@@ -1788,7 +1790,10 @@ def repair_cmd(
     cache = Cache(wd.cache_path)
 
     try:
-        judge_map = normalize_judge_map(cache.get_judge_scores())
+        # Verdicts about the draft: that is what the run this stage was
+        # measured on used, and the quoted fragments still resolve against the
+        # waterfall text. Measurement runs are excluded by default.
+        judge_map = normalize_judge_map(cache.get_judge_scores(judged_stage="translate"))
         if not judge_map:
             console.print("[red]No judge results found. Run 'btrans judge' first.[/red]")
             raise typer.Exit(code=1)

@@ -50,6 +50,16 @@ CREATE TABLE IF NOT EXISTS pipeline_meta (
 STAGE_WATERFALL = ["translate", "reflect", "proofread", "style", "verify", "repair"]
 
 
+def _is_measurement_run(meta_json: str | None) -> bool:
+    """True for verdicts written by `btrans judge --no-cache`."""
+    if not meta_json:
+        return False
+    try:
+        return bool(json.loads(meta_json).get("run"))
+    except (json.JSONDecodeError, AttributeError):
+        return False
+
+
 def _judged_stage_of(meta_json: str | None) -> str:
     """Which stage a judge row describes. Rows predating the field are
     'translate' — that is the only stage the judge could score back then."""
@@ -337,7 +347,11 @@ class Cache:
         """
         return self.count_distinct_chunks(stage) + self.count_legacy_rows(stage)
 
-    def get_judge_scores(self, judged_stage: str | None = None) -> list[dict[str, Any]]:
+    def get_judge_scores(
+        self,
+        judged_stage: str | None = None,
+        include_measurement_runs: bool = False,
+    ) -> list[dict[str, Any]]:
         """Get all judge results as parsed dicts with chunk_id, score, issues.
 
         `judged_stage` narrows the result to verdicts describing that stage's
@@ -345,10 +359,17 @@ class Cache:
         field existed count as 'translate', which is what they were. Without
         it, every verdict is returned, which mixes stages once more than one
         has been scored.
+
+        Verdicts from a `--no-cache` run are excluded unless asked for. Those
+        rows exist to measure the judge against itself; letting them decide
+        which chunks get reflected or repaired would hand the pipeline a
+        second, arbitrary opinion.
         """
         rows = self.conn.execute(
             "SELECT chunk_id, content, meta_json FROM cache WHERE stage = 'judge'"
         ).fetchall()
+        if not include_measurement_runs:
+            rows = [r for r in rows if not _is_measurement_run(r[2])]
         if judged_stage is not None:
             rows = [r for r in rows if _judged_stage_of(r[2]) == judged_stage]
         rows = [(r[0], r[1]) for r in rows]

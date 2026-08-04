@@ -403,8 +403,14 @@ class TestFreshRunKeepsEarlierVerdicts:
         second = self._judge(mock_provider, judge_prompt_path, cache, run_id="run-x")
         second.judge_chunk("c1", "original", "перевод", JudgeStats(chunks_total=1))
 
-        scores = sorted(s["score"] for s in cache.get_judge_scores())
-        assert scores == [2, 4], "both verdicts on the same text must survive"
+        both = sorted(s["score"] for s in cache.get_judge_scores(include_measurement_runs=True))
+        assert both == [2, 4], "both verdicts on the same text must survive"
+
+        # A measurement run must not become a second opinion the pipeline acts
+        # on: reflect and repair would otherwise pick chunks from whichever
+        # verdict happened to be read last.
+        production = [s["score"] for s in cache.get_judge_scores()]
+        assert production == [2], "the --no-cache run must stay out of the default view"
 
     def test_without_a_run_id_the_same_text_is_served_from_cache(
         self, mock_provider, judge_prompt_path, cache
