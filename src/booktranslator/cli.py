@@ -970,6 +970,11 @@ def translate(
                             f"{stage_name} | cached {pstats.chunks_cached} "
                             f"new {pstats.chunks_processed} "
                             f"failed {pstats.chunks_failed}"
+                            + (
+                                f" re-asked {pstats.format_retries}"
+                                if pstats.format_retries
+                                else ""
+                            )
                         ),
                     )
 
@@ -2023,6 +2028,7 @@ def _run_postprocess_cmd(
                         f"{stage} | cached {pstats.chunks_cached} "
                         f"new {pstats.chunks_processed} "
                         f"failed {pstats.chunks_failed}"
+                        + (f" re-asked {pstats.format_retries}" if pstats.format_retries else "")
                     ),
                 )
 

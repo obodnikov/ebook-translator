@@ -1466,3 +1466,141 @@ class TestDialogueDashIsProtected:
         )
         assert out[0] == after
         assert changed is True
+
+
+# ---------------------------------------------------------------------------
+# Replies that ignore the delta format
+# ---------------------------------------------------------------------------
+
+
+def _reply(text: str, *, in_tokens: int = 300, out_tokens: int = 50, finish: str | None = "stop"):
+    return CompletionResult(
+        text=text,
+        input_tokens=in_tokens,
+        output_tokens=out_tokens,
+        total_tokens=in_tokens + out_tokens,
+        model="haiku",
+        raw={},
+        finish_reason=finish,
+    )
+
+
+PATCH = '[{"p": 1, "text": "<p>Исправлено.</p>"}]'
+
+
+class TestPreambleBeforeThePatchArray:
+    def test_commentary_then_array(self, proofreader: PostProcessor):
+        text = "Looking through the text carefully:\n\n" + PATCH
+        out, changed = proofreader._parse_delta_response(text, ["<p>Исходное.</p>"])
+        assert out == ["<p>Исправлено.</p>"]
+        assert changed is True
+
+    def test_a_bracket_in_the_commentary_does_not_hide_the_array(self, proofreader: PostProcessor):
+        """The first `[` is a false start — the parser must keep looking."""
+        text = "Paragraph [14] contains a gender error, see [note]:\n\n" + PATCH
+        out, changed = proofreader._parse_delta_response(text, ["<p>Исходное.</p>"])
+        assert out == ["<p>Исправлено.</p>"]
+        assert changed is True
+
+    def test_commentary_without_an_array_still_fails(self, proofreader: PostProcessor):
+        with pytest.raises(ValueError, match="not valid JSON or NO_CHANGES"):
+            proofreader._parse_delta_response(
+                "Looking at paragraph 18, the translation omits a long speech.",
+                ["<p>Исходное.</p>"],
+            )
+
+
+class TestFormatRetry:
+    def test_a_reply_of_pure_commentary_is_asked_again(
+        self, proofreader: PostProcessor, mock_provider, cache: Cache
+    ):
+        mock_provider.complete.side_effect = [
+            _reply("Looking through the text carefully, paragraph 14 needs work."),
+            _reply(PATCH, in_tokens=310, out_tokens=20),
+        ]
+
+        stats = PostprocessStats(stage="proofread", chunks_total=10)
+        result = proofreader.process_chunk("ch01_c01", ["<p>Исходное.</p>"], stats)
+
+        assert result is not None
+        assert "Исправлено" in result.content
+        assert stats.format_retries == 1
+        assert mock_provider.complete.call_count == 2
+        # The second call is not free and must show up in the totals.
+        assert stats.input_tokens == 610
+        assert stats.output_tokens == 70
+
+    def test_the_retry_restates_the_format(self, proofreader: PostProcessor, mock_provider):
+        mock_provider.complete.side_effect = [_reply("Просто рассуждение."), _reply(PATCH)]
+
+        proofreader.process_chunk(
+            "ch01_c01", ["<p>Исходное.</p>"], PostprocessStats(stage="proofread", chunks_total=10)
+        )
+
+        first_user = mock_provider.complete.call_args_list[0].kwargs["user"]
+        retry_user = mock_provider.complete.call_args_list[1].kwargs["user"]
+        assert "previous reply was rejected" in retry_user
+        assert retry_user.startswith(first_user), "the retry asks the same question"
+
+    def test_a_second_bad_reply_fails_the_chunk(
+        self, proofreader: PostProcessor, mock_provider, cache: Cache
+    ):
+        mock_provider.complete.side_effect = [
+            _reply("Рассуждение раз."),
+            _reply("Рассуждение два."),
+        ]
+
+        stats = PostprocessStats(stage="proofread", chunks_total=10)
+        with pytest.raises(ValueError):
+            proofreader.process_chunk("ch01_c01", ["<p>Исходное.</p>"], stats)
+
+        assert mock_provider.complete.call_count == 2
+        assert cache.get_chunk_stages("ch01_c01") == []
+
+    def test_a_cached_reply_is_never_re_bought(
+        self, proofreader: PostProcessor, mock_provider, cache: Cache
+    ):
+        """A cached row that stopped parsing is a failure, not a purchase."""
+        mock_provider.complete.side_effect = [_reply("Рассуждение."), _reply(PATCH)]
+
+        stats = PostprocessStats(stage="proofread", chunks_total=10)
+        proofreader.process_chunk("ch01_c01", ["<p>Исходное.</p>"], stats)
+        assert mock_provider.complete.call_count == 2
+
+        stats2 = PostprocessStats(stage="proofread", chunks_total=10)
+        proofreader.process_chunk("ch01_c01", ["<p>Исходное.</p>"], stats2)
+        assert stats2.chunks_cached == 1
+        assert mock_provider.complete.call_count == 2, "the cached run bought nothing"
+
+    def test_the_retry_budget_is_bounded(self, proofreader: PostProcessor, mock_provider):
+        """A model that has stopped following the format must not double the bill."""
+        mock_provider.complete.return_value = _reply("Одно рассуждение за другим.")
+
+        stats = PostprocessStats(stage="proofread", chunks_total=10)
+        for i in range(8):
+            with pytest.raises(ValueError):
+                proofreader.process_chunk(f"ch01_c{i:02d}", ["<p>Исходное.</p>"], stats)
+
+        assert stats.format_retries == 3, "budget for a 10-chunk run"
+        assert mock_provider.complete.call_count == 8 + 3
+
+
+class TestFailedReplyIsKept:
+    def test_the_reply_lands_next_to_the_cache(
+        self, proofreader: PostProcessor, mock_provider, cache: Cache, tmp_path: Path
+    ):
+        mock_provider.complete.return_value = _reply(
+            "Looking at paragraph 18, the translation omits a long speech.",
+            finish="length",
+        )
+
+        stats = PostprocessStats(stage="proofread", chunks_total=10)
+        with pytest.raises(ValueError):
+            proofreader.process_chunk("ch70_c01", ["<p>Исходное.</p>"], stats)
+
+        dumped = tmp_path / "failed" / "proofread-ch70_c01.txt"
+        assert dumped.exists()
+        body = dumped.read_text(encoding="utf-8")
+        assert "omits a long speech" in body, "the whole reply, not the first 200 chars"
+        assert "finish_reason: 'length'" in body
+        assert "--- reply after the format retry ---" in body
