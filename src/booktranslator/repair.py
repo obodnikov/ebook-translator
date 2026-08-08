@@ -30,6 +30,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
 
+from . import model_json
 from .cache import Cache
 from .models import SeriesGlossary
 from .prompts import Prompt, load_prompt, render_prompt
@@ -282,9 +283,11 @@ class Repairer:
         if not m:
             raise ValueError(f"Repair verdicts are not a JSON array. First 200 chars: {t[:200]!r}")
         try:
-            data = json.loads(m.group(0))
+            data = model_json.loads(m.group(0))
         except json.JSONDecodeError as e:
             raise ValueError(f"Repair verdicts are not valid JSON: {e}") from e
+        if not isinstance(data, list):
+            raise ValueError(f"Repair verdicts are not a JSON array. Got: {type(data).__name__}")
 
         out: dict[int, tuple[bool, str]] = {}
         for entry in data:

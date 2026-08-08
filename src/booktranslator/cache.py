@@ -13,6 +13,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from . import model_json
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS cache (
     key TEXT PRIMARY KEY,
@@ -106,6 +108,9 @@ class Preference:
 class Cache:
     def __init__(self, path: Path):
         path.parent.mkdir(parents=True, exist_ok=True)
+        # Kept so a stage can write beside the cache — the book's work
+        # directory — without every call site having to pass it down.
+        self.path = path
         # check_same_thread=False lets us share the connection across
         # worker threads; our Translator serialises cache put/get with
         # its own lock, so concurrent access is safe.
@@ -374,30 +379,18 @@ class Cache:
             rows = [r for r in rows if _judged_stage_of(r[2]) == judged_stage]
         rows = [(r[0], r[1]) for r in rows]
         results = []
-        decoder = json.JSONDecoder()
         for chunk_id, content in rows:
-            # Judge content is JSON: {score: N, issues: [...]}
-            # Model often wraps in code fences and/or appends explanation.
+            # Judge content is JSON: {score: N, issues: [...]}. The model wraps
+            # it in code fences, appends explanation, or leaves a quote from the
+            # source text unescaped — model_json.loads handles all three, and
+            # handles them the same way the judge did when it accepted the row.
             parsed: dict[str, Any]
             text = (content or "").strip()
-
-            # Strip code fences if present
-            if text.startswith("```"):
-                lines = text.splitlines()
-                if lines[0].startswith("```"):
-                    lines = lines[1:]
-                if lines and lines[-1].startswith("```"):
-                    lines = lines[:-1]
-                text = "\n".join(lines).strip()
-
             try:
-                parsed = json.loads(text)
-            except (json.JSONDecodeError, TypeError):
-                # Trailing text after valid JSON — use raw_decode
-                try:
-                    parsed, _ = decoder.raw_decode(text)
-                except (json.JSONDecodeError, TypeError, ValueError):
-                    parsed = {"score": 0, "issues": ["parse error"]}
+                loaded = model_json.loads(text)
+            except (json.JSONDecodeError, TypeError, ValueError):
+                loaded = None
+            parsed = loaded if isinstance(loaded, dict) else {"score": 0, "issues": ["parse error"]}
             parsed["chunk_id"] = chunk_id or ""
             results.append(parsed)
         return results

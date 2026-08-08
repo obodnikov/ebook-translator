@@ -1,5 +1,5 @@
 ---
-version: 3
+version: 4
 model: anthropic/claude-haiku-4.5
 temperature: 0.1
 max_tokens: 12000
@@ -69,6 +69,16 @@ translation, and give the correction. Quote — do not paraphrase.
 
 Do not report anything you cannot quote. Do not report personal preferences
 about wording that is already correct and natural.
+
+**Mark every quotation with « », in any language.** Your answer is a JSON
+string, and a straight `"` inside it ends that string and destroys the whole
+verdict. When you quote the {{ source_lang_name }} original and it contains
+straight quotation marks, replace them with « » as you quote:
+
+    original:  and "No," Ada said
+    write it:  «and «No,» Ada said»
+
+Never put a straight `"` inside an issue.
 
 ## Before you answer
 

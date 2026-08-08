@@ -1120,6 +1120,7 @@ ebook-translator/
 │   ├── style.md
 │   ├── verify.md
 │   ├── repair.md
+│   ├── json_fix.md               # переспрос, если ответ судьи не читается как JSON
 │   └── cover_translate.md
 ├── src/booktranslator/      # исходный код пакета
 ├── tools/split_epub.py      # отдельный скрипт для антологий
