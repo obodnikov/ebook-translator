@@ -11,17 +11,19 @@ without making real LLM calls. Covers:
 from __future__ import annotations
 
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 from typer.testing import CliRunner
 
 from booktranslator.cache import Cache
+from booktranslator.cli import app
 from booktranslator.pipeline_helpers import (
     ChunkerConfigMismatchError,
     save_chunker_params,
     verify_chunker_params,
 )
+from tests.epub_fixtures import write_minimal_epub
 
 runner = CliRunner()
 
@@ -452,3 +454,92 @@ class TestReflectAllWithoutJudge:
         from booktranslator.pipeline_helpers import normalize_judge_map
 
         assert normalize_judge_map([]) == {}
+
+
+# ---------------------------------------------------------------------------
+# The judge must be handed the source text, not the translation
+# ---------------------------------------------------------------------------
+
+
+class TestJudgeReceivesTheSourceText:
+    """`translate` runs its judge pass after the translator has spliced the
+    translation into the live tree, so reading originals from that same
+    ChunkSet hands the judge the translation in both slots.
+
+    That is what happened on the Bear Head run: the judge compared the
+    translation with itself and scored 102 of 110 chunks a perfect 5. This test
+    runs the real command end to end against a stub provider and asserts the
+    text reaching the judge is still English.
+    """
+
+    def _run(self, tmp_path: Path, capture: dict):
+        from booktranslator.chunker import chunk_book as real_chunk_book
+
+        epub = write_minimal_epub(tmp_path / "book.epub")
+
+        translated = (
+            "===PARAGRAPH 1===\n<p>Это тестовый абзац про вестигиум.</p>\n"
+            "===PARAGRAPH 2===\n<p>Ещё абзац с Сиуоллом.</p>"
+        )
+
+        def fake_complete(**kwargs):
+            result = MagicMock()
+            # The judge prompt is the only one asking for a score.
+            if "score" in (kwargs.get("system", "") + kwargs.get("user", "")).lower():
+                result.text = '{"score": 5, "issues": []}'
+            else:
+                result.text = translated
+            result.input_tokens = 10
+            result.output_tokens = 10
+            return result
+
+        provider = MagicMock()
+        provider.complete.side_effect = fake_complete
+
+        real_judge_chunks = None
+
+        def spy_judge_chunks(self, chunk_originals, chunk_translations, **kwargs):
+            capture["originals"] = dict(chunk_originals)
+            capture["translations"] = dict(chunk_translations)
+            return real_judge_chunks(self, chunk_originals, chunk_translations, **kwargs)
+
+        from booktranslator.judge import Judge
+
+        real_judge_chunks = Judge.judge_chunks
+
+        with (
+            patch("booktranslator.cli.create_stage_provider", return_value=provider),
+            patch.object(Judge, "judge_chunks", spy_judge_chunks),
+            patch("booktranslator.cli.chunk_book", side_effect=real_chunk_book),
+        ):
+            return runner.invoke(
+                app,
+                [
+                    "translate",
+                    str(epub),
+                    "--work",
+                    str(tmp_path / "work"),
+                    "--no-reflect",
+                    "--no-proofread",
+                    "--no-style",
+                    "--no-verify",
+                    "--no-notes",
+                    "--out",
+                    str(tmp_path / "out.epub"),
+                ],
+            )
+
+    def test_originals_reaching_the_judge_are_not_the_translation(self, tmp_path: Path):
+        capture: dict = {}
+        result = self._run(tmp_path, capture)
+
+        assert capture, f"judge never ran; output was:\n{result.output}"
+        joined = "\n".join(capture["originals"].values())
+        assert "vestigium" in joined, "the judge was not given the English source"
+        assert "вестигиум" not in joined, (
+            "the judge was handed the translation as the original — the very defect "
+            "source_chunk_set exists to prevent"
+        )
+        # And the translation slot really does carry the Russian, so the test
+        # would not pass merely because nothing was translated.
+        assert "вестигиум" in "\n".join(capture["translations"].values())

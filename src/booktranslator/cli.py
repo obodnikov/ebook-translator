@@ -11,6 +11,7 @@ Commands:
 from __future__ import annotations
 
 import json
+from datetime import UTC, datetime
 from pathlib import Path
 
 import click
@@ -36,6 +37,7 @@ from .pipeline_helpers import (
     ChunkerConfigMismatchError,
     build_reflect_input,
     collect_chunk_originals,
+    collect_preferred_translations,
     collect_stage_translations,
     collect_waterfall_paragraphs,
     create_image_provider,
@@ -627,6 +629,19 @@ def translate(
         f"{cfg.chunker.overlap_paragraphs} paragraphs)"
     )
 
+    # The translator splices each translated paragraph into the live tree
+    # (translator.py:_splice_fragments), so `chunk_set` stops holding the
+    # source text the moment translation starts. Judge, reflect and verify all
+    # need the real original to compare against, so they read it from a second
+    # copy of the book that nothing writes to. Re-reading costs ~0.03s.
+    source_chunk_set = chunk_book(
+        read_book_structured(epub),
+        target_words=cfg.chunker.target_words,
+        overlap_paragraphs=cfg.chunker.overlap_paragraphs,
+    )
+    if limit_chunks is not None:
+        source_chunk_set.chunks = source_chunk_set.chunks[:limit_chunks]
+
     effective_parallelism = parallelism if parallelism is not None else cfg.translate.parallelism
     if effective_parallelism > 1:
         console.print(f"[bold]Parallelism:[/bold] {effective_parallelism} chunks")
@@ -700,7 +715,7 @@ def translate(
         # Collect original and translated texts
         translate_ids = cache.get_all_chunk_ids_for_stage("translate")
         if translate_ids:
-            chunk_originals = collect_chunk_originals(chunk_set, translate_ids)
+            chunk_originals = collect_chunk_originals(source_chunk_set, translate_ids)
             chunk_translations = collect_stage_translations(cache, translate_ids, stage="translate")
 
             # Only judge chunks that have both original and translation
@@ -815,7 +830,7 @@ def translate(
                 ]
             )
             chunks_to_reflect_data = build_reflect_input(
-                chunk_set,
+                source_chunk_set,
                 cache,
                 {r.chunk_id for r in chunks_to_reflect_results},
                 judge_by_id,
@@ -908,7 +923,7 @@ def translate(
         originals_for_verify: dict[str, str] | None = None
         if pp_stage == "verify":
             originals_for_verify = collect_chunk_originals(
-                chunk_set, list(waterfall_paragraphs.keys())
+                source_chunk_set, list(waterfall_paragraphs.keys())
             )
 
         for cid, paragraphs in sorted(waterfall_paragraphs.items()):
@@ -955,6 +970,11 @@ def translate(
                             f"{stage_name} | cached {pstats.chunks_cached} "
                             f"new {pstats.chunks_processed} "
                             f"failed {pstats.chunks_failed}"
+                            + (
+                                f" re-asked {pstats.format_retries}"
+                                if pstats.format_retries
+                                else ""
+                            )
                         ),
                     )
 
@@ -1152,6 +1172,29 @@ def judge_cmd(
         "-j",
         help="Number of chunks to judge concurrently.",
     ),
+    no_cache: bool = typer.Option(
+        False,
+        "--no-cache",
+        help=(
+            "Score every chunk again, ignoring cached verdicts. Results are stored "
+            "under a fresh run id, so the existing verdicts survive — this is how the "
+            "judge's own spread gets measured: score the same text twice and compare."
+        ),
+    ),
+    limit_chunks: int | None = typer.Option(
+        None,
+        "--limit-chunks",
+        help=("Score only the first N chunks. Sampling instead of paying for the whole book."),
+    ),
+    from_stage: str = typer.Option(
+        "translate",
+        "--from",
+        help=(
+            "Which stage to score: translate (default), reflect, proofread, style, "
+            "verify, repair — or 'final' for the text the book would be assembled "
+            "from, honouring `btrans prefer`."
+        ),
+    ),
 ) -> None:
     """Run the judge pass on already-translated chunks.
 
@@ -1195,10 +1238,35 @@ def judge_cmd(
 
     # Collect originals and translations using shared helpers
     chunk_originals = collect_chunk_originals(chunk_set, translate_ids)
-    chunk_translations = collect_stage_translations(cache, translate_ids, stage="translate")
+    if from_stage == "final":
+        # What `btrans assemble` would use, `btrans prefer` overrides included.
+        chunk_translations = collect_preferred_translations(cache, translate_ids)
+    else:
+        stage_ids = cache.get_all_chunk_ids_for_stage(from_stage)
+        if not stage_ids:
+            console.print(
+                f"[red]No chunks cached for stage {from_stage!r}.[/red]\n"
+                f"[dim]Known stages: {', '.join(STAGE_WATERFALL)}, or 'final'.[/dim]"
+            )
+            cache.close()
+            raise typer.Exit(code=1)
+        chunk_translations = collect_stage_translations(cache, stage_ids, stage=from_stage)
 
     judgeable_ids = sorted(set(chunk_originals.keys()) & set(chunk_translations.keys()))
+    if limit_chunks is not None:
+        judgeable_ids = judgeable_ids[:limit_chunks]
+
+    run_id = f"run-{datetime.now(UTC):%Y%m%dT%H%M%SZ}" if no_cache else None
+    if run_id:
+        console.print(f"[bold]Fresh run:[/bold] {run_id} (cached verdicts left untouched)")
+    console.print(f"[bold]Judging stage:[/bold] {from_stage}")
     console.print(f"[bold]Chunks to judge:[/bold] {len(judgeable_ids)}")
+    if from_stage != "translate":
+        console.print(
+            "[yellow]Note:[/yellow] verdicts are tagged with the stage they describe, "
+            "but `btrans repair` and `btrans status` read every verdict, so this cache "
+            "will now hold more than one per chunk."
+        )
 
     judge_model = model or cfg.models.judge
     console.print(f"[bold]Model:[/bold] {judge_model}")
@@ -1212,6 +1280,8 @@ def judge_cmd(
         model=judge_model,
         source_lang=cfg.source_lang,
         target_lang=cfg.target_lang,
+        judged_stage=from_stage,
+        run_id=run_id,
     )
 
     if parallelism is not None and parallelism < 1:
@@ -1348,7 +1418,9 @@ def reflect_cmd(
     cache = Cache(wd.cache_path)
 
     # Get judge scores
-    judge_scores = cache.get_judge_scores()
+    # Reflect re-does the translate stage, so it reads verdicts about
+    # that stage — not about a later one, and not from a measurement run.
+    judge_scores = cache.get_judge_scores(judged_stage="translate")
     if not judge_scores and not all_chunks:
         console.print(
             "[red]No judge scores found. Run 'btrans judge' first, "
@@ -1661,6 +1733,166 @@ def verify_cmd(
     )
 
 
+@app.command("repair")
+def repair_cmd(
+    epub: Path = typer.Argument(..., exists=True, dir_okay=False, help="Source EPUB."),
+    series: str | None = typer.Option(
+        None, "--series", "-s", help="Series slug for glossary context."
+    ),
+    glossary_path: Path | None = typer.Option(
+        None,
+        "--glossary",
+        "-g",
+        exists=True,
+        dir_okay=False,
+        help="Path to a single-book glossary.json.",
+    ),
+    config_path: Path = typer.Option(DEFAULT_CONFIG, "--config", "-c", help="YAML config file."),
+    work_dir: Path = typer.Option(
+        DEFAULT_WORK_DIR, "--work", "-w", help="Base directory for artifacts."
+    ),
+    model: str | None = typer.Option(None, "--model", "-m", help="Override the repair model."),
+    categories: str | None = typer.Option(
+        None,
+        "--categories",
+        help="Comma-separated judge categories to act on (default: grammar,markup,accuracy).",
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Show what would be proposed without calling a model or writing anything.",
+    ),
+) -> None:
+    """Apply the judge's mechanical corrections, one vetted fix at a time.
+
+    Each correction the judge quoted is turned into a candidate substitution,
+    and a model holding the original decides whether it preserves the meaning.
+    Rejected candidates are left alone: a wrong correction is printed in a
+    book, a missed one is not.
+
+    Requires a judge pass. Reads the latest available stage and stores results
+    as stage='repair'.
+    """
+    from .pipeline_helpers import (
+        collect_chunk_originals,
+        collect_waterfall_paragraphs,
+        normalize_judge_map,
+        verify_chunker_params,
+    )
+    from .repair import Repairer, RepairStats, propose
+
+    cfg = load_config(config_path if config_path.exists() else None)
+    wanted = tuple(
+        c.strip() for c in (categories.split(",") if categories else cfg.repair.categories)
+    )
+
+    console.print(f"[bold]Reading EPUB:[/bold] {epub}")
+    book = read_book_structured(epub)
+    console.print(f"[bold]Book:[/bold] {book.meta.title}")
+
+    glossary = _resolve_glossary(series, glossary_path, work_dir, cfg, book)
+    wd = WorkDir.for_book(work_dir, book.meta.title)
+    cache = Cache(wd.cache_path)
+
+    try:
+        # Verdicts about the draft: that is what the run this stage was
+        # measured on used, and the quoted fragments still resolve against the
+        # waterfall text. Measurement runs are excluded by default.
+        judge_map = normalize_judge_map(cache.get_judge_scores(judged_stage="translate"))
+        if not judge_map:
+            console.print("[red]No judge results found. Run 'btrans judge' first.[/red]")
+            raise typer.Exit(code=1)
+
+        try:
+            verify_chunker_params(cache, cfg.chunker.target_words, cfg.chunker.overlap_paragraphs)
+        except ChunkerConfigMismatchError as e:
+            console.print(f"[red]Error:[/red] {e}")
+            raise typer.Exit(code=1) from e
+
+        chunk_set = chunk_book(
+            book,
+            target_words=cfg.chunker.target_words,
+            overlap_paragraphs=cfg.chunker.overlap_paragraphs,
+        )
+        paragraph_counts = {chunk.id: len(chunk.paragraph_indexes) for chunk in chunk_set.chunks}
+        chunk_ids = [c.id for c in chunk_set.chunks if c.id in judge_map]
+        waterfall = collect_waterfall_paragraphs(cache, chunk_ids, "repair", paragraph_counts)
+        if not waterfall:
+            console.print("[yellow]No chunks with parseable translations to repair.[/yellow]")
+            return
+
+        console.print(f"[bold]Categories:[/bold] {', '.join(wanted)}")
+
+        if dry_run:
+            total = sum(
+                len(propose(paras, judge_map[cid]["issues"], wanted).candidates)
+                for cid, paras in waterfall.items()
+            )
+            console.print(
+                f"[bold]Dry run:[/bold] {total} candidate substitutions across "
+                f"{len(waterfall)} chunks. Nothing called, nothing written."
+            )
+            return
+
+        originals = collect_chunk_originals(chunk_set, list(waterfall))
+        chosen_model = model or cfg.models.repair
+        console.print(f"[bold]Model:[/bold] {chosen_model}\n")
+
+        repairer = Repairer(
+            provider=create_stage_provider(cfg, "repair"),
+            prompt_path=Path("prompts/repair.md"),
+            cache=cache,
+            glossary=glossary,
+            model=chosen_model,
+            categories=wanted,
+            source_lang=cfg.source_lang,
+            target_lang=cfg.target_lang,
+        )
+
+        stats = RepairStats(chunks_total=len(waterfall))
+        with Progress(
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            MofNCompleteColumn(),
+            TimeElapsedColumn(),
+            console=console,
+        ) as progress:
+            task = progress.add_task("repair", total=len(waterfall))
+            for done, (cid, paras) in enumerate(sorted(waterfall.items()), 1):
+                try:
+                    repairer.repair_chunk(
+                        cid, paras, judge_map[cid]["issues"], originals.get(cid, ""), stats
+                    )
+                except Exception as e:  # noqa: BLE001
+                    stats.chunks_failed += 1
+                    console.print(f"[yellow]{cid}: {type(e).__name__}: {e}[/yellow]")
+                progress.update(
+                    task,
+                    completed=done,
+                    description=(
+                        f"repair | accepted {stats.accepted} "
+                        f"rejected {stats.rejected} failed {stats.chunks_failed}"
+                    ),
+                )
+
+        console.print(
+            f"\n[bold]Repair results:[/bold]\n"
+            f"  Candidates: {stats.candidates}\n"
+            f"  Applied:    {stats.accepted}\n"
+            f"  Rejected:   {stats.rejected}\n"
+            f"  Chunks changed: {stats.chunks_repaired}/{stats.chunks_total}\n"
+            f"  Failed: {stats.chunks_failed}\n"
+            f"[dim]Tokens: {stats.input_tokens:,} in, {stats.output_tokens:,} out.[/dim]"
+        )
+        if stats.unhandled:
+            console.print(
+                f"\n[dim]{len(stats.unhandled)} issues could not be turned into a "
+                f"substitution and were left for a human.[/dim]"
+            )
+    finally:
+        cache.close()
+
+
 # ---------------------------------------------------------------------------
 # shared postprocess runner
 # ---------------------------------------------------------------------------
@@ -1796,6 +2028,7 @@ def _run_postprocess_cmd(
                         f"{stage} | cached {pstats.chunks_cached} "
                         f"new {pstats.chunks_processed} "
                         f"failed {pstats.chunks_failed}"
+                        + (f" re-asked {pstats.format_retries}" if pstats.format_retries else "")
                     ),
                 )
 

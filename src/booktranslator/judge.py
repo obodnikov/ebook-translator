@@ -15,13 +15,18 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from . import model_json
 from .cache import Cache
 from .models import SeriesGlossary
 from .prompts import Prompt, load_prompt, render_prompt
-from .provider import OpenRouterProvider
+from .provider import CompletionResult, EmptyCompletionError, OpenRouterProvider
 from .series import render_for_prompt
 
 logger = logging.getLogger(__name__)
+
+# Sits next to the judge prompt. Used only when a verdict cannot be read even
+# after repair — see `Judge._refetch_valid_json`.
+JSON_FIX_PROMPT_NAME = "json_fix.md"
 
 LANG_NAMES = {
     "en": "English",
@@ -64,17 +69,32 @@ class Judge:
         model: str,
         source_lang: str = "en",
         target_lang: str = "ru",
+        judged_stage: str = "translate",
+        run_id: str | None = None,
     ):
         self.provider = provider
+        self.prompt_path = prompt_path
         self.prompt: Prompt = load_prompt(prompt_path)
         self.cache = cache
         self.glossary = glossary
         self.model = model
         self.source_lang = source_lang
         self.target_lang = target_lang
+        # Which stage's text these verdicts describe. Recorded on every row so
+        # scoring a second stage does not leave the cache holding two verdicts
+        # per chunk with no way to tell them apart.
+        self.judged_stage = judged_stage
+        # Set to start a fresh measurement: it joins the cache key, so this
+        # run neither reads nor overwrites earlier verdicts on the same text.
+        # Reusing the same id resumes that run from its own cached rows, which
+        # is what makes an interrupted variance measurement restartable.
+        self.run_id = run_id
 
         self._glossary_block = render_for_prompt(glossary) if glossary else "(no glossary provided)"
         self._lock = threading.Lock()
+        # Loaded on first use; absent file means the re-ask is simply skipped.
+        self._json_fix_prompt: Prompt | None = None
+        self._json_fix_loaded = False
 
     def _build_context(
         self,
@@ -99,27 +119,18 @@ class Judge:
         responses should be treated as failures, not low scores.
         """
         text = text.strip()
-        # Strip code fences if present
-        if text.startswith("```"):
-            lines = text.splitlines()
-            if lines[0].startswith("```"):
-                lines = lines[1:]
-            if lines and lines[-1].startswith("```"):
-                lines = lines[:-1]
-            text = "\n".join(lines)
-
         try:
-            data = json.loads(text)
-        except json.JSONDecodeError:
-            # Model sometimes appends explanation after valid JSON.
-            # Try to extract the first JSON object using raw_decode.
-            decoder = json.JSONDecoder()
-            try:
-                data, _ = decoder.raw_decode(text)
-            except json.JSONDecodeError as e2:
-                raise ValueError(
-                    f"Judge response is not valid JSON: {e2}. First 200 chars: {text[:200]!r}"
-                ) from e2
+            data = model_json.loads(text)
+        except json.JSONDecodeError as e:
+            raise ValueError(
+                f"Judge response is not valid JSON: {e}. First 200 chars: {text[:200]!r}"
+            ) from e
+
+        if not isinstance(data, dict):
+            raise ValueError(
+                f"Judge response is not a JSON object. Got: {type(data).__name__}. "
+                f"First 200 chars: {text[:200]!r}"
+            )
 
         raw_score = data.get("score")
         if raw_score is None:
@@ -145,6 +156,50 @@ class Judge:
 
         return score, issues
 
+    def _load_json_fix_prompt(self) -> Prompt | None:
+        """Load the fix-up prompt from beside the judge prompt, once."""
+        with self._lock:
+            if not self._json_fix_loaded:
+                self._json_fix_loaded = True
+                path = self.prompt_path.parent / JSON_FIX_PROMPT_NAME
+                if path.exists():
+                    self._json_fix_prompt = load_prompt(path)
+                else:
+                    logger.debug("No fix-up prompt at %s; malformed verdicts will fail", path)
+            return self._json_fix_prompt
+
+    def _refetch_valid_json(self, broken: str, error: Exception) -> CompletionResult | None:
+        """Ask the model to re-emit its own answer as valid JSON.
+
+        Sends only the broken answer — not the chunk — so this costs a small
+        fraction of a judging call: a verdict is about 1.5 KB either way.
+        The model is told to change nothing but the escaping, so the verdict
+        it already formed is preserved rather than formed anew.
+
+        Returns None if there is no fix-up prompt or the call fails, leaving
+        the caller to report the original parse failure.
+        """
+        prompt = self._load_json_fix_prompt()
+        if prompt is None:
+            return None
+
+        system, user = render_prompt(prompt, {"broken_json": broken, "error": str(error)})
+        try:
+            result = self.provider.complete(
+                model=self.model,
+                system=system,
+                user=user,
+                temperature=prompt.temperature,
+                max_tokens=prompt.max_tokens,
+                reasoning_effort=prompt.reasoning_effort,
+            )
+        except Exception as e:  # noqa: BLE001 — the original failure is the one to report
+            logger.warning("Fix-up call for a malformed verdict failed: %s", e)
+            return None
+        if not result.text.strip():
+            return None
+        return result
+
     def judge_chunk(
         self,
         chunk_id: str,
@@ -156,13 +211,10 @@ class Judge:
         context = self._build_context(original_text, translated_text)
         system, user = render_prompt(self.prompt, context)
 
-        cache_key = Cache.make_key(
-            "judge",
-            self.model,
-            self.prompt.version,
-            system,
-            user,
-        )
+        key_parts = ["judge", self.model, self.prompt.version, system, user]
+        if self.run_id:
+            key_parts.append(self.run_id)
+        cache_key = Cache.make_key(*key_parts)
 
         with self._lock:
             cached = self.cache.get(cache_key)
@@ -182,22 +234,41 @@ class Judge:
                 reasoning_effort=self.prompt.reasoning_effort,
             )
             raw_text = result.text
-            # Guard: empty content means the provider routed the answer
-            # elsewhere (tool call / reasoning_content). Raise BEFORE caching so
-            # a poisoned empty response is never written to the cache.
+            # Belt and braces: provider.complete() already raises on an empty
+            # response, but a stubbed provider might not, and an empty verdict
+            # must never reach the cache.
             if not raw_text.strip():
-                raise ValueError(
+                raise EmptyCompletionError(
                     "Judge model returned empty content "
-                    f"(finish_reason={result.finish_reason!r}). Check "
-                    "WEB_SEARCH_ENABLED / FAKE_REASONING on the gateway."
+                    f"(finish_reason={result.finish_reason!r}). Reasoning shares the "
+                    "response budget with the answer — lower reasoning_effort."
                 )
 
         # Validate BEFORE caching: _parse_judge_response raises on invalid JSON,
         # so a malformed/empty response is never written to the cache.
-        score, issues = self._parse_judge_response(raw_text)
+        fixup: CompletionResult | None = None
+        try:
+            score, issues = self._parse_judge_response(raw_text)
+        except ValueError as e:
+            # A cached row is never worth money: if it no longer reads, that
+            # is a failure to surface, not a call to make.
+            if result is None:
+                raise
+            logger.warning(
+                "Verdict for %s did not parse (%s); asking the model to fix it", chunk_id, e
+            )
+            fixup = self._refetch_valid_json(raw_text, e)
+            if fixup is None:
+                raise
+            # Store the text that parses, so `btrans status --scores` reads the
+            # same verdict later without repeating the fix-up call.
+            score, issues = self._parse_judge_response(fixup.text)
+            raw_text = fixup.text
 
         # Cache only fresh, validated results (never on a cache hit).
         if result is not None:
+            fix_in = fixup.input_tokens if fixup else 0
+            fix_out = fixup.output_tokens if fixup else 0
             with self._lock:
                 self.cache.put(
                     key=cache_key,
@@ -205,13 +276,17 @@ class Judge:
                     model=self.model,
                     prompt_version=self.prompt.version,
                     content=raw_text,
-                    input_tokens=result.input_tokens,
-                    output_tokens=result.output_tokens,
-                    meta={"chunk_id": chunk_id},
+                    input_tokens=result.input_tokens + fix_in,
+                    output_tokens=result.output_tokens + fix_out,
+                    meta={
+                        "chunk_id": chunk_id,
+                        "judged_stage": self.judged_stage,
+                        **({"run": self.run_id} if self.run_id else {}),
+                    },
                 )
                 stats.chunks_judged += 1
-                stats.input_tokens += result.input_tokens
-                stats.output_tokens += result.output_tokens
+                stats.input_tokens += result.input_tokens + fix_in
+                stats.output_tokens += result.output_tokens + fix_out
         judge_result = JudgeResult(
             chunk_id=chunk_id,
             score=score,

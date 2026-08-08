@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import logging
 import os
 from dataclasses import dataclass, field
 
@@ -10,11 +11,32 @@ from openai import OpenAI
 from tenacity import (
     retry,
     retry_if_exception_type,
+    retry_if_not_exception_type,
     stop_after_attempt,
     wait_exponential,
 )
 
+logger = logging.getLogger(__name__)
+
 DEFAULT_BASE_URL = "https://openrouter.ai/api/v1"
+
+# Warn once a response gets this close to the provider's response ceiling.
+# There is no earlier signal: kiro-gateway returns finish_reason="stop" even
+# when it truncates (docs/design/2026-08-03-...md §4.4).
+RESPONSE_SIZE_WARN_RATIO = 0.85
+
+
+class EmptyCompletionError(ValueError):
+    """The provider returned no content.
+
+    Permanent, not transient: retrying the identical request cannot help.
+    The usual cause is the response ceiling — injected reasoning is ordinary
+    output and competes with the answer for the same budget, so a verbose
+    reasoning pass can leave nothing for the answer itself.
+
+    Subclasses ValueError because that is what the stages raised for this
+    failure before the check moved here, and callers catch it that way.
+    """
 
 
 @dataclass
@@ -26,6 +48,9 @@ class CompletionResult:
     model: str
     raw: dict
     finish_reason: str | None = None  # e.g. "stop", "length", "content_filter"
+    # Reasoning text, when the provider exposes it. Diagnostics only — it is a
+    # draft of the model's thinking, never the answer.
+    reasoning: str = ""
 
 
 @dataclass
@@ -50,6 +75,7 @@ class OpenRouterProvider:
         site_url: str | None = None,
         api_key_env: str = "OPENROUTER_API_KEY",
         extra_headers: dict[str, str] | None = None,
+        max_response_bytes: int | None = None,
     ):
         key = api_key or os.environ.get(api_key_env)
         if not key:
@@ -70,6 +96,7 @@ class OpenRouterProvider:
         self._api_key = key
         self._base_url = resolved_base_url
         self._extra_headers = default_headers.copy()
+        self._max_response_bytes = max_response_bytes
 
         self.client = OpenAI(
             base_url=resolved_base_url,
@@ -79,7 +106,9 @@ class OpenRouterProvider:
 
     @retry(
         reraise=True,
-        retry=retry_if_exception_type(Exception),
+        # Retry anything transient, but not EmptyCompletionError: it is
+        # permanent, and the identical request would fail the same way.
+        retry=retry_if_not_exception_type(EmptyCompletionError),
         stop=stop_after_attempt(5),
         wait=wait_exponential(multiplier=2, min=2, max=60),
     )
@@ -121,7 +150,30 @@ class OpenRouterProvider:
         response = self.client.chat.completions.create(**kwargs)
 
         choice = response.choices[0]
-        text = choice.message.content or ""
+        message = choice.message
+        text = message.content or ""
+        finish_reason = getattr(choice, "finish_reason", None)
+        # Providers disagree on the field name: kiro-gateway uses
+        # `reasoning_content`, OpenRouter uses `reasoning`.
+        reasoning = (
+            getattr(message, "reasoning_content", None) or getattr(message, "reasoning", None) or ""
+        )
+
+        if not text.strip():
+            # Do NOT fall back to `reasoning`: it is a draft of the model's
+            # thinking, not the answer. Caching it would put nonsense into the
+            # book. finish_reason is no help either — kiro-gateway reports
+            # "stop" even when it truncates.
+            raise EmptyCompletionError(
+                f"{model} returned no content "
+                f"(finish_reason={finish_reason!r}, reasoning={len(reasoning)} chars). "
+                "Reasoning shares the response budget with the answer: shrink the chunk "
+                "(chunker.target_words) or lower reasoning_effort in the prompt. "
+                "Raising max_tokens helps on OpenRouter but not on kiro-gateway, "
+                "which never forwards it upstream."
+            )
+
+        self._warn_if_near_response_ceiling(text, reasoning, model)
 
         usage = response.usage
         input_tokens = getattr(usage, "prompt_tokens", 0) or 0
@@ -134,8 +186,35 @@ class OpenRouterProvider:
             output_tokens=output_tokens,
             total_tokens=total_tokens,
             model=response.model or model,
-            finish_reason=getattr(choice, "finish_reason", None),
+            finish_reason=finish_reason,
+            reasoning=reasoning,
             raw=response.model_dump() if hasattr(response, "model_dump") else {},
+        )
+
+    def _warn_if_near_response_ceiling(self, text: str, reasoning: str, model: str) -> None:
+        """Log a warning when a response approaches the configured size limit.
+
+        `max_response_bytes` is a cautious threshold, not the provider's exact
+        limit: a 23 644-byte response came back whole while a 26 825-byte one
+        was cut off mid-JSON, and the real limit looks to be counted in tokens
+        rather than bytes. Reasoning and answer share the budget, so both are
+        counted here. Silence means nothing on its own — the next, slightly
+        longer chunk may be the one that comes back empty.
+        """
+        if not self._max_response_bytes:
+            return
+        used = len(text.encode("utf-8")) + len(reasoning.encode("utf-8"))
+        if used < self._max_response_bytes * RESPONSE_SIZE_WARN_RATIO:
+            return
+        logger.warning(
+            "Response from %s is %d bytes, past the %d-byte warning threshold "
+            "set for this provider (%d of them reasoning). Shrink "
+            "chunker.target_words or lower reasoning_effort before responses "
+            "start coming back empty.",
+            model,
+            used,
+            self._max_response_bytes,
+            len(reasoning.encode("utf-8")),
         )
 
     @retry(

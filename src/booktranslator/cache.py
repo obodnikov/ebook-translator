@@ -13,6 +13,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from . import model_json
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS cache (
     key TEXT PRIMARY KEY,
@@ -47,7 +49,28 @@ CREATE TABLE IF NOT EXISTS pipeline_meta (
 """
 
 # Waterfall order: later stages take priority over earlier ones.
-STAGE_WATERFALL = ["translate", "reflect", "proofread", "style", "verify"]
+STAGE_WATERFALL = ["translate", "reflect", "proofread", "style", "verify", "repair"]
+
+
+def _is_measurement_run(meta_json: str | None) -> bool:
+    """True for verdicts written by `btrans judge --no-cache`."""
+    if not meta_json:
+        return False
+    try:
+        return bool(json.loads(meta_json).get("run"))
+    except (json.JSONDecodeError, AttributeError):
+        return False
+
+
+def _judged_stage_of(meta_json: str | None) -> str:
+    """Which stage a judge row describes. Rows predating the field are
+    'translate' — that is the only stage the judge could score back then."""
+    if not meta_json:
+        return "translate"
+    try:
+        return json.loads(meta_json).get("judged_stage", "translate")
+    except (json.JSONDecodeError, AttributeError):
+        return "translate"
 
 
 @dataclass
@@ -85,6 +108,9 @@ class Preference:
 class Cache:
     def __init__(self, path: Path):
         path.parent.mkdir(parents=True, exist_ok=True)
+        # Kept so a stage can write beside the cache — the book's work
+        # directory — without every call site having to pass it down.
+        self.path = path
         # check_same_thread=False lets us share the connection across
         # worker threads; our Translator serialises cache put/get with
         # its own lock, so concurrent access is safe.
@@ -326,36 +352,45 @@ class Cache:
         """
         return self.count_distinct_chunks(stage) + self.count_legacy_rows(stage)
 
-    def get_judge_scores(self) -> list[dict[str, Any]]:
-        """Get all judge results as parsed dicts with chunk_id, score, issues."""
+    def get_judge_scores(
+        self,
+        judged_stage: str | None = None,
+        include_measurement_runs: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Get all judge results as parsed dicts with chunk_id, score, issues.
+
+        `judged_stage` narrows the result to verdicts describing that stage's
+        text — the value the judge recorded in meta. Rows written before that
+        field existed count as 'translate', which is what they were. Without
+        it, every verdict is returned, which mixes stages once more than one
+        has been scored.
+
+        Verdicts from a `--no-cache` run are excluded unless asked for. Those
+        rows exist to measure the judge against itself; letting them decide
+        which chunks get reflected or repaired would hand the pipeline a
+        second, arbitrary opinion.
+        """
         rows = self.conn.execute(
-            "SELECT chunk_id, content FROM cache WHERE stage = 'judge'"
+            "SELECT chunk_id, content, meta_json FROM cache WHERE stage = 'judge'"
         ).fetchall()
+        if not include_measurement_runs:
+            rows = [r for r in rows if not _is_measurement_run(r[2])]
+        if judged_stage is not None:
+            rows = [r for r in rows if _judged_stage_of(r[2]) == judged_stage]
+        rows = [(r[0], r[1]) for r in rows]
         results = []
-        decoder = json.JSONDecoder()
         for chunk_id, content in rows:
-            # Judge content is JSON: {score: N, issues: [...]}
-            # Model often wraps in code fences and/or appends explanation.
+            # Judge content is JSON: {score: N, issues: [...]}. The model wraps
+            # it in code fences, appends explanation, or leaves a quote from the
+            # source text unescaped — model_json.loads handles all three, and
+            # handles them the same way the judge did when it accepted the row.
             parsed: dict[str, Any]
             text = (content or "").strip()
-
-            # Strip code fences if present
-            if text.startswith("```"):
-                lines = text.splitlines()
-                if lines[0].startswith("```"):
-                    lines = lines[1:]
-                if lines and lines[-1].startswith("```"):
-                    lines = lines[:-1]
-                text = "\n".join(lines).strip()
-
             try:
-                parsed = json.loads(text)
-            except (json.JSONDecodeError, TypeError):
-                # Trailing text after valid JSON — use raw_decode
-                try:
-                    parsed, _ = decoder.raw_decode(text)
-                except (json.JSONDecodeError, TypeError, ValueError):
-                    parsed = {"score": 0, "issues": ["parse error"]}
+                loaded = model_json.loads(text)
+            except (json.JSONDecodeError, TypeError, ValueError):
+                loaded = None
+            parsed = loaded if isinstance(loaded, dict) else {"score": 0, "issues": ["parse error"]}
             parsed["chunk_id"] = chunk_id or ""
             results.append(parsed)
         return results

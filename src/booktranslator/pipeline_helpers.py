@@ -37,6 +37,7 @@ def _create_provider_from_config(provider_cfg: ProviderConfig) -> OpenRouterProv
         base_url=provider_cfg.base_url,
         api_key_env=provider_cfg.api_key_env,
         extra_headers=provider_cfg.extra_headers or None,
+        max_response_bytes=provider_cfg.max_response_bytes,
     )
 
 
@@ -48,6 +49,7 @@ _TEXT_STAGES = (
     "proofread",
     "style",
     "verify",
+    "repair",
 )
 
 

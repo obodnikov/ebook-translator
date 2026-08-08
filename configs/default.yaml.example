@@ -25,9 +25,13 @@ models:
   proofread:  anthropic/claude-haiku-4.5
   style:      anthropic/claude-sonnet-4.6
   verify:     anthropic/claude-sonnet-4.6
+  repair:     anthropic/claude-sonnet-4.6
 
 reflection:
-  trigger_score: 3
+  # Порог 2: замерено, что рефлексия окупается только на двойках. На тройках
+  # выигрыш неотличим от нуля, а фрагменты с оценкой 5 она портит — добавляет
+  # около замечания на фрагмент сверх собственного шума оценщика.
+  trigger_score: 2
 
 pauses:
   after_glossary: true
@@ -48,6 +52,18 @@ notifications:
 
 cost:
   hard_limit_usd: 50.0
+
+repair:
+  # Точечная починка замечаний оценщика: правится только названная им фраза,
+  # остальной абзац не трогается.
+  #
+  # Оценщик выдаёт шесть категорий: grammar, accuracy, naturalness, register,
+  # glossary, markup. Включены три, где исправление сводится к подстановке.
+  # Замер на «Bear Head» (36 кандидатов через привратника): отклонено 3 из 11
+  # у grammar, 7 из 20 у accuracy, 4 из 5 у glossary — поэтому accuracy в
+  # списке, а glossary нет. register и naturalness автоматике не по зубам.
+  enabled: true
+  categories: [grammar, markup, accuracy]
 
 reader_notes:
   enabled: true

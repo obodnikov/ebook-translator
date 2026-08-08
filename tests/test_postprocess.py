@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -167,6 +168,57 @@ class TestParseResponse:
         text = "  \n===PARAGRAPH 1===\n  <p>Spaced.</p>  \n  "
         fragments = proofreader._parse_response(text, 1)
         assert fragments[0] == "<p>Spaced.</p>"
+
+
+class TestNoChangesRecognition:
+    """The delta prompts print NO_CHANGES inside a code fence and call it
+    `NO_CHANGES` in the rules, so models copy those shapes back. Rejecting
+    them threw away correct verdicts on the Bear Head run: style ch19_c05
+    answered with commentary plus a fenced NO_CHANGES, verify ch25_c03 with
+    a back-quoted one. Both were logged as parse failures.
+    """
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "NO_CHANGES",
+            "no changes",
+            "NOCHANGES",
+            "```\nNO_CHANGES\n```",
+            "```NO_CHANGES```",
+            "`NO_CHANGES`",  # verify ch25_c03
+            "  NO_CHANGES  \n",
+            # style ch19_c05: a sentence of commentary, then the fenced verdict
+            "Перечитал абзац. Текст живой, канцелярита нет.\n\n```\nNO_CHANGES\n```",
+        ],
+    )
+    def test_accepted_forms_leave_paragraphs_untouched(self, proofreader: PostProcessor, text):
+        paragraphs = ["<p>Первый.</p>", "<p>Второй.</p>"]
+        out, changed = proofreader._parse_delta_response(text, paragraphs)
+        assert out == paragraphs
+        assert changed is False
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            # A response carrying patches is never read as "nothing to change",
+            # even when it mentions NO_CHANGES in passing — edits must not be
+            # silently dropped.
+            "Сначала думал ответить NO_CHANGES, но нет.\n"
+            '```json\n[{"p": 1, "text": "<p>Правка.</p>"}]\n```',
+            '[{"p": 1, "text": "<p>Правка.</p>"}]',
+        ],
+    )
+    def test_patches_win_over_a_mention_of_no_changes(self, proofreader: PostProcessor, text):
+        paragraphs = ["<p>Первый.</p>", "<p>Второй.</p>"]
+        out, changed = proofreader._parse_delta_response(text, paragraphs)
+        assert changed is True
+        assert out[0] == "<p>Правка.</p>"
+        assert out[1] == "<p>Второй.</p>"
+
+    def test_unparseable_response_still_raises(self, proofreader: PostProcessor):
+        with pytest.raises(ValueError, match="not valid JSON or NO_CHANGES"):
+            proofreader._parse_delta_response("Ответа нет вовсе.", ["<p>Первый.</p>"])
 
 
 # ---------------------------------------------------------------------------
@@ -1348,3 +1400,207 @@ class TestCacheLifecycle:
         assert entry is not None
         assert entry.content == "test"
         cache2.close()
+
+
+class TestDialogueDashIsProtected:
+    """Russian dialogue opens a paragraph with an em dash; guillemets are for
+    speech quoted inline. The proofread prompt asked for « » outright, models
+    obliged, and 8 paragraphs of Bear Head lost their dashes. The prompt says
+    the opposite now (v5); this refuses the change if a model does it anyway.
+
+    One patch is dropped, not the whole chunk: rejecting everything would throw
+    away the pass's real corrections over a punctuation slip.
+    """
+
+    @pytest.mark.parametrize(
+        "before,after",
+        [
+            # the three shapes seen in the book
+            (
+                '<p class="indent">— Он своё получит.</p>',
+                '<p class="indent">« Он своё получит.»</p>',
+            ),
+            ("<p>— Выйти из машины!</p>", "<p>« Выйти из машины! »</p>"),
+            (
+                "<p>— Доктор — он своё получит, — пробормотал Бойо.</p>",
+                "<p>« Доктор — он своё получит, — пробормотал Бойо.</p>",
+            ),
+        ],
+    )
+    def test_patch_is_dropped_and_paragraph_kept(self, proofreader: PostProcessor, before, after):
+        paragraphs = [before, "<p>Второй абзац.</p>"]
+        patches = json.dumps([{"p": 1, "text": after}])
+        out, changed = proofreader._parse_delta_response(patches, paragraphs)
+        assert out[0] == before
+        assert changed is False
+
+    def test_other_patches_in_the_same_chunk_still_apply(self, proofreader: PostProcessor):
+        paragraphs = ["<p>— Он своё получит.</p>", "<p>Опечатка тут.</p>"]
+        patches = json.dumps(
+            [
+                {"p": 1, "text": "<p>« Он своё получит. »</p>"},
+                {"p": 2, "text": "<p>Опечатки тут нет.</p>"},
+            ]
+        )
+        out, changed = proofreader._parse_delta_response(patches, paragraphs)
+        assert out[0] == paragraphs[0], "the damaging patch was refused"
+        assert out[1] == "<p>Опечатки тут нет.</p>", "the good patch went through"
+        assert changed is True
+
+    @pytest.mark.parametrize(
+        "before,after",
+        [
+            # edits that must not be mistaken for the defect
+            ("<p>— Ну, это совсем не так.</p>", "<p>— Ну, это совсем не так!</p>"),
+            ("<p>Он сказал «да» и ушёл.</p>", "<p>Он сказал «нет» и ушёл.</p>"),
+            (
+                "<p>«Правда» — так называлась газета.</p>",
+                "<p>«Известия» — так называлась газета.</p>",
+            ),
+            ("<p>Он сказал.</p>", "<p>— Он сказал.</p>"),
+        ],
+    )
+    def test_legitimate_edits_are_untouched(self, proofreader: PostProcessor, before, after):
+        out, changed = proofreader._parse_delta_response(
+            json.dumps([{"p": 1, "text": after}]), [before]
+        )
+        assert out[0] == after
+        assert changed is True
+
+
+# ---------------------------------------------------------------------------
+# Replies that ignore the delta format
+# ---------------------------------------------------------------------------
+
+
+def _reply(text: str, *, in_tokens: int = 300, out_tokens: int = 50, finish: str | None = "stop"):
+    return CompletionResult(
+        text=text,
+        input_tokens=in_tokens,
+        output_tokens=out_tokens,
+        total_tokens=in_tokens + out_tokens,
+        model="haiku",
+        raw={},
+        finish_reason=finish,
+    )
+
+
+PATCH = '[{"p": 1, "text": "<p>Исправлено.</p>"}]'
+
+
+class TestPreambleBeforeThePatchArray:
+    def test_commentary_then_array(self, proofreader: PostProcessor):
+        text = "Looking through the text carefully:\n\n" + PATCH
+        out, changed = proofreader._parse_delta_response(text, ["<p>Исходное.</p>"])
+        assert out == ["<p>Исправлено.</p>"]
+        assert changed is True
+
+    def test_a_bracket_in_the_commentary_does_not_hide_the_array(self, proofreader: PostProcessor):
+        """The first `[` is a false start — the parser must keep looking."""
+        text = "Paragraph [14] contains a gender error, see [note]:\n\n" + PATCH
+        out, changed = proofreader._parse_delta_response(text, ["<p>Исходное.</p>"])
+        assert out == ["<p>Исправлено.</p>"]
+        assert changed is True
+
+    def test_commentary_without_an_array_still_fails(self, proofreader: PostProcessor):
+        with pytest.raises(ValueError, match="not valid JSON or NO_CHANGES"):
+            proofreader._parse_delta_response(
+                "Looking at paragraph 18, the translation omits a long speech.",
+                ["<p>Исходное.</p>"],
+            )
+
+
+class TestFormatRetry:
+    def test_a_reply_of_pure_commentary_is_asked_again(
+        self, proofreader: PostProcessor, mock_provider, cache: Cache
+    ):
+        mock_provider.complete.side_effect = [
+            _reply("Looking through the text carefully, paragraph 14 needs work."),
+            _reply(PATCH, in_tokens=310, out_tokens=20),
+        ]
+
+        stats = PostprocessStats(stage="proofread", chunks_total=10)
+        result = proofreader.process_chunk("ch01_c01", ["<p>Исходное.</p>"], stats)
+
+        assert result is not None
+        assert "Исправлено" in result.content
+        assert stats.format_retries == 1
+        assert mock_provider.complete.call_count == 2
+        # The second call is not free and must show up in the totals.
+        assert stats.input_tokens == 610
+        assert stats.output_tokens == 70
+
+    def test_the_retry_restates_the_format(self, proofreader: PostProcessor, mock_provider):
+        mock_provider.complete.side_effect = [_reply("Просто рассуждение."), _reply(PATCH)]
+
+        proofreader.process_chunk(
+            "ch01_c01", ["<p>Исходное.</p>"], PostprocessStats(stage="proofread", chunks_total=10)
+        )
+
+        first_user = mock_provider.complete.call_args_list[0].kwargs["user"]
+        retry_user = mock_provider.complete.call_args_list[1].kwargs["user"]
+        assert "previous reply was rejected" in retry_user
+        assert retry_user.startswith(first_user), "the retry asks the same question"
+
+    def test_a_second_bad_reply_fails_the_chunk(
+        self, proofreader: PostProcessor, mock_provider, cache: Cache
+    ):
+        mock_provider.complete.side_effect = [
+            _reply("Рассуждение раз."),
+            _reply("Рассуждение два."),
+        ]
+
+        stats = PostprocessStats(stage="proofread", chunks_total=10)
+        with pytest.raises(ValueError):
+            proofreader.process_chunk("ch01_c01", ["<p>Исходное.</p>"], stats)
+
+        assert mock_provider.complete.call_count == 2
+        assert cache.get_chunk_stages("ch01_c01") == []
+
+    def test_a_cached_reply_is_never_re_bought(
+        self, proofreader: PostProcessor, mock_provider, cache: Cache
+    ):
+        """A cached row that stopped parsing is a failure, not a purchase."""
+        mock_provider.complete.side_effect = [_reply("Рассуждение."), _reply(PATCH)]
+
+        stats = PostprocessStats(stage="proofread", chunks_total=10)
+        proofreader.process_chunk("ch01_c01", ["<p>Исходное.</p>"], stats)
+        assert mock_provider.complete.call_count == 2
+
+        stats2 = PostprocessStats(stage="proofread", chunks_total=10)
+        proofreader.process_chunk("ch01_c01", ["<p>Исходное.</p>"], stats2)
+        assert stats2.chunks_cached == 1
+        assert mock_provider.complete.call_count == 2, "the cached run bought nothing"
+
+    def test_the_retry_budget_is_bounded(self, proofreader: PostProcessor, mock_provider):
+        """A model that has stopped following the format must not double the bill."""
+        mock_provider.complete.return_value = _reply("Одно рассуждение за другим.")
+
+        stats = PostprocessStats(stage="proofread", chunks_total=10)
+        for i in range(8):
+            with pytest.raises(ValueError):
+                proofreader.process_chunk(f"ch01_c{i:02d}", ["<p>Исходное.</p>"], stats)
+
+        assert stats.format_retries == 3, "budget for a 10-chunk run"
+        assert mock_provider.complete.call_count == 8 + 3
+
+
+class TestFailedReplyIsKept:
+    def test_the_reply_lands_next_to_the_cache(
+        self, proofreader: PostProcessor, mock_provider, cache: Cache, tmp_path: Path
+    ):
+        mock_provider.complete.return_value = _reply(
+            "Looking at paragraph 18, the translation omits a long speech.",
+            finish="length",
+        )
+
+        stats = PostprocessStats(stage="proofread", chunks_total=10)
+        with pytest.raises(ValueError):
+            proofreader.process_chunk("ch70_c01", ["<p>Исходное.</p>"], stats)
+
+        dumped = tmp_path / "failed" / "proofread-ch70_c01.txt"
+        assert dumped.exists()
+        body = dumped.read_text(encoding="utf-8")
+        assert "omits a long speech" in body, "the whole reply, not the first 200 chars"
+        assert "finish_reason: 'length'" in body
+        assert "--- reply after the format retry ---" in body

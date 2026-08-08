@@ -18,6 +18,11 @@ class ProviderConfig(BaseModel):
     base_url: str = "https://openrouter.ai/api/v1"
     api_key_env: str = "OPENROUTER_API_KEY"
     extra_headers: dict[str, str] = Field(default_factory=dict)
+    # Largest response this endpoint can return, in bytes. Reasoning and answer
+    # share it. None means no known ceiling (OpenRouter). kiro-gateway caps
+    # around 23 000 and gives no warning of its own — see
+    # docs/design/2026-08-03-judge-repair-stage-and-reasoning-on-gateway.md §4.
+    max_response_bytes: int | None = None
 
 
 class ProvidersConfig(BaseModel):
@@ -35,6 +40,7 @@ class ProvidersConfig(BaseModel):
     proofread: ProviderConfig | None = None
     style: ProviderConfig | None = None
     verify: ProviderConfig | None = None
+    repair: ProviderConfig | None = None
 
 
 class ModelsConfig(BaseModel):
@@ -45,6 +51,7 @@ class ModelsConfig(BaseModel):
     proofread: str = "anthropic/claude-haiku-4.5"
     style: str = "anthropic/claude-sonnet-4.6"
     verify: str = "anthropic/claude-sonnet-4.6"
+    repair: str = "anthropic/claude-sonnet-4.6"
     cover: str = "google/gemini-3.1-flash-image-preview"
 
 
@@ -60,7 +67,14 @@ class TranslateConfig(BaseModel):
 
 
 class ReflectionConfig(BaseModel):
-    trigger_score: int = 3
+    # Reflect pays off only on the worst chunks. Measured per score band on
+    # Bear Head, each against its own noise control (same text, judged twice),
+    # in issues per chunk: at 2 it removes 0.88 beyond noise, at 3 it removes
+    # 0.26 — indistinguishable from nothing — and at 5 it *adds* 0.67, because
+    # it rewrites 87% of paragraphs whether or not there is anything to fix.
+    # See docs/design/2026-08-03-judge-repair-stage-and-reasoning-on-gateway.md
+    # §5.8-bis.
+    trigger_score: int = 2
 
 
 class PausesConfig(BaseModel):
@@ -120,6 +134,24 @@ _LANG_NAME_MAP: dict[str, str] = {
 }
 
 
+class RepairConfig(BaseModel):
+    """Targeted repair of the judge's findings.
+
+    `categories` lists which judge issue categories the stage acts on. The
+    default holds those where a correction is a substitution rather than a
+    judgement call. Register and naturalness were measured to be beyond
+    automatic repair and stay out.
+
+    Accuracy was excluded on the assumption that it was "too mixed"; measuring
+    it disproved that, and the same run disqualified glossary instead — see
+    docs/design/2026-08-03-judge-repair-stage-and-reasoning-on-gateway.md §5
+    for the counts.
+    """
+
+    enabled: bool = True
+    categories: list[str] = Field(default_factory=lambda: ["grammar", "markup", "accuracy"])
+
+
 class Config(BaseModel):
     source_lang: str = "en"
     target_lang: str = "ru"
@@ -136,6 +168,7 @@ class Config(BaseModel):
     retry: RetryConfig = Field(default_factory=RetryConfig)
     notifications: NotificationsConfig = Field(default_factory=NotificationsConfig)
     reader_notes: ReaderNotesConfig = Field(default_factory=ReaderNotesConfig)
+    repair: RepairConfig = Field(default_factory=RepairConfig)
     cost: CostConfig = Field(default_factory=CostConfig)
 
     def resolved_target_lang_name(self) -> str | None:

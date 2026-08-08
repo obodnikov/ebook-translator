@@ -27,6 +27,7 @@ from booktranslator.pipeline_helpers import (
     save_chunker_params,
     verify_chunker_params,
 )
+from tests.epub_fixtures import write_minimal_epub
 
 
 @pytest.fixture
@@ -408,3 +409,87 @@ class TestCreateStageProvider:
         translate_prov = create_stage_provider(cfg, "translate")
         assert judge_prov._base_url == "http://judge/v1"
         assert translate_prov._base_url == "http://text/v1"
+
+
+# ---------------------------------------------------------------------------
+# Originals must not be read from a tree that translation has written into
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def tiny_epub(tmp_path: Path) -> Path:
+    return write_minimal_epub(tmp_path / "test-book.epub")
+
+
+class TestOriginalsSurviveTranslation:
+    """The translator splices each translated paragraph into the live tree
+    (translator.py), so a ChunkSet that has been translated no longer holds the
+    source text — asking it for originals hands back the translation.
+
+    On the Bear Head run this fed the judge the Russian text in both slots. It
+    compared the translation with itself, scored 102 of 110 chunks a perfect 5,
+    and the four chunks that answered "the Original section is in Russian" were
+    reporting the truth. Verify, whose whole job is comparing against the
+    source, was hit the same way.
+
+    The fix is that cli.translate builds `source_chunk_set` from a second read
+    of the EPUB and hands that to judge, reflect and verify. These tests pin
+    the property that fix relies on.
+    """
+
+    @staticmethod
+    def _build(epub: Path):
+        from booktranslator.chunker import chunk_book
+        from booktranslator.epub_io import read_book_structured
+
+        return chunk_book(read_book_structured(epub), target_words=2000, overlap_paragraphs=1)
+
+    @staticmethod
+    def _translate_in_place(chunk_set) -> None:
+        """Do to the tree exactly what Translator does after a chunk returns."""
+        from lxml import etree
+
+        for chapter in chunk_set.book.chapters:
+            for i, para in enumerate(chapter.paragraphs):
+                new_el = etree.fromstring(
+                    '<p xmlns="http://www.w3.org/1999/xhtml">Русский перевод абзаца.</p>'
+                )
+                para.getparent().replace(para, new_el)
+                chapter.paragraphs[i] = new_el
+
+    def test_translated_tree_no_longer_yields_originals(self, tiny_epub: Path):
+        chunk_set = self._build(tiny_epub)
+        ids = [c.id for c in chunk_set.chunks]
+        assert "vestigium" in collect_chunk_originals(chunk_set, ids)[ids[0]]
+
+        self._translate_in_place(chunk_set)
+
+        after = collect_chunk_originals(chunk_set, ids)[ids[0]]
+        assert "vestigium" not in after, (
+            "translation has overwritten the source in this ChunkSet — this is the "
+            "hazard cli.translate works around with source_chunk_set"
+        )
+        assert "Русский перевод" in after
+
+    def test_a_second_chunk_set_still_holds_the_source(self, tiny_epub: Path):
+        translated = self._build(tiny_epub)
+        source = self._build(tiny_epub)  # what cli.translate calls source_chunk_set
+
+        self._translate_in_place(translated)
+
+        ids = [c.id for c in source.chunks]
+        originals = collect_chunk_originals(source, ids)[ids[0]]
+        assert "vestigium" in originals
+        assert "Русский перевод" not in originals
+
+    def test_originals_with_paragraphs_are_protected_too(self, tiny_epub: Path):
+        """reflect reads through collect_chunk_originals_with_paragraphs."""
+        translated = self._build(tiny_epub)
+        source = self._build(tiny_epub)
+
+        self._translate_in_place(translated)
+
+        ids = {c.id for c in source.chunks}
+        text, paragraphs = collect_chunk_originals_with_paragraphs(source, ids)[next(iter(ids))]
+        assert "vestigium" in text
+        assert any("vestigium" in p for p in paragraphs)

@@ -13,7 +13,7 @@ from .cache import Cache
 from .epub_io import ExtractedBook
 from .models import Glossary, GlossaryEntry
 from .prompts import load_prompt, render_prompt
-from .provider import CompletionResult, OpenRouterProvider
+from .provider import CompletionResult, EmptyCompletionError, OpenRouterProvider
 
 LANG_NAMES = {
     "en": "English",
@@ -192,17 +192,19 @@ def extract_glossary(
         )
         raw_text = result.text
 
-        # Guard: empty content means thinking consumed the entire output budget
-        # (e.g. kiro-gateway with extended thinking enabled). Do NOT cache or
-        # write a glossary — surface a clear error instead.
+        # Belt and braces. provider.complete() already raises on an empty
+        # response, but a stubbed or third-party provider might not, and an
+        # empty glossary poisons every stage of the book that follows. Without
+        # this the failure would surface as "not valid JSON", which sends the
+        # reader looking in the wrong place.
         if not raw_text.strip():
             finish_info = (
                 f" (finish_reason={result.finish_reason!r})" if result.finish_reason else ""
             )
-            raise ValueError(
+            raise EmptyCompletionError(
                 f"Model returned empty content{finish_info}. "
-                "На gateway с extended thinking ответ мог уйти в reasoning_content — "
-                "убедитесь, что в промпте задан reasoning_effort: none."
+                "Reasoning shares the response budget with the answer — lower "
+                "reasoning_effort in the prompt, or shrink the request."
             )
 
         # Parse and validate bookend BEFORE writing to cache.

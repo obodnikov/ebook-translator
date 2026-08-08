@@ -228,12 +228,24 @@ class TestWaterfallResolution:
         assert cache.resolve_stage_for_chunk("ch01_c01") == "reflect"
 
     def test_full_waterfall(self, fresh_cache: Cache):
+        """With every stage present, the last one in the waterfall wins.
+
+        Asserted against the constant rather than a literal name, so adding a
+        stage does not need this test edited — only that the property holds.
+        """
         cache = fresh_cache
         for stage in STAGE_WATERFALL:
             cache.put(
                 f"k_{stage}", stage, "m", "v1", f"text_{stage}", meta={"chunk_id": "ch01_c01"}
             )
-        assert cache.resolve_stage_for_chunk("ch01_c01") == "verify"
+        assert cache.resolve_stage_for_chunk("ch01_c01") == STAGE_WATERFALL[-1]
+
+    def test_repair_beats_verify(self, fresh_cache: Cache):
+        """Repair is the final say: it edits what verify produced."""
+        cache = fresh_cache
+        cache.put("k1", "verify", "m", "v1", "v", meta={"chunk_id": "ch01_c01"})
+        cache.put("k2", "repair", "m", "v1", "r", meta={"chunk_id": "ch01_c01"})
+        assert cache.resolve_stage_for_chunk("ch01_c01") == "repair"
 
     def test_preference_overrides_waterfall(self, fresh_cache: Cache):
         cache = fresh_cache
@@ -313,6 +325,49 @@ class TestQueryMethods:
         by_id = {s["chunk_id"]: s for s in scores}
         assert by_id["c1"]["score"] == 4
         assert by_id["c2"]["issues"] == ["bad", "worse"]
+
+    def test_judge_scores_can_be_narrowed_to_one_judged_stage(self, fresh_cache: Cache):
+        """`btrans judge --from X` tags each verdict with the stage it
+        describes, so scoring a second stage does not leave the cache with two
+        verdicts per chunk and no way to tell them apart."""
+        cache = fresh_cache
+        cache.put(
+            "j1",
+            "judge",
+            "m",
+            "v1",
+            json.dumps({"score": 2, "issues": ["draft is rough"]}),
+            meta={"chunk_id": "c1", "judged_stage": "translate"},
+        )
+        cache.put(
+            "j2",
+            "judge",
+            "m",
+            "v1",
+            json.dumps({"score": 5, "issues": []}),
+            meta={"chunk_id": "c1", "judged_stage": "final"},
+        )
+
+        assert len(cache.get_judge_scores()) == 2
+        draft = cache.get_judge_scores(judged_stage="translate")
+        final = cache.get_judge_scores(judged_stage="final")
+        assert [s["score"] for s in draft] == [2]
+        assert [s["score"] for s in final] == [5]
+
+    def test_verdicts_without_the_field_count_as_translate(self, fresh_cache: Cache):
+        """Caches written before the field existed hold translate verdicts —
+        that was the only stage the judge could score."""
+        cache = fresh_cache
+        cache.put(
+            "old",
+            "judge",
+            "m",
+            "v1",
+            json.dumps({"score": 3, "issues": []}),
+            meta={"chunk_id": "c1"},
+        )
+        assert len(cache.get_judge_scores(judged_stage="translate")) == 1
+        assert cache.get_judge_scores(judged_stage="final") == []
 
     def test_list_stages(self, fresh_cache: Cache):
         cache = fresh_cache

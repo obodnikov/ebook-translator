@@ -359,3 +359,208 @@ class TestJudgeCacheIntegration:
         # Waterfall should still resolve to translate (judge is not in waterfall)
         resolved = cache.resolve_stage_for_chunk("ch01_c01")
         assert resolved == "translate"
+
+
+class TestFreshRunKeepsEarlierVerdicts:
+    """`--no-cache` starts a run id that joins the cache key, so scoring the
+    same text twice measures the judge's own spread instead of overwriting the
+    first answer with the second.
+    """
+
+    @staticmethod
+    def _judge(provider, prompt_path, cache, run_id=None):
+        return Judge(
+            provider=provider,
+            prompt_path=prompt_path,
+            cache=cache,
+            glossary=None,
+            model="anthropic/claude-haiku-4.5",
+            source_lang="en",
+            target_lang="ru",
+            judged_stage="translate",
+            run_id=run_id,
+        )
+
+    @staticmethod
+    def _reply(text):
+        r = MagicMock()
+        r.text = text
+        r.input_tokens = 10
+        r.output_tokens = 10
+        r.finish_reason = "stop"
+        return r
+
+    def test_second_run_adds_a_verdict_instead_of_replacing_it(
+        self, mock_provider, judge_prompt_path, cache
+    ):
+        from booktranslator.judge import JudgeStats
+
+        mock_provider.complete.return_value = self._reply('{"score": 2, "issues": ["a"]}')
+        first = self._judge(mock_provider, judge_prompt_path, cache)
+        first.judge_chunk("c1", "original", "перевод", JudgeStats(chunks_total=1))
+
+        mock_provider.complete.return_value = self._reply('{"score": 4, "issues": []}')
+        second = self._judge(mock_provider, judge_prompt_path, cache, run_id="run-x")
+        second.judge_chunk("c1", "original", "перевод", JudgeStats(chunks_total=1))
+
+        both = sorted(s["score"] for s in cache.get_judge_scores(include_measurement_runs=True))
+        assert both == [2, 4], "both verdicts on the same text must survive"
+
+        # A measurement run must not become a second opinion the pipeline acts
+        # on: reflect and repair would otherwise pick chunks from whichever
+        # verdict happened to be read last.
+        production = [s["score"] for s in cache.get_judge_scores()]
+        assert production == [2], "the --no-cache run must stay out of the default view"
+
+    def test_without_a_run_id_the_same_text_is_served_from_cache(
+        self, mock_provider, judge_prompt_path, cache
+    ):
+        from booktranslator.judge import JudgeStats
+
+        mock_provider.complete.return_value = self._reply('{"score": 2, "issues": []}')
+        j = self._judge(mock_provider, judge_prompt_path, cache)
+        j.judge_chunk("c1", "original", "перевод", JudgeStats(chunks_total=1))
+
+        stats = JudgeStats(chunks_total=1)
+        j.judge_chunk("c1", "original", "перевод", stats)
+        assert stats.chunks_cached == 1
+        assert mock_provider.complete.call_count == 1
+
+    def test_the_same_run_id_resumes_rather_than_re_asking(
+        self, mock_provider, judge_prompt_path, cache
+    ):
+        """An interrupted measurement restarts without paying twice."""
+        from booktranslator.judge import JudgeStats
+
+        mock_provider.complete.return_value = self._reply('{"score": 3, "issues": []}')
+        j = self._judge(mock_provider, judge_prompt_path, cache, run_id="run-x")
+        j.judge_chunk("c1", "original", "перевод", JudgeStats(chunks_total=1))
+
+        stats = JudgeStats(chunks_total=1)
+        again = self._judge(mock_provider, judge_prompt_path, cache, run_id="run-x")
+        again.judge_chunk("c1", "original", "перевод", stats)
+        assert stats.chunks_cached == 1
+        assert mock_provider.complete.call_count == 1
+
+
+# ---------------------------------------------------------------------------
+# Malformed verdicts
+# ---------------------------------------------------------------------------
+
+
+def _reply(text: str, *, in_tokens: int = 500, out_tokens: int = 50) -> CompletionResult:
+    return CompletionResult(
+        text=text,
+        input_tokens=in_tokens,
+        output_tokens=out_tokens,
+        total_tokens=in_tokens + out_tokens,
+        model="haiku",
+        raw={},
+    )
+
+
+@pytest.fixture
+def judge_with_fixup(mock_provider, judge_prompt_path: Path, cache: Cache) -> Judge:
+    """A judge whose prompt directory also holds the fix-up prompt."""
+    (judge_prompt_path.parent / "json_fix.md").write_text(
+        "---\nversion: 1\ntemperature: 0\nmax_tokens: 4000\n---\n"
+        "# System\nRepair the JSON.\n\n"
+        "# User\nError: {{ error }}\nReply: {{ broken_json }}\n",
+        encoding="utf-8",
+    )
+    return Judge(
+        provider=mock_provider,
+        prompt_path=judge_prompt_path,
+        cache=cache,
+        glossary=None,
+        model="anthropic/claude-haiku-4.5",
+    )
+
+
+class TestMalformedVerdicts:
+    # The shape that broke a real run: the judge quoted English dialogue and
+    # left its straight quotes unescaped inside the JSON string.
+    STRAY_QUOTES = (
+        '{"score": 3, "issues": ["accuracy: p.10 «сдвиг» — в оригинале '
+        '«and "No," Ada said, but then felt»"]}'
+    )
+
+    def test_stray_quotes_cost_nothing_to_repair(self, judge_with_fixup: Judge, mock_provider):
+        """The common break is fixed locally — no second call to the model."""
+        mock_provider.complete.return_value = _reply(self.STRAY_QUOTES)
+
+        stats = JudgeStats()
+        result = judge_with_fixup.judge_chunk("c1", "<p>A</p>", "<p>А</p>", stats)
+
+        assert result is not None
+        assert result.score == 3
+        assert '«and "No," Ada said, but then felt»' in result.issues[0]
+        assert mock_provider.complete.call_count == 1
+
+    def test_unreadable_verdict_is_sent_back_for_repair(
+        self, judge_with_fixup: Judge, mock_provider, cache: Cache
+    ):
+        mock_provider.complete.side_effect = [
+            _reply('{"score": 3, "issues": [ oops'),
+            _reply('{"score": 3, "issues": ["accuracy: сдвиг"]}', in_tokens=90, out_tokens=40),
+        ]
+
+        stats = JudgeStats()
+        result = judge_with_fixup.judge_chunk("c1", "<p>A</p>", "<p>А</p>", stats)
+
+        assert result is not None
+        assert result.score == 3
+        assert mock_provider.complete.call_count == 2
+        # The fix-up call is not free and must show up in the totals.
+        assert stats.input_tokens == 590
+        assert stats.output_tokens == 90
+        # The cache holds the text that parses, so `status --scores` agrees
+        # with the run without repeating the fix-up call.
+        assert cache.get_judge_scores()[0]["score"] == 3
+
+    def test_a_verdict_that_stays_broken_fails_the_chunk(
+        self, judge_with_fixup: Judge, mock_provider, cache: Cache
+    ):
+        mock_provider.complete.side_effect = [
+            _reply("совершенно не JSON"),
+            _reply("по-прежнему не JSON"),
+        ]
+
+        stats = JudgeStats()
+        with pytest.raises(ValueError, match="not valid JSON"):
+            judge_with_fixup.judge_chunk("c1", "<p>A</p>", "<p>А</p>", stats)
+
+        assert mock_provider.complete.call_count == 2
+        assert cache.get_judge_scores() == [], "nothing unreadable may reach the cache"
+
+    def test_without_a_fix_up_prompt_nothing_extra_is_spent(self, judge: Judge, mock_provider):
+        mock_provider.complete.return_value = _reply("совершенно не JSON")
+
+        with pytest.raises(ValueError, match="not valid JSON"):
+            judge.judge_chunk("c1", "<p>A</p>", "<p>А</p>", JudgeStats())
+
+        assert mock_provider.complete.call_count == 1
+
+    def test_an_unreadable_cached_row_never_costs_money(
+        self, judge_with_fixup: Judge, mock_provider, cache: Cache
+    ):
+        """A row cached by an older version must surface, not trigger a call."""
+        from booktranslator.prompts import render_prompt
+
+        j = judge_with_fixup
+        system, user = render_prompt(j.prompt, j._build_context("<p>A</p>", "<p>А</p>"))
+        cache.put(
+            key=Cache.make_key("judge", j.model, j.prompt.version, system, user),
+            stage="judge",
+            model=j.model,
+            prompt_version=j.prompt.version,
+            content="это не JSON",
+            input_tokens=0,
+            output_tokens=0,
+            meta={"chunk_id": "c1", "judged_stage": "translate"},
+        )
+
+        with pytest.raises(ValueError, match="not valid JSON"):
+            j.judge_chunk("c1", "<p>A</p>", "<p>А</p>", JudgeStats())
+
+        mock_provider.complete.assert_not_called()

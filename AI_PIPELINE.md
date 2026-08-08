@@ -66,6 +66,27 @@ See [ARCHITECTURE.md §3, §5, §9](ARCHITECTURE.md); this file is the coding co
 - Classify failures (ARCHITECTURE §9): transient (429/5xx) → retry with backoff; permanent (400 /
   invalid JSON) → log, skip the chunk, flag it in state, continue; budget exceeded → abort;
   malformed EPUB → fail fast at extract. Don't turn a permanent error into an infinite retry.
+- **Read every JSON reply through `model_json.loads`, never a bare `json.loads`.** It strips code
+  fences, tolerates commentary after the value, and escapes the straight `"` a model leaves inside
+  a string when it quotes the source text — the break that `raw_decode` cannot repair. Repairs are
+  validated by parsing, so a valid reply is never rewritten. Don't grow a fourth private parser in
+  a stage; extend that module instead, and keep the stage's own salvage (truncation, preamble)
+  around it.
+- Invalid JSON stays a permanent error, with two exceptions, both capped at **one** extra attempt
+  on a **fresh** reply — a cached row that no longer parses must surface as a failure, never as a
+  reason to spend money:
+  - the judge sends an unreadable verdict back to the model to be re-emitted as JSON
+    (`prompts/json_fix.md`, a short call carrying only the broken reply);
+  - a post-processing stage whose reply ignored the delta format asks the same question again with
+    the format restated (`_FORMAT_RETRY_NOTE`, appended in code so no prompt version changes).
+    Never a "repair" of that reply: when a model answers with analysis instead of patches there is
+    no JSON to repair, and turning prose into patches would let it invent text nobody vetted.
+    These are full-price calls, so a run gets a budget (`PostProcessor._retry_budget`) — a model
+    that has stopped following the format must not silently double the cost of the stage.
+- A reply that fails to parse is never cached, so it is gone when the run ends. Write it to
+  `work/<book>/failed/<stage>-<chunk>.txt` before raising, and log the failure with
+  `finish_reason` and the length — 200 characters in an error message is not enough to tell a
+  truncated reply from a model that ignored the format.
 
 ## What stays out of this layer
 
