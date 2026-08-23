@@ -109,7 +109,7 @@ def _make_console():
 class TestInjectNotesForCli:
     def test_preloaded_glossary_is_used_directly(self, tmp_path: Path):
         """preloaded_glossary bypasses load_notes_glossary entirely."""
-        chapter = _make_chapter("Вестигиум — это магия.")
+        chapter = _make_chapter("Он почувствовал Вестигиум в комнате.")
         glossary = _make_glossary(
             [
                 _make_entry("Vestigium", "Вестигиум", "Магический след"),
@@ -139,7 +139,7 @@ class TestInjectNotesForCli:
 
     def test_notes_flag_false_returns_none_no_injection(self, tmp_path: Path):
         """--no-notes flag disables injection regardless of cfg.enabled."""
-        chapter = _make_chapter("Вестигиум — это магия.")
+        chapter = _make_chapter("Он почувствовал Вестигиум в комнате.")
         glossary = _make_glossary(
             [
                 _make_entry("Vestigium", "Вестигиум", "Магический след"),
@@ -166,7 +166,7 @@ class TestInjectNotesForCli:
 
     def test_notes_flag_none_uses_cfg_enabled_true(self, tmp_path: Path):
         """notes_flag=None falls back to cfg.reader_notes.enabled=True."""
-        chapter = _make_chapter("Вестигиум — это магия.")
+        chapter = _make_chapter("Он почувствовал Вестигиум в комнате.")
         glossary = _make_glossary(
             [
                 _make_entry("Vestigium", "Вестигиум", "Магический след"),
@@ -194,7 +194,7 @@ class TestInjectNotesForCli:
 
     def test_notes_flag_none_uses_cfg_enabled_false(self, tmp_path: Path):
         """notes_flag=None falls back to cfg.reader_notes.enabled=False → skip."""
-        chapter = _make_chapter("Вестигиум — это магия.")
+        chapter = _make_chapter("Он почувствовал Вестигиум в комнате.")
         glossary = _make_glossary(
             [
                 _make_entry("Vestigium", "Вестигиум", "Магический след"),
@@ -221,7 +221,7 @@ class TestInjectNotesForCli:
 
     def test_no_glossary_implicit_returns_none_silently(self, tmp_path: Path):
         """When notes enabled by default and no glossary, silently return None (no warning)."""
-        chapter = _make_chapter("Вестигиум — это магия.")
+        chapter = _make_chapter("Он почувствовал Вестигиум в комнате.")
         cfg = _make_cfg(enabled=True)
         console = _make_console()
 
@@ -245,7 +245,7 @@ class TestInjectNotesForCli:
 
     def test_no_glossary_explicit_warns_and_returns_none(self, tmp_path: Path):
         """When notes explicitly requested and no glossary, warn and return None."""
-        chapter = _make_chapter("Вестигиум — это магия.")
+        chapter = _make_chapter("Он почувствовал Вестигиум в комнате.")
         cfg = _make_cfg(enabled=True)
         console = _make_console()
 

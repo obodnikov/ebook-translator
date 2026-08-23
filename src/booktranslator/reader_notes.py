@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 
 from lxml import etree
@@ -22,6 +23,53 @@ EPUB_NS = "http://www.idpf.org/2007/ops"
 XHTML_NS = "http://www.w3.org/1999/xhtml"
 
 NSMAP = {"epub": EPUB_NS, "xhtml": XHTML_NS}
+
+# ---------------------------------------------------------------------------
+# Russian word forms
+#
+# A glossary term is stored in its dictionary form while the text uses it
+# declined, so the match has to cover the declined forms. Accepting the
+# dictionary form plus an arbitrary short tail does not work: it matches a
+# sequence of letters rather than a word, and swallows unrelated words that
+# merely begin the same way — "скрип" (company scrip) matched "скрипели",
+# a form of the verb "скрипеть".
+#
+# Instead the term's own ending is stripped to get its stem, and only the
+# endings that belong to its declension type are accepted. The whole form is
+# part of the match, so the marker always lands after a complete word.
+# ---------------------------------------------------------------------------
+
+_VOWELS = "аеёиоуыэюя"
+# after these consonants -ы is spelled -и (Russian spelling rule)
+_SIBILANTS = "гкхжшчщ"
+
+# Terms this short are matched exactly: a generated ending on a three-letter
+# stem collides with ordinary words far too often.
+_MIN_INFLECTED_LEN = 5
+
+# The bare-stem form (genitive plural "ведьм") is deliberately absent from the
+# vowel-stem tables: dropping a letter can expose a shorter, unrelated word —
+# "Бойо" would otherwise match "бой". For consonant stems the dictionary form
+# itself is the zero-ending form, so "" belongs there.
+_MASC_HARD = ("", "а", "у", "ом", "е", "ы", "ов", "ам", "ами", "ах")
+_MASC_HARD_SIB = ("", "а", "у", "ом", "е", "и", "ов", "ам", "ами", "ах")
+_MASC_SOFT_J = ("й", "я", "ю", "ем", "е", "и", "ев", "ям", "ями", "ях")
+_MASC_SOFT_SIGN = ("ь", "я", "ю", "ем", "е", "и", "ей", "ям", "ями", "ях")
+_FEM_SIGN = ("ь", "и", "ью", "ей", "ям", "ями", "ях")
+_FEM_A = ("а", "ы", "е", "у", "ой", "ою", "ам", "ами", "ах")
+_FEM_A_SIB = ("а", "и", "е", "у", "ой", "ою", "ам", "ами", "ах")
+_FEM_YA = ("я", "и", "е", "ю", "ей", "ею", "ям", "ями", "ях")
+_FEM_IYA = ("ия", "ии", "ию", "ией", "иею", "ий", "иям", "иями", "иях")
+_NEUT_O = ("о", "а", "у", "ом", "е", "ам", "ами", "ах")
+_NEUT_E = ("е", "я", "ю", "ем", "и", "ям", "ями", "ях")
+_ADJ_HARD = ("ый", "ой", "ого", "ому", "ым", "ом", "ая", "ую", "ою", "ое", "ые", "ых", "ыми")
+_ADJ_SOFT = ("ий", "его", "ему", "им", "ем", "яя", "ей", "юю", "ею", "ее", "ие", "их", "ими")
+_NOUN_IJ = ("ий", "ия", "ию", "ием", "ии", "иев", "иям", "иями", "иях")
+
+# Looking left from a match, these are stepped over on the way to the
+# punctuation that would mark the end of the previous sentence.
+_SKIP_LEFT = " \t\r\n «»\"“”„‘’'()[]{}<>-–—*"
+_SENTENCE_ENDERS = ".!?…:;"
 
 
 class GlossaryLoadError(Exception):
@@ -35,8 +83,105 @@ class NoteCandidate:
     """A glossary entry eligible for footnoting."""
 
     entry: SeriesGlossaryEntry
-    translation: str  # lowercased for matching
+    translation: str  # as written in the glossary — the case carries meaning
     note_text: str
+    probe: str  # lowercased stem, for the cheap "is it in this paragraph" test
+
+
+def _stem_and_endings(word: str, gender: str | None) -> tuple[str, tuple[str, ...]]:
+    """Split a Russian word into its stem and the endings of its declension.
+
+    The declension type is read off the word's own ending; for words in -ь,
+    which can be either masculine or feminine, the glossary `gender` field
+    settles it, and both sets are accepted when it is missing.
+    """
+    t = word.lower()
+    if len(t) < _MIN_INFLECTED_LEN:
+        return t, ("",)
+
+    last, prev = t[-1], t[-2]
+
+    if t.endswith(("ый", "ой")):
+        return t[:-2], _ADJ_HARD
+    if t.endswith("ий"):
+        # "-ий" ends both adjectives ("Управляющий") and nouns ("Апиарий").
+        # Accept the union: a form from the wrong set is not a word at all,
+        # so it never occurs in the text.
+        return t[:-2], _ADJ_SOFT + tuple(e for e in _NOUN_IJ if e not in _ADJ_SOFT)
+    if t.endswith("ия"):
+        return t[:-2], _FEM_IYA
+    if last == "я":
+        return t[:-1], _FEM_YA
+    if last == "а":
+        return t[:-1], _FEM_A_SIB if prev in _SIBILANTS else _FEM_A
+    if last == "й":
+        return t[:-1], _MASC_SOFT_J
+    if last == "ь":
+        if gender == "f":
+            return t[:-1], _FEM_SIGN
+        if gender == "m":
+            return t[:-1], _MASC_SOFT_SIGN
+        return t[:-1], _MASC_SOFT_SIGN + tuple(e for e in _FEM_SIGN if e not in _MASC_SOFT_SIGN)
+    if last == "о":
+        return t[:-1], _NEUT_O
+    if last == "е":
+        return t[:-1], _NEUT_E
+    if last in _VOWELS:
+        # -у, -и, -ю and the like: borrowed names that do not decline
+        return t, ("",)
+    return t, _MASC_HARD_SIB if last in _SIBILANTS else _MASC_HARD
+
+
+@lru_cache(maxsize=2048)
+def _compile_term_pattern(term: str, gender: str | None) -> re.Pattern[str]:
+    """Build the regex that finds `term` in any of its grammatical forms.
+
+    In a multi-word term only the last word is inflected; the rest has to
+    appear verbatim, since agreement across the phrase is beyond what an
+    ending table can do.
+    """
+    words = term.split()
+    stem, endings = _stem_and_endings(words[-1], gender)
+    body = re.escape(stem)
+    if endings != ("",):
+        # longest ending first, so the match covers the whole word
+        alt = "|".join(re.escape(e) for e in sorted(set(endings), key=len, reverse=True))
+        body += f"(?:{alt})"
+    head = "".join(re.escape(w) + r"\s+" for w in words[:-1])
+    return re.compile(rf"(?<!\w){head}{body}(?!\w)", re.IGNORECASE)
+
+
+@lru_cache(maxsize=2048)
+def _term_probe(term: str, gender: str | None) -> str:
+    """A lowercased substring that any match of the term must contain."""
+    words = term.split()
+    if len(words) > 1:
+        return words[0].lower()
+    return _stem_and_endings(words[0], gender)[0]
+
+
+def _requires_capital(term: str) -> bool:
+    """Whether the term may only match text that is capitalised too.
+
+    A term the glossary writes with a capital is a proper noun of the book's
+    world — "Облако" the computing system, not "облако" in the sky. Russian
+    does not capitalise common nouns mid-sentence, so that capital is the one
+    signal separating the two senses, and it must not be discarded.
+    """
+    return term[:1].isupper()
+
+
+def _is_sentence_start(text: str, pos: int) -> bool:
+    """Whether the word at `pos` opens a sentence.
+
+    There every word is capitalised, so a capital says nothing about whether
+    this is the term or an ordinary word, and such occurrences are passed over
+    in favour of an unambiguous one later in the text.
+    """
+    i = pos - 1
+    while i >= 0 and text[i] in _SKIP_LEFT:
+        i -= 1
+    return i < 0 or text[i] in _SENTENCE_ENDERS
 
 
 @dataclass
@@ -65,8 +210,9 @@ def _build_candidates(
         candidates.append(
             NoteCandidate(
                 entry=entry,
-                translation=entry.translation.lower(),
+                translation=entry.translation,
                 note_text=entry.notes,
+                probe=_term_probe(entry.translation, entry.gender),
             )
         )
     # Sort by translation length descending so longer matches take priority
@@ -82,17 +228,21 @@ def _get_text_content(element: etree._Element) -> str:
 
 def _find_and_wrap_first_match(
     element: etree._Element,
-    search_lower: str,
+    term: str,
     note_id: str,
     xhtml_ns: str,
+    gender: str | None = None,
 ) -> bool:
-    """Find the first occurrence of `search_lower` in element's text tree
+    """Find the first usable occurrence of `term` in element's text tree
     and wrap it in a footnote-ref <sup><a>. Returns True if wrapped.
 
-    Walks the text nodes (element.text and child.tail) looking for a
-    case-insensitive match. When found, splits the text node and inserts
-    the <sup><a epub:type="noteref" href="#note_id">[N]</a></sup> after
-    the matched word.
+    Walks the text nodes (element.text and child.tail) looking for the term
+    in any of its grammatical forms. When found, splits the text node and
+    inserts the <sup><a epub:type="noteref" href="#note_id">[N]</a></sup>
+    after the matched word.
+
+    `term` is taken as the glossary writes it: a capitalised term only
+    matches capitalised text, and only away from the start of a sentence.
     """
     # We need to find the match in the serialized text and figure out
     # which text node it lives in.
@@ -137,27 +287,22 @@ def _find_and_wrap_first_match(
 
     _collect_text_nodes(element)
 
-    # Build full text and find match (word-boundary aware)
+    # Build full text and find the term in any of its forms. The text keeps
+    # its original case — for a capitalised term the case is the meaning.
     full_text = "".join(t for _, _, t in text_nodes)
-    full_lower = full_text.lower()
-    # Use left word boundary to avoid matching inside larger words
-    # (e.g. "форма" should not match inside "информация").
-    # For short terms (≤4 chars), match the bare word only — a suffix would
-    # produce false positives (e.g. "art" matching "article").
-    # For longer terms, allow a short inflectional ending so the term is found
-    # in its declined forms ("вестигиум" in "вестигиуме", "биоформ" in
-    # "биоформами"). Russian case/number endings are at most three letters;
-    # a longer tail means a different word altogether ("АдАпт" inside
-    # "адаптационная"), and that occurrence is rejected.
-    # The ending is part of the match, so the marker always lands after the
-    # whole word rather than inside it.
-    escaped = re.escape(search_lower)
-    suffix = r"" if len(search_lower) <= 4 else r"\w{0,3}"
-    pattern = re.compile(r"(?<!\w)" + escaped + suffix + r"(?!\w)", re.IGNORECASE)
+    pattern = _compile_term_pattern(term, gender)
+    needs_capital = _requires_capital(term)
 
-    for m in pattern.finditer(full_lower):
+    for m in pattern.finditer(full_text):
         match_pos = m.start()
         match_len = m.end() - m.start()
+
+        if needs_capital and (
+            not m.group(0)[:1].isupper() or _is_sentence_start(full_text, match_pos)
+        ):
+            # Either an ordinary word ("тяжёлое облако", not the Cloud), or a
+            # position where the capital proves nothing. Try the next one.
+            continue
 
         # Find which text node contains match_pos
         offset = 0
@@ -285,15 +430,21 @@ def inject_reader_notes(
                 if config.scope == "first-in-chapter" and entry_key in noted_in_chapter:
                     continue
 
-                # Quick check: is the translation even in this paragraph?
-                if candidate.translation not in para_text_lower:
+                # Quick check: is the term's stem even in this paragraph?
+                if candidate.probe not in para_text_lower:
                     continue
 
-                # Try to wrap the first occurrence
+                # Try to wrap the first usable occurrence
                 note_counter += 1
                 note_id = f"reader-note-{note_counter}"
 
-                success = _find_and_wrap_first_match(para, candidate.translation, note_id, xhtml_ns)
+                success = _find_and_wrap_first_match(
+                    para,
+                    candidate.translation,
+                    note_id,
+                    xhtml_ns,
+                    gender=candidate.entry.gender,
+                )
 
                 if success:
                     # Create the footnote aside element
