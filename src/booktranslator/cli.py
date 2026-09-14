@@ -2881,14 +2881,45 @@ def assemble_cmd(
                     f"Aborting.[/dim]"
                 )
             else:
-                console.print(
-                    f"\n[red]Error:[/red] {len(failed_ids)} chunk(s) have no "
-                    f"translated content in cache:\n"
-                    f"[dim]  {', '.join(sorted(failed_ids)[:10])}"
-                    f"{'...' if len(failed_ids) > 10 else ''}[/dim]\n"
-                    f"\n[dim]Run 'btrans translate' first to populate the cache, "
-                    f"or check that chunker settings match.[/dim]"
+                # A chunk fails either because nothing is cached for it, or
+                # because every cached version is unusable (wrong paragraph
+                # count or broken XHTML). The two need different fixes.
+                cached_stages = cache.get_stages_for_chunks_bulk(failed_ids)
+                broken = sorted(
+                    cid
+                    for cid in failed_ids
+                    if any(s.stage in STAGE_WATERFALL for s in cached_stages.get(cid, []))
                 )
+                missing = sorted(set(failed_ids) - set(broken))
+                if missing:
+                    console.print(
+                        f"\n[red]Error:[/red] {len(missing)} chunk(s) have no "
+                        f"translated content in cache:\n"
+                        f"[dim]  {', '.join(missing[:10])}"
+                        f"{'...' if len(missing) > 10 else ''}[/dim]\n"
+                        f"\n[dim]Run 'btrans translate' first to populate the cache, "
+                        f"or check that chunker settings match.[/dim]"
+                    )
+                if broken:
+                    chunk_flags = " ".join(f"--chunk {cid}" for cid in broken)
+                    found = []
+                    for cid in broken[:10]:
+                        stages = sorted(
+                            {s.stage for s in cached_stages[cid] if s.stage in STAGE_WATERFALL}
+                        )
+                        found.append(f"{cid} ({', '.join(stages)})")
+                    console.print(
+                        f"\n[red]Error:[/red] {len(broken)} chunk(s) are cached, but no "
+                        f"version of them is usable (wrong paragraph count or "
+                        f"malformed XHTML in every stage found):\n"
+                        f"[dim]  {', '.join(found)}"
+                        f"{'...' if len(broken) > 10 else ''}[/dim]\n"
+                        f"\n[dim]Remove them — clearing translate also clears every later "
+                        f"stage and verdict of those chunks — and translate them again:\n"
+                        f"  btrans cache clear {work_path} --stage translate {chunk_flags}\n"
+                        f"  btrans translate ...[/dim]",
+                        soft_wrap=True,  # keep the command copyable on one line
+                    )
             raise typer.Exit(code=1)
 
         # --- Reader notes injection ---

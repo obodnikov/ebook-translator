@@ -83,6 +83,17 @@ See [ARCHITECTURE.md §3, §5, §9](ARCHITECTURE.md); this file is the coding co
     no JSON to repair, and turning prose into patches would let it invent text nobody vetted.
     These are full-price calls, so a run gets a budget (`PostProcessor._retry_budget`) — a model
     that has stopped following the format must not silently double the cost of the stage.
+- A translate or reflect reply is checked in full before it is cached: exactly N markers **and**
+  every paragraph one well-formed XHTML element (`replies.parse_paragraphs`). The count alone is
+  not enough — a paragraph missing `</p>`, two `<p>` under one marker, or the model's own
+  "wait, I mis-numbered" pasted between markers all pass it. A rejected **fresh** reply is asked
+  for once more with the reason appended (`replies.RETRY_NOTE`, in code so no prompt version
+  changes), within the run's `replies.retry_budget`. A cached reply that fails is reported with
+  the `btrans cache clear` command that removes it — never re-bought.
+- A chunk goes into the live tree whole or not at all: parse every paragraph first, then splice.
+- The waterfall that feeds proofread / style / verify / repair skips a stage whose paragraphs do
+  not parse, the same way it skips a count mismatch. Those passes send patches for changed
+  paragraphs only, so they cannot be relied on to close a broken tag — don't pay them to try.
 - A reply that fails to parse is never cached, so it is gone when the run ends. Write it to
   `work/<book>/failed/<stage>-<chunk>.txt` before raising, and log the failure with
   `finish_reason` and the length — 200 characters in an error message is not enough to tell a

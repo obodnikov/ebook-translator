@@ -11,13 +11,13 @@ CLI commands. Addresses code review concerns about:
 from __future__ import annotations
 
 import logging
-import re
 from typing import Any
 
 from .cache import Cache
 from .chunker import ChunkSet
 from .models import Config, ProviderConfig
 from .provider import OpenRouterProvider
+from .replies import parse_fragment, split_markers
 
 logger = logging.getLogger(__name__)
 
@@ -359,9 +359,11 @@ def collect_waterfall_paragraphs(
     """Get waterfall translations parsed into paragraph lists.
 
     For each chunk, iterates preceding stages from newest to oldest and
-    accepts the first stage whose content parses correctly and matches
-    the expected paragraph count. Falls back to earlier stages if the
-    latest one is malformed.
+    accepts the first stage whose content matches the expected paragraph
+    count and whose every paragraph is well-formed XHTML. Falls back to
+    earlier stages if the latest one is malformed — a post-processing pass
+    only patches the paragraphs it changes, so it cannot be relied on to
+    repair a broken tag, and paying it to try is waste.
 
     Args:
         cache: Cache instance.
@@ -371,11 +373,7 @@ def collect_waterfall_paragraphs(
 
     Returns {chunk_id: [paragraph_fragments]} for chunks with valid content.
     """
-    import re
-
     from .cache import STAGE_WATERFALL
-
-    _MARKER_RE = re.compile(r"^===PARAGRAPH\s+\d+===\s*$", re.MULTILINE)
 
     if not chunk_ids:
         return {}
@@ -407,13 +405,13 @@ def collect_waterfall_paragraphs(
             if content is None:
                 continue
 
-            fragments = _parse_waterfall_content(content, _MARKER_RE)
+            fragments = split_markers(content)
             if fragments is None:
                 # No markers and not a single-paragraph case
                 if expected == 1:
                     # Treat entire content as single paragraph
                     text = content.strip()
-                    if text:
+                    if text and _all_well_formed(cid, stage, [text]):
                         result[cid] = [text]
                         break
                 continue
@@ -429,38 +427,30 @@ def collect_waterfall_paragraphs(
                 )
                 continue
 
+            if not _all_well_formed(cid, stage, fragments):
+                continue
+
             result[cid] = fragments
             break
 
     return result
 
 
-def _parse_waterfall_content(content: str, marker_re: re.Pattern[str]) -> list[str] | None:
-    """Parse ===PARAGRAPH N=== markers from cached content.
-
-    Returns list of fragments, or None if no markers found.
-    """
-    text = content.strip()
-    if text.startswith("```"):
-        lines = text.splitlines()
-        if lines[0].startswith("```"):
-            lines = lines[1:]
-        if lines and lines[-1].startswith("```"):
-            lines = lines[:-1]
-        text = "\n".join(lines)
-
-    matches = list(marker_re.finditer(text))
-    if not matches:
-        return None
-
-    fragments: list[str] = []
-    for i, m in enumerate(matches):
-        start = m.end()
-        end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
-        fragment = text[start:end].strip()
-        fragments.append(fragment)
-
-    return fragments
+def _all_well_formed(chunk_id: str, stage: str, fragments: list[str]) -> bool:
+    """True when every fragment parses as one XHTML element; logs the first that doesn't."""
+    for number, fragment in enumerate(fragments, start=1):
+        try:
+            parse_fragment(fragment)
+        except ValueError as e:
+            logger.warning(
+                "Waterfall %s/%s: paragraph %d is not well-formed (%s); trying earlier stage",
+                chunk_id,
+                stage,
+                number,
+                str(e).split(". First 200 chars")[0],
+            )
+            return False
+    return True
 
 
 def rehydrate_book_from_waterfall(
@@ -494,16 +484,9 @@ def rehydrate_book_from_waterfall(
         failed_chunk_ids is always empty. In strict mode (forced_stage),
         it contains IDs of chunks that could not be rehydrated.
     """
-    import re
-
     from lxml import etree
 
     from .cache import STAGE_WATERFALL
-
-    _MARKER_RE = re.compile(r"^===PARAGRAPH\s+\d+===\s*$", re.MULTILINE)
-
-    # Matches a `&` that does NOT start a valid XML entity
-    _BARE_AMP_RE = re.compile(r"&(?!(?:amp|lt|gt|quot|apos|#\d+|#x[0-9a-fA-F]+);)")
 
     # Build chunk lookup: id -> Chunk
     chunk_by_id = {c.id: c for c in chunk_set.chunks}
@@ -565,8 +548,12 @@ def rehydrate_book_from_waterfall(
                 if resolved_stage in STAGE_WATERFALL
                 else len(STAGE_WATERFALL)
             )
+            # In the translate flow the tree already holds the translate
+            # output, so falling back to it would be a no-op. A freshly
+            # loaded tree (assemble) holds the source: there translate is
+            # the last good version to fall back to.
             for stage in reversed(STAGE_WATERFALL[:resolved_idx]):
-                if stage != "translate" and stage in stage_content:
+                if stage in stage_content and (stage != "translate" or rehydrate_all):
                     stages_to_try.append(stage)
 
         expected = len(chunk.paragraph_indexes)
@@ -578,27 +565,8 @@ def rehydrate_book_from_waterfall(
             if content is None:
                 continue
 
-            # Parse paragraph markers
-            text = content.strip()
-            if text.startswith("```"):
-                lines = text.splitlines()
-                if lines[0].startswith("```"):
-                    lines = lines[1:]
-                if lines and lines[-1].startswith("```"):
-                    lines = lines[:-1]
-                text = "\n".join(lines)
-
-            matches = list(_MARKER_RE.finditer(text))
-            if not matches:
-                continue
-
-            candidate: list[str] = []
-            for i, m in enumerate(matches):
-                start = m.end()
-                end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
-                candidate.append(text[start:end].strip())
-
-            if len(candidate) != expected:
+            candidate = split_markers(content)
+            if candidate is None or len(candidate) != expected:
                 continue
 
             # Validate ALL fragments parse as XML before mutating
@@ -606,10 +574,9 @@ def rehydrate_book_from_waterfall(
             all_ok = True
 
             for para_idx, frag_str in zip(chunk.paragraph_indexes, candidate, strict=True):
-                frag_str = _BARE_AMP_RE.sub("&amp;", frag_str)
                 try:
-                    new_el = etree.fromstring(frag_str)
-                except etree.XMLSyntaxError:
+                    new_el = parse_fragment(frag_str)
+                except ValueError:
                     all_ok = False
                     break
 

@@ -637,3 +637,37 @@ class TestCacheClearCommand:
         with pytest.raises(ChunkerConfigMismatchError, match="btrans cache clear"):
             verify_chunker_params(cache, target_words=1200, overlap_paragraphs=1)
         cache.close()
+
+
+# ---------------------------------------------------------------------------
+# assemble: a cached chunk nothing usable can be built from
+# ---------------------------------------------------------------------------
+
+
+class TestAssembleNamesBrokenChunks:
+    def test_broken_chunk_is_not_reported_as_missing(self, tmp_path: Path):
+        epub = write_minimal_epub(tmp_path / "book.epub")
+        work = tmp_path / "work" / "test-book"
+        work.mkdir(parents=True)
+        cache = Cache(work / "cache.sqlite")
+        save_chunker_params(cache, target_words=2000, overlap_paragraphs=1)
+        cache.put(
+            "t1",
+            "translate",
+            "m",
+            "3",
+            "===PARAGRAPH 1===\n<p>Первый\n===PARAGRAPH 2===\n<p>Второй</p>",
+            meta={"chunk_id": "ch01_c01"},
+        )
+        cache.close()
+
+        result = runner.invoke(
+            app,
+            ["assemble", str(work), "--epub", str(epub), "--out", str(tmp_path / "out.epub")],
+        )
+
+        assert result.exit_code == 1
+        assert "no version of them is usable" in result.output
+        assert "--chunk ch01_c01" in result.output
+        assert "have no translated content" not in result.output
+        assert not (tmp_path / "out.epub").exists()

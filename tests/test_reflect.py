@@ -224,6 +224,71 @@ class TestRetranslateWithNotes:
         assert len(reflect_stages) == 1
 
 
+class TestRetranslateRejectsBrokenReplies:
+    """The re-translation competes in the waterfall, so it is checked like translate."""
+
+    BROKEN = "===PARAGRAPH 1===\n<p>Первый\n===PARAGRAPH 2===\n<p>Второй</p>"
+    GOOD = "===PARAGRAPH 1===\n<p>Первый</p>\n===PARAGRAPH 2===\n<p>Второй</p>"
+    ORIGINALS = ["<p>First</p>", "<p>Second</p>"]
+
+    @staticmethod
+    def _reply(text: str) -> CompletionResult:
+        return CompletionResult(
+            text=text, input_tokens=10, output_tokens=5, total_tokens=15, model="m", raw={}
+        )
+
+    def test_asks_again_and_caches_the_good_reply(self, reflector, mock_provider, cache):
+        mock_provider.complete.side_effect = [self._reply(self.BROKEN), self._reply(self.GOOD)]
+        stats = ReflectStats(chunks_total=1)
+
+        result = reflector._retranslate_with_notes("ch01_c01", self.ORIGINALS, "notes", stats)
+
+        assert result == self.GOOD
+        assert stats.retries == 1
+        assert "Your previous reply was rejected" in mock_provider.complete.call_args.kwargs["user"]
+        [row] = cache.get_chunk_stages("ch01_c01")
+        assert row.content == self.GOOD
+
+    def test_rejected_twice_is_not_cached(self, reflector, mock_provider, cache, tmp_path):
+        mock_provider.complete.return_value = self._reply(self.BROKEN)
+
+        with pytest.raises(ValueError, match="not well-formed"):
+            reflector._retranslate_with_notes(
+                "ch01_c01", self.ORIGINALS, "notes", ReflectStats(chunks_total=1)
+            )
+
+        assert mock_provider.complete.call_count == 2
+        assert cache.get_chunk_stages("ch01_c01") == []
+        assert (tmp_path / "failed" / "reflect-ch01_c01.txt").is_file()
+
+    def test_wrong_paragraph_count_is_rejected(self, reflector, mock_provider, cache):
+        mock_provider.complete.return_value = self._reply("===PARAGRAPH 1===\n<p>Один</p>")
+
+        with pytest.raises(ValueError, match="Expected 2 paragraphs"):
+            reflector._retranslate_with_notes(
+                "ch01_c01", self.ORIGINALS, "notes", ReflectStats(chunks_total=1)
+            )
+
+        assert cache.get_chunk_stages("ch01_c01") == []
+
+    def test_broken_cached_reply_is_not_rebought(self, reflector, mock_provider, cache):
+        mock_provider.complete.side_effect = [self._reply(self.BROKEN), self._reply(self.GOOD)]
+        reflector._retranslate_with_notes(
+            "ch01_c01", self.ORIGINALS, "notes", ReflectStats(chunks_total=1)
+        )
+        # Simulate a row cached before replies were checked.
+        cache.conn.execute("UPDATE cache SET content = ?", (self.BROKEN,))
+        cache.conn.commit()
+        mock_provider.complete.reset_mock()
+
+        with pytest.raises(ValueError, match="btrans cache"):
+            reflector._retranslate_with_notes(
+                "ch01_c01", self.ORIGINALS, "notes", ReflectStats(chunks_total=1)
+            )
+
+        mock_provider.complete.assert_not_called()
+
+
 # ---------------------------------------------------------------------------
 # Full reflect_chunk (both steps)
 # ---------------------------------------------------------------------------

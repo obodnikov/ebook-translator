@@ -694,6 +694,47 @@ class TestWaterfallIntegration:
 
 
 class TestCollectWaterfallParagraphs:
+    def test_skips_a_stage_with_malformed_xhtml(self, cache: Cache):
+        """A post-processing pass must not be paid to patch a broken paragraph."""
+        from booktranslator.pipeline_helpers import collect_waterfall_paragraphs
+
+        cache.put(
+            "t1",
+            "translate",
+            "m",
+            "v1",
+            "===PARAGRAPH 1===\n<p>First.</p>\n===PARAGRAPH 2===\n<p>Second.</p>",
+            meta={"chunk_id": "ch01_c01"},
+        )
+        cache.put(
+            "r1",
+            "reflect",
+            "m",
+            "v1",
+            "===PARAGRAPH 1===\n<p>First.</p>\n<p>Extra.</p>\n===PARAGRAPH 2===\n<p>Second.</p>",
+            meta={"chunk_id": "ch01_c01"},
+        )
+
+        result = collect_waterfall_paragraphs(cache, ["ch01_c01"], "proofread", {"ch01_c01": 2})
+
+        assert result["ch01_c01"] == ["<p>First.</p>", "<p>Second.</p>"]
+
+    def test_chunk_with_no_well_formed_stage_is_left_out(self, cache: Cache):
+        from booktranslator.pipeline_helpers import collect_waterfall_paragraphs
+
+        cache.put(
+            "t1",
+            "translate",
+            "m",
+            "v1",
+            "===PARAGRAPH 1===\n<p>First.\n===PARAGRAPH 2===\n<p>Second.",
+            meta={"chunk_id": "ch01_c01"},
+        )
+
+        result = collect_waterfall_paragraphs(cache, ["ch01_c01"], "proofread", {"ch01_c01": 2})
+
+        assert result == {}
+
     def test_gets_translate_when_no_later_stages(self, cache: Cache):
         from booktranslator.pipeline_helpers import collect_waterfall_paragraphs
 
@@ -1214,6 +1255,36 @@ class TestRehydrateBookFromWaterfall:
         chapter = chunk_set.book.chapters[0]
         text1 = etree.tostring(chapter.paragraphs[0], encoding="unicode")
         assert "Good 1" in text1
+
+    def test_fresh_tree_falls_back_to_translate(self, cache: Cache):
+        """In assemble the tree holds the source, so translate is a real fallback."""
+        from lxml import etree
+
+        from booktranslator.pipeline_helpers import rehydrate_book_from_waterfall
+
+        chunk_set = self._make_book_and_chunks(None)
+        cache.put(
+            "t1",
+            "translate",
+            "m",
+            "v1",
+            "===PARAGRAPH 1===\n<p>T1</p>\n===PARAGRAPH 2===\n<p>T2</p>",
+            meta={"chunk_id": "ch01_c01"},
+        )
+        cache.put(
+            "v1",
+            "verify",
+            "m",
+            "v1",
+            "===PARAGRAPH 1===\n<p>V1</p>\n===PARAGRAPH 2===\n<p>Broken <unclosed",
+            meta={"chunk_id": "ch01_c01"},
+        )
+
+        rehydrated, failed = rehydrate_book_from_waterfall(cache, chunk_set, rehydrate_all=True)
+
+        assert (rehydrated, failed) == (1, [])
+        chapter = chunk_set.book.chapters[0]
+        assert "T1" in etree.tostring(chapter.paragraphs[0], encoding="unicode")
 
     def test_atomic_no_partial_update_on_xml_error(self, cache: Cache):
         """If second fragment has invalid XML, neither fragment is applied."""
