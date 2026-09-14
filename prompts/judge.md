@@ -1,8 +1,8 @@
 ---
-version: 4
+version: 5
 model: anthropic/claude-haiku-4.5
 temperature: 0.1
-max_tokens: 12000
+max_tokens: 20000
 reasoning_effort: low
 ---
 
