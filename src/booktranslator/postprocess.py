@@ -31,6 +31,7 @@ from .cache import Cache
 from .models import SeriesGlossary
 from .prompts import Prompt, load_prompt, render_prompt
 from .provider import CompletionResult, OpenRouterProvider
+from .replies import parse_fragment
 from .series import render_for_prompt
 
 logger = logging.getLogger(__name__)
@@ -112,6 +113,42 @@ def _bracket_positions(text: str) -> list[int]:
 def _breaks_dialogue_dash(before: str, after: str) -> bool:
     """True when a patch replaces a paragraph's opening dash with guillemets."""
     return bool(_OPENS_WITH_DASH.match(before)) and bool(_OPENS_WITH_GUILLEMET.match(after))
+
+
+# A sentence has to be at least this long before finding it inside another
+# paragraph's patch means the paragraphs were mixed up. Short lines — "Да.",
+# "– Хорошо, – сказал я." — recur in any novel and prove nothing.
+_MIN_BORROWED_SENTENCE = 40
+_TAG_RE = re.compile(r"<[^>]+>")
+_SENTENCE_END_RE = re.compile(r"(?<=[.!?…»])\s+")
+
+
+def _plain_text(fragment: str) -> str:
+    return " ".join(_TAG_RE.sub(" ", fragment).split())
+
+
+def _borrowed_paragraph(idx: int, new_text: str, paragraphs: list[str]) -> int | None:
+    """The 1-based number of another paragraph whose sentence a patch copies, if any.
+
+    A patch rewrites one paragraph; it has no business carrying a sentence of a
+    different one. When it does, the model has mixed paragraphs up — on Foxglove
+    Summer a proofread patch for paragraph 21 came back as paragraph 22 plus the
+    second half of 21, its first half gone. Only sentences that paragraph `idx`
+    does not already contain count, so a line the author really repeats is fine.
+    """
+    patch = _plain_text(new_text)
+    own = _plain_text(paragraphs[idx])
+    for other, paragraph in enumerate(paragraphs):
+        if other == idx:
+            continue
+        for sentence in _SENTENCE_END_RE.split(_plain_text(paragraph)):
+            if (
+                len(sentence) >= _MIN_BORROWED_SENTENCE
+                and sentence in patch
+                and sentence not in own
+            ):
+                return other + 1
+    return None
 
 
 def _is_no_changes(text: str) -> bool:
@@ -346,6 +383,29 @@ class PostProcessor:
                     "guillemets — keeping the original paragraph",
                     self.stage,
                     p_idx,
+                )
+                continue
+            # The same reasoning for the two checks below: one bad patch costs
+            # that paragraph's edit, never the rest of the chunk's work.
+            try:
+                parse_fragment(new_text)
+            except ValueError as e:
+                logger.warning(
+                    "%s: patch for paragraph %s is not well-formed XHTML (%s) — "
+                    "keeping the original paragraph",
+                    self.stage,
+                    p_idx,
+                    str(e).split(". First 200 chars")[0],
+                )
+                continue
+            borrowed = _borrowed_paragraph(idx, new_text, input_paragraphs)
+            if borrowed is not None:
+                logger.warning(
+                    "%s: patch for paragraph %s carries a sentence of paragraph %d — "
+                    "paragraphs mixed up, keeping the original paragraph",
+                    self.stage,
+                    p_idx,
+                    borrowed,
                 )
                 continue
             output[idx] = new_text

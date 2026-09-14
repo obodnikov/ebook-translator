@@ -63,6 +63,9 @@ See [ARCHITECTURE.md §3, §5, §9](ARCHITECTURE.md); this file is the coding co
 
 ## Errors & resilience
 
+- When the server names a wait (`Retry-After`, or OpenRouter's 402 `in_flight_budget_exhausted`
+  body), the provider retry waits that long (capped at `MAX_RETRY_AFTER_SECONDS`) instead of the
+  exponential backoff — five quick attempts inside a 120 s wait lose the chunk for nothing.
 - Classify failures (ARCHITECTURE §9): transient (429/5xx) → retry with backoff; permanent (400 /
   invalid JSON) → log, skip the chunk, flag it in state, continue; budget exceeded → abort;
   malformed EPUB → fail fast at extract. Don't turn a permanent error into an infinite retry.
@@ -94,6 +97,11 @@ See [ARCHITECTURE.md §3, §5, §9](ARCHITECTURE.md); this file is the coding co
 - The waterfall that feeds proofread / style / verify / repair skips a stage whose paragraphs do
   not parse, the same way it skips a count mismatch. Those passes send patches for changed
   paragraphs only, so they cannot be relied on to close a broken tag — don't pay them to try.
+- Each patch of those passes is checked on its own in `PostProcessor._apply_patches`: it must be
+  one well-formed element, and must not carry a sentence (40+ characters) of a different
+  paragraph that its own paragraph lacks — the sign of paragraphs mixed up, which XHTML checks
+  cannot see. A failing patch is dropped and its paragraph kept; the chunk's other patches
+  stand. Don't widen this to rejecting the chunk: that throws away every good edit with it.
 - A reply that fails to parse is never cached, so it is gone when the run ends. Write it to
   `work/<book>/failed/<stage>-<chunk>.txt` before raising, and log the failure with
   `finish_reason` and the length — 200 characters in an error message is not enough to tell a

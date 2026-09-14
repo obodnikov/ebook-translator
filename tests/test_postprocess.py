@@ -1675,3 +1675,66 @@ class TestFailedReplyIsKept:
         assert "omits a long speech" in body, "the whole reply, not the first 200 chars"
         assert "finish_reason: 'length'" in body
         assert "--- reply after the format retry ---" in body
+
+
+class TestPatchesAreCheckedOneByOne:
+    """A patch replaces one whole paragraph, so a bad one costs that paragraph's
+    edit and nothing more. The shapes below come from Foxglove Summer: a style
+    patch that dropped only `</p>`, and a proofread patch for paragraph 21 that
+    came back as paragraph 22 plus the second half of 21.
+    """
+
+    P21 = (
+        '<p class="calibre14">Беверли вышла из душа и спросила, будет ли там ежевика. '
+        "Я поморщился, когда она бросила грязную одежду обратно на кровать.</p>"
+    )
+    P22 = (
+        '<p class="calibre14">Я смотрел, как она собирает дреды в хвост, машинально '
+        "покусывая нижнюю губу. Она заметила, что я смотрю, и улыбнулась мне.</p>"
+    )
+
+    def test_malformed_patch_is_dropped(self, proofreader: PostProcessor):
+        paragraphs = ["<p>Первый абзац.</p>", "<p>Опечатка тут.</p>"]
+        patches = json.dumps(
+            [
+                {"p": 1, "text": "<p>Первый абзац."},
+                {"p": 2, "text": "<p>Опечатки тут нет.</p>"},
+            ]
+        )
+        out, changed = proofreader._parse_delta_response(patches, paragraphs)
+        assert out == ["<p>Первый абзац.</p>", "<p>Опечатки тут нет.</p>"]
+        assert changed is True
+
+    def test_two_elements_in_one_patch_are_dropped(self, proofreader: PostProcessor):
+        paragraphs = [self.P21, self.P22]
+        patches = json.dumps([{"p": 1, "text": self.P21 + self.P21}])
+        out, changed = proofreader._parse_delta_response(patches, paragraphs)
+        assert out == paragraphs
+        assert changed is False
+
+    def test_patch_carrying_another_paragraph_is_dropped(self, proofreader: PostProcessor):
+        paragraphs = [self.P21, self.P22]
+        # Well-formed, so only the mixed-up check can catch it.
+        mixed = (
+            '<p class="calibre14">Я смотрел, как она собирает дреды в хвост, машинально '
+            "покусывая нижнюю губу. Я поморщился, когда она бросила грязную одежду.</p>"
+        )
+        patches = json.dumps([{"p": 1, "text": mixed}])
+        out, changed = proofreader._parse_delta_response(patches, paragraphs)
+        assert out == paragraphs
+        assert changed is False
+
+    def test_a_sentence_the_paragraph_already_had_is_fine(self, proofreader: PostProcessor):
+        repeated = "Я услышал что-то похожее то на смех, то на кашель."
+        paragraphs = [f"<p>{repeated} Потом тишина.</p>", f"<p>{repeated}</p>"]
+        edited = f"<p>{repeated} Потом наступила тишина.</p>"
+        patches = json.dumps([{"p": 1, "text": edited}])
+        out, changed = proofreader._parse_delta_response(patches, paragraphs)
+        assert out[0] == edited
+        assert changed is True
+
+    def test_short_recurring_lines_do_not_count(self, proofreader: PostProcessor):
+        paragraphs = ["<p>– Да.</p>", "<p>– Нет, – сказал я.</p>"]
+        patches = json.dumps([{"p": 2, "text": "<p>– Нет. – Да. – сказал я.</p>"}])
+        out, _ = proofreader._parse_delta_response(patches, paragraphs)
+        assert out[1] == "<p>– Нет. – Да. – сказал я.</p>"
