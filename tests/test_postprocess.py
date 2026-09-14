@@ -694,6 +694,47 @@ class TestWaterfallIntegration:
 
 
 class TestCollectWaterfallParagraphs:
+    def test_skips_a_stage_with_malformed_xhtml(self, cache: Cache):
+        """A post-processing pass must not be paid to patch a broken paragraph."""
+        from booktranslator.pipeline_helpers import collect_waterfall_paragraphs
+
+        cache.put(
+            "t1",
+            "translate",
+            "m",
+            "v1",
+            "===PARAGRAPH 1===\n<p>First.</p>\n===PARAGRAPH 2===\n<p>Second.</p>",
+            meta={"chunk_id": "ch01_c01"},
+        )
+        cache.put(
+            "r1",
+            "reflect",
+            "m",
+            "v1",
+            "===PARAGRAPH 1===\n<p>First.</p>\n<p>Extra.</p>\n===PARAGRAPH 2===\n<p>Second.</p>",
+            meta={"chunk_id": "ch01_c01"},
+        )
+
+        result = collect_waterfall_paragraphs(cache, ["ch01_c01"], "proofread", {"ch01_c01": 2})
+
+        assert result["ch01_c01"] == ["<p>First.</p>", "<p>Second.</p>"]
+
+    def test_chunk_with_no_well_formed_stage_is_left_out(self, cache: Cache):
+        from booktranslator.pipeline_helpers import collect_waterfall_paragraphs
+
+        cache.put(
+            "t1",
+            "translate",
+            "m",
+            "v1",
+            "===PARAGRAPH 1===\n<p>First.\n===PARAGRAPH 2===\n<p>Second.",
+            meta={"chunk_id": "ch01_c01"},
+        )
+
+        result = collect_waterfall_paragraphs(cache, ["ch01_c01"], "proofread", {"ch01_c01": 2})
+
+        assert result == {}
+
     def test_gets_translate_when_no_later_stages(self, cache: Cache):
         from booktranslator.pipeline_helpers import collect_waterfall_paragraphs
 
@@ -1215,6 +1256,36 @@ class TestRehydrateBookFromWaterfall:
         text1 = etree.tostring(chapter.paragraphs[0], encoding="unicode")
         assert "Good 1" in text1
 
+    def test_fresh_tree_falls_back_to_translate(self, cache: Cache):
+        """In assemble the tree holds the source, so translate is a real fallback."""
+        from lxml import etree
+
+        from booktranslator.pipeline_helpers import rehydrate_book_from_waterfall
+
+        chunk_set = self._make_book_and_chunks(None)
+        cache.put(
+            "t1",
+            "translate",
+            "m",
+            "v1",
+            "===PARAGRAPH 1===\n<p>T1</p>\n===PARAGRAPH 2===\n<p>T2</p>",
+            meta={"chunk_id": "ch01_c01"},
+        )
+        cache.put(
+            "v1",
+            "verify",
+            "m",
+            "v1",
+            "===PARAGRAPH 1===\n<p>V1</p>\n===PARAGRAPH 2===\n<p>Broken <unclosed",
+            meta={"chunk_id": "ch01_c01"},
+        )
+
+        rehydrated, failed = rehydrate_book_from_waterfall(cache, chunk_set, rehydrate_all=True)
+
+        assert (rehydrated, failed) == (1, [])
+        chapter = chunk_set.book.chapters[0]
+        assert "T1" in etree.tostring(chapter.paragraphs[0], encoding="unicode")
+
     def test_atomic_no_partial_update_on_xml_error(self, cache: Cache):
         """If second fragment has invalid XML, neither fragment is applied."""
         from booktranslator.pipeline_helpers import rehydrate_book_from_waterfall
@@ -1604,3 +1675,66 @@ class TestFailedReplyIsKept:
         assert "omits a long speech" in body, "the whole reply, not the first 200 chars"
         assert "finish_reason: 'length'" in body
         assert "--- reply after the format retry ---" in body
+
+
+class TestPatchesAreCheckedOneByOne:
+    """A patch replaces one whole paragraph, so a bad one costs that paragraph's
+    edit and nothing more. The shapes below come from Foxglove Summer: a style
+    patch that dropped only `</p>`, and a proofread patch for paragraph 21 that
+    came back as paragraph 22 plus the second half of 21.
+    """
+
+    P21 = (
+        '<p class="calibre14">Беверли вышла из душа и спросила, будет ли там ежевика. '
+        "Я поморщился, когда она бросила грязную одежду обратно на кровать.</p>"
+    )
+    P22 = (
+        '<p class="calibre14">Я смотрел, как она собирает дреды в хвост, машинально '
+        "покусывая нижнюю губу. Она заметила, что я смотрю, и улыбнулась мне.</p>"
+    )
+
+    def test_malformed_patch_is_dropped(self, proofreader: PostProcessor):
+        paragraphs = ["<p>Первый абзац.</p>", "<p>Опечатка тут.</p>"]
+        patches = json.dumps(
+            [
+                {"p": 1, "text": "<p>Первый абзац."},
+                {"p": 2, "text": "<p>Опечатки тут нет.</p>"},
+            ]
+        )
+        out, changed = proofreader._parse_delta_response(patches, paragraphs)
+        assert out == ["<p>Первый абзац.</p>", "<p>Опечатки тут нет.</p>"]
+        assert changed is True
+
+    def test_two_elements_in_one_patch_are_dropped(self, proofreader: PostProcessor):
+        paragraphs = [self.P21, self.P22]
+        patches = json.dumps([{"p": 1, "text": self.P21 + self.P21}])
+        out, changed = proofreader._parse_delta_response(patches, paragraphs)
+        assert out == paragraphs
+        assert changed is False
+
+    def test_patch_carrying_another_paragraph_is_dropped(self, proofreader: PostProcessor):
+        paragraphs = [self.P21, self.P22]
+        # Well-formed, so only the mixed-up check can catch it.
+        mixed = (
+            '<p class="calibre14">Я смотрел, как она собирает дреды в хвост, машинально '
+            "покусывая нижнюю губу. Я поморщился, когда она бросила грязную одежду.</p>"
+        )
+        patches = json.dumps([{"p": 1, "text": mixed}])
+        out, changed = proofreader._parse_delta_response(patches, paragraphs)
+        assert out == paragraphs
+        assert changed is False
+
+    def test_a_sentence_the_paragraph_already_had_is_fine(self, proofreader: PostProcessor):
+        repeated = "Я услышал что-то похожее то на смех, то на кашель."
+        paragraphs = [f"<p>{repeated} Потом тишина.</p>", f"<p>{repeated}</p>"]
+        edited = f"<p>{repeated} Потом наступила тишина.</p>"
+        patches = json.dumps([{"p": 1, "text": edited}])
+        out, changed = proofreader._parse_delta_response(patches, paragraphs)
+        assert out[0] == edited
+        assert changed is True
+
+    def test_short_recurring_lines_do_not_count(self, proofreader: PostProcessor):
+        paragraphs = ["<p>– Да.</p>", "<p>– Нет, – сказал я.</p>"]
+        patches = json.dumps([{"p": 2, "text": "<p>– Нет. – Да. – сказал я.</p>"}])
+        out, _ = proofreader._parse_delta_response(patches, paragraphs)
+        assert out[1] == "<p>– Нет. – Да. – сказал я.</p>"

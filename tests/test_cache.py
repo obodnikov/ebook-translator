@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from booktranslator.cache import STAGE_WATERFALL, Cache
+from booktranslator.cache import STAGE_WATERFALL, Cache, text_stages_cleared_from
 
 
 @pytest.fixture
@@ -520,3 +520,139 @@ class TestBulkResolutionScale:
         assert resolved[chunk_ids[500]] == "translate"  # preference
         assert resolved[chunk_ids[0]] == "reflect"  # waterfall
         assert resolved[chunk_ids[999]] == "reflect"  # waterfall
+
+
+# ---------------------------------------------------------------------------
+# Clearing (btrans cache clear)
+# ---------------------------------------------------------------------------
+
+
+def _fill_book(cache: Cache) -> None:
+    """Glossary plus a full waterfall for two chunks, judged at two stages."""
+    cache.put("g", "glossary", "m", "1", "{}", cost_usd=1.0)
+    for cid in ("ch01_c01", "ch01_c02"):
+        for stage in STAGE_WATERFALL:
+            cache.put(
+                f"{stage}-{cid}", stage, "m", "1", "text", cost_usd=0.1, meta={"chunk_id": cid}
+            )
+        cache.put(f"notes-{cid}", "reflect_notes", "m", "1", "n", meta={"chunk_id": cid})
+        for judged in ("translate", "style"):
+            cache.put(
+                f"judge-{judged}-{cid}",
+                "judge",
+                "m",
+                "1",
+                "{}",
+                meta={"chunk_id": cid, "judged_stage": judged},
+            )
+    cache.set_preference("ch01_c01", "reflect")
+    cache.set_preference("ch01_c02", "translate")
+
+
+class TestTextStagesClearedFrom:
+    def test_full_clear_takes_every_text_stage(self):
+        assert text_stages_cleared_from(None) == STAGE_WATERFALL
+
+    def test_stage_takes_itself_and_later_stages(self):
+        assert text_stages_cleared_from("style") == ["style", "verify", "repair"]
+
+    def test_judge_takes_no_text_stage(self):
+        assert text_stages_cleared_from("judge") == []
+
+    def test_unknown_stage_rejected(self):
+        with pytest.raises(ValueError, match="Unknown stage"):
+            text_stages_cleared_from("glossary")
+
+
+class TestClear:
+    def test_full_clear_keeps_only_glossary(self, fresh_cache: Cache):
+        _fill_book(fresh_cache)
+        fresh_cache.set_meta("chunker_params", {"target_words": 2000})
+
+        selection = fresh_cache.select_for_clear()
+        fresh_cache.clear(selection, ["chunker_params"])
+
+        assert fresh_cache.list_stages() == {"glossary": 1}
+        assert fresh_cache.list_preferences() == []
+        assert fresh_cache.get_meta("chunker_params") is None
+        assert selection.resets_chunking
+        assert selection.cost_usd == pytest.approx(1.2)
+
+    def test_select_deletes_nothing(self, fresh_cache: Cache):
+        _fill_book(fresh_cache)
+        before = fresh_cache.list_stages()
+        fresh_cache.select_for_clear()
+        assert fresh_cache.list_stages() == before
+
+    def test_stage_clears_later_stages_and_their_verdicts(self, fresh_cache: Cache):
+        _fill_book(fresh_cache)
+
+        selection = fresh_cache.select_for_clear("style")
+        fresh_cache.clear(selection)
+
+        stages = fresh_cache.list_stages()
+        assert "style" not in stages and "verify" not in stages and "repair" not in stages
+        assert stages["proofread"] == 2
+        assert stages["reflect_notes"] == 2
+        # Verdicts on style went with it; verdicts on translate stay.
+        assert fresh_cache.get_judge_scores(judged_stage="style") == []
+        assert len(fresh_cache.get_judge_scores(judged_stage="translate")) == 2
+        assert not selection.resets_chunking
+
+    def test_repair_takes_its_verdicts(self, fresh_cache: Cache):
+        _fill_book(fresh_cache)
+        fresh_cache.put("rv", "repair_verdicts", "m", "1", "[]", meta={"chunk_id": "ch01_c01"})
+        fresh_cache.clear(fresh_cache.select_for_clear("repair"))
+        stages = fresh_cache.list_stages()
+        assert "repair" not in stages and "repair_verdicts" not in stages
+        assert stages["verify"] == 2
+
+    def test_reflect_takes_its_notes(self, fresh_cache: Cache):
+        _fill_book(fresh_cache)
+        fresh_cache.clear(fresh_cache.select_for_clear("reflect"))
+        assert set(fresh_cache.list_stages()) == {"glossary", "translate", "judge"}
+
+    def test_preferences_for_cleared_stages_only(self, fresh_cache: Cache):
+        _fill_book(fresh_cache)
+        fresh_cache.clear(fresh_cache.select_for_clear("reflect"))
+        prefs = {p.chunk_id: p.preferred_stage for p in fresh_cache.list_preferences()}
+        assert prefs == {"ch01_c02": "translate"}
+
+    def test_judge_clears_verdicts_only(self, fresh_cache: Cache):
+        _fill_book(fresh_cache)
+        selection = fresh_cache.select_for_clear("judge")
+        fresh_cache.clear(selection)
+        stages = fresh_cache.list_stages()
+        assert "judge" not in stages
+        assert stages["translate"] == 2 and stages["repair"] == 2
+        assert len(fresh_cache.list_preferences()) == 2
+        assert not selection.resets_chunking
+
+    def test_chunk_filter_leaves_other_chunks(self, fresh_cache: Cache):
+        _fill_book(fresh_cache)
+        selection = fresh_cache.select_for_clear("translate", ["ch01_c01"])
+        fresh_cache.clear(selection)
+
+        assert fresh_cache.get_chunk_stages("ch01_c01") == []
+        assert len(fresh_cache.get_chunk_stages("ch01_c02")) == len(STAGE_WATERFALL) + 3
+        assert [p.chunk_id for p in fresh_cache.list_preferences()] == ["ch01_c02"]
+        assert not selection.resets_chunking
+
+    def test_clear_is_all_or_nothing(self, fresh_cache: Cache):
+        _fill_book(fresh_cache)
+        before = fresh_cache.list_stages()
+        selection = fresh_cache.select_for_clear()
+        selection.preference_chunk_ids = [object()]  # unbindable: fails mid-transaction
+
+        with pytest.raises(sqlite3.Error):
+            fresh_cache.clear(selection)
+
+        assert fresh_cache.list_stages() == before
+
+    def test_backup_is_a_readable_copy(self, fresh_cache: Cache, tmp_path: Path):
+        _fill_book(fresh_cache)
+        backup = tmp_path / "cache.sqlite.bak"
+        fresh_cache.backup_to(backup)
+        copy = Cache(backup)
+        assert copy.list_stages() == fresh_cache.list_stages()
+        copy.close()

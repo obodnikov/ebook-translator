@@ -7,7 +7,7 @@ import logging
 import os
 from dataclasses import dataclass, field
 
-from openai import OpenAI
+from openai import APIStatusError, OpenAI
 from tenacity import (
     retry,
     retry_if_exception_type,
@@ -24,6 +24,52 @@ DEFAULT_BASE_URL = "https://openrouter.ai/api/v1"
 # There is no earlier signal: kiro-gateway returns finish_reason="stop" even
 # when it truncates (docs/design/2026-08-03-...md §4.4).
 RESPONSE_SIZE_WARN_RATIO = 0.85
+
+
+# Longest pause a server may ask for before a retry. OpenRouter asks for 120 s
+# when the requests already running have reserved all the account's credit.
+MAX_RETRY_AFTER_SECONDS = 300.0
+
+_backoff = wait_exponential(multiplier=2, min=2, max=60)
+
+
+def retry_after_seconds(error: BaseException | None) -> float | None:
+    """How long the server asked us to wait before retrying, if it said.
+
+    Read from the `Retry-After` header, or from `metadata.headers` in the error
+    body, where OpenRouter repeats it for its 402 `in_flight_budget_exhausted`.
+    """
+    if not isinstance(error, APIStatusError):
+        return None
+    value = error.response.headers.get("retry-after")
+    if value is None and isinstance(error.body, dict):
+        headers = (error.body.get("metadata") or {}).get("headers") or {}
+        value = next((v for k, v in headers.items() if k.lower() == "retry-after"), None)
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return None
+    return min(max(seconds, 0.0), MAX_RETRY_AFTER_SECONDS)
+
+
+def _wait_before_retry(retry_state) -> float:
+    """Wait as long as the server asked, or back off exponentially if it did not.
+
+    Backing off 2-16 s is right for a dropped connection, but a server that
+    says "retry after 120 s" gets asked five times inside half a minute and
+    the chunk is lost with its wait not even half over.
+    """
+    error = retry_state.outcome.exception() if retry_state.outcome else None
+    asked = retry_after_seconds(error)
+    if asked is None:
+        return _backoff(retry_state)
+    logger.warning(
+        "Provider asked to retry after %.0f s (HTTP %s); waiting before attempt %d.",
+        asked,
+        getattr(error, "status_code", "?"),
+        retry_state.attempt_number + 1,
+    )
+    return asked
 
 
 class EmptyCompletionError(ValueError):
@@ -110,7 +156,7 @@ class OpenRouterProvider:
         # permanent, and the identical request would fail the same way.
         retry=retry_if_not_exception_type(EmptyCompletionError),
         stop=stop_after_attempt(5),
-        wait=wait_exponential(multiplier=2, min=2, max=60),
+        wait=_wait_before_retry,
     )
     def complete(
         self,

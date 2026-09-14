@@ -26,6 +26,8 @@ import json
 import logging
 import re
 import threading
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
@@ -35,6 +37,7 @@ from .cache import Cache
 from .models import SeriesGlossary
 from .prompts import Prompt, load_prompt, render_prompt
 from .provider import OpenRouterProvider
+from .replies import split_markers
 from .series import render_for_prompt
 
 logger = logging.getLogger(__name__)
@@ -110,8 +113,13 @@ class Proposal:
         is not made real by asking a larger model about it, and a category out
         of scope was never ours to act on.
         """
+        return [issue for issue, _ in self.deferred_with_reasons]
+
+    @property
+    def deferred_with_reasons(self) -> list[tuple[ParsedIssue, Skip]]:
+        """`deferred`, each with why it was not a substitution."""
         hopeless = {Skip.QUOTE_ABSENT, Skip.OUT_OF_SCOPE, Skip.NO_CATEGORY, Skip.NO_OP}
-        return [issue for issue, why in self.skipped if why not in hopeless]
+        return [(issue, why) for issue, why in self.skipped if why not in hopeless]
 
 
 def parse_issue(raw: str) -> ParsedIssue:
@@ -227,7 +235,8 @@ class RepairStats:
     # Issues nothing can act on yet: those whose fix belongs in the glossary,
     # and those the deterministic pass could not turn into a substitution.
     glossary_issues: list[tuple[str, str]] = field(default_factory=list)
-    unhandled: list[tuple[str, str]] = field(default_factory=list)
+    # (chunk_id, issue as the judge wrote it, why it was not a substitution)
+    unhandled: list[tuple[str, str, str]] = field(default_factory=list)
 
 
 @dataclass
@@ -280,12 +289,23 @@ class Repairer:
         if t.startswith("```"):
             t = "\n".join(ln for ln in t.splitlines() if not ln.startswith("```")).strip()
         m = re.search(r"\[.*]", t, re.S)
-        if not m:
-            raise ValueError(f"Repair verdicts are not a JSON array. First 200 chars: {t[:200]!r}")
-        try:
-            data = model_json.loads(m.group(0))
-        except json.JSONDecodeError as e:
-            raise ValueError(f"Repair verdicts are not valid JSON: {e}") from e
+        if m:
+            try:
+                data = model_json.loads(m.group(0))
+            except json.JSONDecodeError as e:
+                raise ValueError(f"Repair verdicts are not valid JSON: {e}") from e
+        else:
+            # With a single proposal, models answer with the lone verdict object
+            # instead of a one-entry array. Same verdict, so read it as one.
+            try:
+                data = model_json.loads(t)
+            except json.JSONDecodeError:
+                data = None
+            if not (isinstance(data, dict) and "n" in data):
+                raise ValueError(
+                    f"Repair verdicts are not a JSON array. First 200 chars: {t[:200]!r}"
+                )
+            data = [data]
         if not isinstance(data, list):
             raise ValueError(f"Repair verdicts are not a JSON array. Got: {type(data).__name__}")
 
@@ -300,6 +320,64 @@ class Repairer:
             verdict = str(entry.get("verdict", "")).strip().lower()
             out[n] = (verdict.startswith("accept"), str(entry.get("why", "")))
         return out
+
+    def _legacy_result(
+        self,
+        chunk_id: str,
+        paragraphs: list[str],
+        proposal: Proposal,
+        cached,
+        stats: RepairStats,
+    ) -> RepairResult:
+        repaired = split_markers(cached.content) or []
+        if len(repaired) != len(paragraphs):
+            raise ValueError(
+                f"cached repair for {chunk_id} has {len(repaired)} paragraphs, "
+                f"expected {len(paragraphs)}"
+            )
+        accepted = int(cached.meta.get("accepted", 0))
+        with self._lock:
+            stats.chunks_cached += 1
+            stats.candidates += len(proposal.candidates)
+            stats.accepted += accepted
+            stats.rejected += max(len(proposal.candidates) - accepted, 0)
+            if accepted:
+                stats.chunks_repaired += 1
+        return RepairResult(chunk_id=chunk_id, paragraphs=repaired)
+
+    # -- many chunks --------------------------------------------------------
+
+    def repair_chunks(
+        self,
+        jobs: list[tuple[str, list[str], list[str], str]],
+        stats: RepairStats,
+        *,
+        parallelism: int = 1,
+        on_done: Callable[[int, str, Exception | None], None] | None = None,
+    ) -> None:
+        """Repair many chunks, `parallelism` at a time.
+
+        Each job is (chunk_id, paragraphs, issues, original_text). A chunk that
+        fails is counted and handed to `on_done` with its error, never raised,
+        so one bad reply does not stop the rest.
+        """
+
+        def run(job: tuple[str, list[str], list[str], str]) -> Exception | None:
+            try:
+                self.repair_chunk(*job, stats)
+                return None
+            except Exception as e:  # noqa: BLE001 — reported through on_done
+                return e
+
+        with ThreadPoolExecutor(max_workers=max(1, parallelism)) as pool:
+            futures = {pool.submit(run, job): job[0] for job in jobs}
+            for done, future in enumerate(as_completed(futures), 1):
+                error = future.result()
+                if error is not None:
+                    with self._lock:
+                        stats.chunks_failed += 1
+                if on_done:
+                    on_done(done, futures[future], error)
 
     # -- one chunk ----------------------------------------------------------
 
@@ -319,8 +397,8 @@ class Repairer:
         proposal = propose(paragraphs, issues, self.categories)
 
         with self._lock:
-            for issue in proposal.deferred:
-                stats.unhandled.append((chunk_id, issue.raw))
+            for issue, why in proposal.deferred_with_reasons:
+                stats.unhandled.append((chunk_id, issue.raw, why.value))
 
         if not proposal.candidates:
             return None
@@ -346,14 +424,22 @@ class Repairer:
         system, user = render_prompt(self.prompt, context)
 
         # The issue list is part of the key: re-running the judge must not
-        # serve a repair made from its previous verdicts.
+        # serve a repair made from its previous verdicts. The key names the
+        # model call, and the call's answer — the verdicts — is what is kept
+        # under it; the repaired text is derived from them and kept apart.
         cache_key = Cache.make_key("repair", self.model, self.prompt.version, system, user)
+        text_key = Cache.make_key("repair_text", cache_key)
         with self._lock:
             cached = self.cache.get(cache_key)
 
+        result = None
+        if cached is not None and not cached.meta.get("verdicts"):
+            # Written before verdicts were kept: the row holds the repaired
+            # text itself, with no record of which candidate was accepted.
+            # It is still a paid, vetted result, so it is used as it stands.
+            return self._legacy_result(chunk_id, paragraphs, proposal, cached, stats)
         if cached is not None:
             raw_text = cached.content
-            result = None
             with self._lock:
                 stats.chunks_cached += 1
         else:
@@ -383,18 +469,31 @@ class Repairer:
                 f"{len(paragraphs)} -> {len(out_paragraphs)}"
             )
 
-        if result is not None and accepted:
-            with self._lock:
+        with self._lock:
+            if result is not None:
+                # Kept even when every candidate was rejected: otherwise the
+                # next run pays for the same refusal again.
                 self.cache.put(
                     key=cache_key,
+                    stage="repair_verdicts",
+                    model=self.model,
+                    prompt_version=self.prompt.version,
+                    content=raw_text,
+                    input_tokens=result.input_tokens,
+                    output_tokens=result.output_tokens,
+                    meta={"chunk_id": chunk_id, "verdicts": True},
+                )
+            # Only a change is a `repair` stage entry: an unchanged copy would
+            # outrank a later re-run of verify at assembly.
+            if accepted and self.cache.get(text_key) is None:
+                self.cache.put(
+                    key=text_key,
                     stage="repair",
                     model=self.model,
                     prompt_version=self.prompt.version,
                     content="\n".join(
                         f"===PARAGRAPH {i}===\n{p}" for i, p in enumerate(out_paragraphs, 1)
                     ),
-                    input_tokens=result.input_tokens,
-                    output_tokens=result.output_tokens,
                     meta={"chunk_id": chunk_id, "accepted": len(accepted)},
                 )
 

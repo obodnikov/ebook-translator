@@ -63,6 +63,9 @@ See [ARCHITECTURE.md §3, §5, §9](ARCHITECTURE.md); this file is the coding co
 
 ## Errors & resilience
 
+- When the server names a wait (`Retry-After`, or OpenRouter's 402 `in_flight_budget_exhausted`
+  body), the provider retry waits that long (capped at `MAX_RETRY_AFTER_SECONDS`) instead of the
+  exponential backoff — five quick attempts inside a 120 s wait lose the chunk for nothing.
 - Classify failures (ARCHITECTURE §9): transient (429/5xx) → retry with backoff; permanent (400 /
   invalid JSON) → log, skip the chunk, flag it in state, continue; budget exceeded → abort;
   malformed EPUB → fail fast at extract. Don't turn a permanent error into an infinite retry.
@@ -83,6 +86,27 @@ See [ARCHITECTURE.md §3, §5, §9](ARCHITECTURE.md); this file is the coding co
     no JSON to repair, and turning prose into patches would let it invent text nobody vetted.
     These are full-price calls, so a run gets a budget (`PostProcessor._retry_budget`) — a model
     that has stopped following the format must not silently double the cost of the stage.
+- A translate or reflect reply is checked in full before it is cached: exactly N markers **and**
+  every paragraph one well-formed XHTML element (`replies.parse_paragraphs`). The count alone is
+  not enough — a paragraph missing `</p>`, two `<p>` under one marker, or the model's own
+  "wait, I mis-numbered" pasted between markers all pass it. A rejected **fresh** reply is asked
+  for once more with the reason appended (`replies.RETRY_NOTE`, in code so no prompt version
+  changes), within the run's `replies.retry_budget`. A cached reply that fails is reported with
+  the `btrans cache clear` command that removes it — never re-bought.
+- A chunk goes into the live tree whole or not at all: parse every paragraph first, then splice.
+- The waterfall that feeds proofread / style / verify / repair skips a stage whose paragraphs do
+  not parse, the same way it skips a count mismatch. Those passes send patches for changed
+  paragraphs only, so they cannot be relied on to close a broken tag — don't pay them to try.
+- Each patch of those passes is checked on its own in `PostProcessor._apply_patches`: it must be
+  one well-formed element, and must not carry a sentence (40+ characters) of a different
+  paragraph that its own paragraph lacks — the sign of paragraphs mixed up, which XHTML checks
+  cannot see. A failing patch is dropped and its paragraph kept; the chunk's other patches
+  stand. Don't widen this to rejecting the chunk: that throws away every good edit with it.
+- Repair caches the gatekeeper's verdicts (`repair_verdicts`, outside the waterfall, cleared with
+  `repair`) under the call's key, rejections included, and the repaired text as a separate
+  `repair` row — only when something was accepted, since an unchanged copy would outrank a later
+  verify. A cached row must hold what its key names: the key is the model call, so the row is its
+  answer, not text derived from it.
 - A reply that fails to parse is never cached, so it is gone when the run ends. Write it to
   `work/<book>/failed/<stage>-<chunk>.txt` before raising, and log the failure with
   `finish_reason` and the length — 200 characters in an error message is not enough to tell a

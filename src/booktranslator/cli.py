@@ -6,6 +6,7 @@ Commands:
     btrans series init SLUG --title "..." --author "..."
     btrans series show SLUG
     btrans translate EPUB [--series SLUG]
+    btrans cache clear BOOK_WORKDIR [--stage STAGE] [--chunk ID]
 """
 
 from __future__ import annotations
@@ -27,13 +28,14 @@ from rich.progress import (
 )
 from rich.table import Table
 
-from .cache import STAGE_WATERFALL, Cache
+from .cache import CLEARABLE_STAGES, STAGE_WATERFALL, Cache
 from .chunker import chunk_book
 from .config import load_config
 from .epub_io import read_book, read_book_structured, write_translated_epub
 from .glossary import extract_glossary, save_glossary
 from .models import Glossary, SeriesGlossary, SeriesGlossaryEntry, Stage
 from .pipeline_helpers import (
+    CHUNKER_META_KEY,
     ChunkerConfigMismatchError,
     build_reflect_input,
     collect_chunk_originals,
@@ -66,9 +68,11 @@ app = typer.Typer(
 glossary_app = typer.Typer(help="Glossary extraction and curation.")
 series_app = typer.Typer(help="Series-level curated glossary management.")
 cover_app = typer.Typer(help="Cover image replacement and translation.")
+cache_app = typer.Typer(help="Inspect and clear a book's translation cache.")
 app.add_typer(glossary_app, name="glossary")
 app.add_typer(series_app, name="series")
 app.add_typer(cover_app, name="cover")
+app.add_typer(cache_app, name="cache")
 
 console = Console()
 
@@ -1733,6 +1737,21 @@ def verify_cmd(
     )
 
 
+def _write_repair_unhandled(path: Path, unhandled: list[tuple[str, str, str]]) -> None:
+    """Write the judge's issues repair could not act on, grouped by chunk, for a human."""
+    lines = [
+        "# Замечания оценщика, которые починка не смогла превратить в точную замену.",
+        f"# btrans repair, {datetime.now():%Y-%m-%d %H:%M}. Их стоит просмотреть вручную.",
+    ]
+    current = None
+    for chunk_id, issue, why in sorted(unhandled):
+        if chunk_id != current:
+            lines += ["", chunk_id]
+            current = chunk_id
+        lines.append(f"  - [{why}] {issue}")
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
 @app.command("repair")
 def repair_cmd(
     epub: Path = typer.Argument(..., exists=True, dir_okay=False, help="Source EPUB."),
@@ -1762,6 +1781,12 @@ def repair_cmd(
         "--dry-run",
         help="Show what would be proposed without calling a model or writing anything.",
     ),
+    parallelism: int | None = typer.Option(
+        None,
+        "--parallelism",
+        "-j",
+        help="Number of chunks to repair concurrently (default 4).",
+    ),
 ) -> None:
     """Apply the judge's mechanical corrections, one vetted fix at a time.
 
@@ -1780,6 +1805,10 @@ def repair_cmd(
         verify_chunker_params,
     )
     from .repair import Repairer, RepairStats, propose
+
+    if parallelism is not None and parallelism < 1:
+        console.print("[red]--parallelism must be ≥ 1.[/red]")
+        raise typer.Exit(code=1)
 
     cfg = load_config(config_path if config_path.exists() else None)
     wanted = tuple(
@@ -1858,14 +1887,12 @@ def repair_cmd(
             console=console,
         ) as progress:
             task = progress.add_task("repair", total=len(waterfall))
-            for done, (cid, paras) in enumerate(sorted(waterfall.items()), 1):
-                try:
-                    repairer.repair_chunk(
-                        cid, paras, judge_map[cid]["issues"], originals.get(cid, ""), stats
+
+            def on_done(done: int, cid: str, error: Exception | None) -> None:
+                if error is not None:
+                    progress.console.print(
+                        f"[yellow]{cid}: {type(error).__name__}: {error}[/yellow]"
                     )
-                except Exception as e:  # noqa: BLE001
-                    stats.chunks_failed += 1
-                    console.print(f"[yellow]{cid}: {type(e).__name__}: {e}[/yellow]")
                 progress.update(
                     task,
                     completed=done,
@@ -1874,6 +1901,16 @@ def repair_cmd(
                         f"rejected {stats.rejected} failed {stats.chunks_failed}"
                     ),
                 )
+
+            repairer.repair_chunks(
+                [
+                    (cid, paras, judge_map[cid]["issues"], originals.get(cid, ""))
+                    for cid, paras in sorted(waterfall.items())
+                ],
+                stats,
+                parallelism=parallelism or 4,
+                on_done=on_done,
+            )
 
         console.print(
             f"\n[bold]Repair results:[/bold]\n"
@@ -1884,11 +1921,16 @@ def repair_cmd(
             f"  Failed: {stats.chunks_failed}\n"
             f"[dim]Tokens: {stats.input_tokens:,} in, {stats.output_tokens:,} out.[/dim]"
         )
+        unhandled_path = wd.root / "repair-unhandled.txt"
         if stats.unhandled:
+            _write_repair_unhandled(unhandled_path, stats.unhandled)
             console.print(
                 f"\n[dim]{len(stats.unhandled)} issues could not be turned into a "
-                f"substitution and were left for a human.[/dim]"
+                f"substitution and were left for a human: {unhandled_path}[/dim]"
             )
+        else:
+            # A list from an earlier run would describe text that has moved on.
+            unhandled_path.unlink(missing_ok=True)
     finally:
         cache.close()
 
@@ -2550,6 +2592,103 @@ def prefer_cmd(
 
 
 # ---------------------------------------------------------------------------
+# cache clear
+# ---------------------------------------------------------------------------
+
+
+@cache_app.command("clear")
+def cache_clear_cmd(
+    work_path: Path = typer.Argument(
+        ...,
+        exists=True,
+        file_okay=False,
+        help="Book workdir (e.g. work/foxglove-summer).",
+    ),
+    stage: str | None = typer.Option(
+        None,
+        "--stage",
+        help=(
+            f"Clear this stage and every stage after it ({', '.join(CLEARABLE_STAGES)}). "
+            "Omit to clear everything except the glossary."
+        ),
+    ),
+    chunks: list[str] | None = typer.Option(
+        None,
+        "--chunk",
+        help="Only clear these chunks (repeatable). Keeps the saved chunking.",
+    ),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Don't ask for confirmation."),
+) -> None:
+    """Delete cached stage results so they are produced again on the next run.
+
+    The glossary is always kept. A backup of cache.sqlite is written first.
+    """
+    if stage is not None and stage not in CLEARABLE_STAGES:
+        console.print(f"[red]Invalid stage {stage!r}. Valid: {', '.join(CLEARABLE_STAGES)}[/red]")
+        raise typer.Exit(code=1)
+    cache_path = work_path / "cache.sqlite"
+    if not cache_path.is_file():
+        console.print(f"[red]No cache.sqlite in {work_path}[/red]")
+        raise typer.Exit(code=1)
+
+    cache = Cache(cache_path)
+    try:
+        selection = cache.select_for_clear(stage, chunks)
+        chunking = cache.get_meta(CHUNKER_META_KEY) if selection.resets_chunking else None
+        if selection.is_empty and chunking is None:
+            console.print("[green]Nothing to clear.[/green]")
+            return
+
+        table = Table(title=f"To delete from {cache_path}")
+        table.add_column("Stage")
+        table.add_column("Rows", justify="right")
+        table.add_column("Cost", justify="right")
+        order = [*CLEARABLE_STAGES, "reflect_notes", "repair_verdicts"]
+        for name in sorted(
+            selection.by_stage,
+            key=lambda n: (n not in order, order.index(n) if n in order else 0, n),
+        ):
+            rows, cost = selection.by_stage[name]
+            table.add_row(name, str(rows), f"${cost:.4f}")
+        console.print(table)
+        console.print(f"[bold]Paid for these rows:[/bold] ${selection.cost_usd:.4f}")
+        if selection.preference_chunk_ids:
+            console.print(
+                f"[bold]Stage preferences removed:[/bold] {len(selection.preference_chunk_ids)}"
+            )
+        if chunking is not None:
+            console.print(
+                f"[bold]Saved chunking forgotten:[/bold] "
+                f"target_words={chunking.get('target_words')}, "
+                f"overlap={chunking.get('overlap_paragraphs')}"
+            )
+
+        if not yes and not typer.confirm("Delete these entries?", default=False):
+            console.print("Nothing deleted.")
+            return
+
+        backup = work_path / f"cache.sqlite.bak-{datetime.now():%Y%m%d-%H%M%S}"
+        cache.backup_to(backup)
+        console.print(f"[dim]Backup: {backup}[/dim]")
+        cache.clear(selection, [CHUNKER_META_KEY] if chunking is not None else [])
+    finally:
+        cache.close()
+
+    if selection.resets_chunking:
+        wd = WorkDir(root=work_path, slug=work_path.name)
+        if wd.state_path.is_file():
+            state = wd.load_state()
+            state.completed_stages = [
+                s
+                for s in state.completed_stages
+                if s not in (Stage.TRANSLATE, Stage.PAUSE_2, Stage.DONE)
+            ]
+            wd.save_state(state)
+
+    console.print(f"[green]Deleted {len(selection.keys)} cached rows.[/green]")
+
+
+# ---------------------------------------------------------------------------
 # assemble
 # ---------------------------------------------------------------------------
 
@@ -2780,14 +2919,45 @@ def assemble_cmd(
                     f"Aborting.[/dim]"
                 )
             else:
-                console.print(
-                    f"\n[red]Error:[/red] {len(failed_ids)} chunk(s) have no "
-                    f"translated content in cache:\n"
-                    f"[dim]  {', '.join(sorted(failed_ids)[:10])}"
-                    f"{'...' if len(failed_ids) > 10 else ''}[/dim]\n"
-                    f"\n[dim]Run 'btrans translate' first to populate the cache, "
-                    f"or check that chunker settings match.[/dim]"
+                # A chunk fails either because nothing is cached for it, or
+                # because every cached version is unusable (wrong paragraph
+                # count or broken XHTML). The two need different fixes.
+                cached_stages = cache.get_stages_for_chunks_bulk(failed_ids)
+                broken = sorted(
+                    cid
+                    for cid in failed_ids
+                    if any(s.stage in STAGE_WATERFALL for s in cached_stages.get(cid, []))
                 )
+                missing = sorted(set(failed_ids) - set(broken))
+                if missing:
+                    console.print(
+                        f"\n[red]Error:[/red] {len(missing)} chunk(s) have no "
+                        f"translated content in cache:\n"
+                        f"[dim]  {', '.join(missing[:10])}"
+                        f"{'...' if len(missing) > 10 else ''}[/dim]\n"
+                        f"\n[dim]Run 'btrans translate' first to populate the cache, "
+                        f"or check that chunker settings match.[/dim]"
+                    )
+                if broken:
+                    chunk_flags = " ".join(f"--chunk {cid}" for cid in broken)
+                    found = []
+                    for cid in broken[:10]:
+                        stages = sorted(
+                            {s.stage for s in cached_stages[cid] if s.stage in STAGE_WATERFALL}
+                        )
+                        found.append(f"{cid} ({', '.join(stages)})")
+                    console.print(
+                        f"\n[red]Error:[/red] {len(broken)} chunk(s) are cached, but no "
+                        f"version of them is usable (wrong paragraph count or "
+                        f"malformed XHTML in every stage found):\n"
+                        f"[dim]  {', '.join(found)}"
+                        f"{'...' if len(broken) > 10 else ''}[/dim]\n"
+                        f"\n[dim]Remove them — clearing translate also clears every later "
+                        f"stage and verdict of those chunks — and translate them again:\n"
+                        f"  btrans cache clear {work_path} --stage translate {chunk_flags}\n"
+                        f"  btrans translate ...[/dim]",
+                        soft_wrap=True,  # keep the command copyable on one line
+                    )
             raise typer.Exit(code=1)
 
         # --- Reader notes injection ---

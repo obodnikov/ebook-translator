@@ -102,14 +102,14 @@ translate:
 #   - kiro-gateway — короткое имя без приставки (claude-sonnet-4.6);
 #   - OpenRouter — с приставкой anthropic/ (anthropic/claude-sonnet-4.6).
 models:
-  glossary:   anthropic/claude-sonnet-4.6
-  translate:  claude-sonnet-4.6
+  glossary:   anthropic/claude-sonnet-5
+  translate:  claude-sonnet-5
   judge:      anthropic/claude-haiku-4.5
-  reflect:    claude-sonnet-4.6
+  reflect:    claude-sonnet-5
   proofread:  anthropic/claude-haiku-4.5
-  style:      claude-sonnet-4.6
-  verify:     claude-sonnet-4.6
-  repair:     anthropic/claude-sonnet-4.6
+  style:      claude-sonnet-5
+  verify:     claude-sonnet-5
+  repair:     anthropic/claude-sonnet-5
 
 reflection:
   # Порог 2. Значение получено замером по трём полосам оценок, у каждой свой

@@ -11,7 +11,6 @@ The original stage='translate' entry is never modified.
 from __future__ import annotations
 
 import logging
-import re
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -20,7 +19,8 @@ from pathlib import Path
 from .cache import Cache
 from .models import SeriesGlossary
 from .prompts import Prompt, load_prompt, render_prompt
-from .provider import OpenRouterProvider
+from .provider import CompletionResult, OpenRouterProvider
+from .replies import ReplyChecker, parse_cached_paragraphs
 from .series import render_for_prompt
 
 logger = logging.getLogger(__name__)
@@ -30,8 +30,6 @@ LANG_NAMES = {
     "ru": "Russian",
     "hu": "Hungarian",
 }
-
-_PARAGRAPH_MARKER_RE = re.compile(r"^===PARAGRAPH\s+(\d+)===\s*$", re.MULTILINE)
 
 
 @dataclass
@@ -52,6 +50,7 @@ class ReflectStats:
     chunks_failed: int = 0
     chunks_improved: int = 0
     chunks_unchanged: int = 0
+    retries: int = 0
     input_tokens: int = 0
     output_tokens: int = 0
     results: list[ReflectResult] = field(default_factory=list)
@@ -83,6 +82,13 @@ class Reflector:
 
         self._glossary_block = render_for_prompt(glossary) if glossary else "(no glossary provided)"
         self._lock = threading.Lock()
+        self._checker = ReplyChecker(
+            stage="reflect",
+            model=model,
+            prompt_version=str(self.translate_prompt.version),
+            cache_path=getattr(cache, "path", None),
+            lock=self._lock,
+        )
 
     def _build_reflect_context(
         self,
@@ -207,14 +213,42 @@ class Reflector:
             user,
         )
 
+        expected = len(original_paragraphs)
         with self._lock:
             cached = self.cache.get(cache_key)
 
         if cached is not None:
+            parse_cached_paragraphs(cached.content, expected, stage="reflect", chunk_id=chunk_id)
             with self._lock:
                 stats.chunks_cached += 1
             return cached.content
 
+        # Validate BEFORE caching, like translate: this reply competes in the
+        # waterfall, so it must hold the paragraph count and parse as XHTML.
+        reply = self._checker.ask(
+            self._complete_retranslate,
+            system,
+            user,
+            chunk_id=chunk_id,
+            expected=expected,
+            stats=stats,
+        )
+        with self._lock:
+            self.cache.put(
+                key=cache_key,
+                stage="reflect",
+                model=self.model,
+                prompt_version=self.translate_prompt.version,
+                content=reply.text,
+                input_tokens=reply.input_tokens,
+                output_tokens=reply.output_tokens,
+                meta={"chunk_id": chunk_id},
+            )
+            stats.chunks_reflected += 1
+
+        return reply.text
+
+    def _complete_retranslate(self, system: str, user: str) -> CompletionResult:
         result = self.provider.complete(
             model=self.model,
             system=system,
@@ -223,7 +257,6 @@ class Reflector:
             max_tokens=self.translate_prompt.max_tokens,
             reasoning_effort=self.translate_prompt.reasoning_effort,
         )
-
         # Guard: empty content means the provider routed the answer elsewhere
         # (tool call / reasoning_content). Raise BEFORE caching so an empty
         # response is never written to the cache.
@@ -233,23 +266,7 @@ class Reflector:
                 f"(finish_reason={result.finish_reason!r}). Check "
                 "WEB_SEARCH_ENABLED / FAKE_REASONING on the gateway."
             )
-
-        with self._lock:
-            self.cache.put(
-                key=cache_key,
-                stage="reflect",
-                model=self.model,
-                prompt_version=self.translate_prompt.version,
-                content=result.text,
-                input_tokens=result.input_tokens,
-                output_tokens=result.output_tokens,
-                meta={"chunk_id": chunk_id},
-            )
-            stats.chunks_reflected += 1
-            stats.input_tokens += result.input_tokens
-            stats.output_tokens += result.output_tokens
-
-        return result.text
+        return result
 
     def reflect_chunk(
         self,

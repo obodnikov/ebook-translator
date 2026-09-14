@@ -893,7 +893,7 @@ Translate + glossary на `anthropic/claude-haiku-4.5`, остальное на 
 - Операции:
   - При старте stage: для каждого chunk спрашиваем кэш, попавшие — пропускаем.
   - Новый результат → в кэш сразу после валидации.
-  - Инвалидация: `btrans cache invalidate --chunk ch07 --stage translate` или сменой `prompt_version` / модели.
+  - Инвалидация: `btrans cache clear work/<book> --stage translate --chunk ch07_c01` (этап и все следующие за ним; словарь не трогается, перед удалением — копия `cache.sqlite`) или сменой `prompt_version` / модели.
 
 ### Возобновление
 
@@ -986,7 +986,7 @@ Translate + glossary на `anthropic/claude-haiku-4.5`, остальное на 
 
 **v1.1**:
 - `btrans estimate` для оценки стоимости до запуска.
-- `btrans cache` для управления кэшем.
+- `btrans cache` для управления кэшем (**`btrans cache clear` реализовано**).
 - Параллельная обработка chunks (текущая — последовательная, для простоты).
 
 **v1.2**:
