@@ -671,3 +671,66 @@ class TestAssembleNamesBrokenChunks:
         assert "--chunk ch01_c01" in result.output
         assert "have no translated content" not in result.output
         assert not (tmp_path / "out.epub").exists()
+
+
+# ---------------------------------------------------------------------------
+# btrans repair: -j and the list of issues left for a human
+# ---------------------------------------------------------------------------
+
+
+class TestRepairCommand:
+    def test_parallel_run_writes_unhandled_issues(self, tmp_path: Path):
+        import json
+
+        epub = write_minimal_epub(tmp_path / "book.epub")
+        work = tmp_path / "work"
+        book_dir = work / "test-book"
+        book_dir.mkdir(parents=True)
+        cache = Cache(book_dir / "cache.sqlite")
+        save_chunker_params(cache, target_words=2000, overlap_paragraphs=1)
+        cache.put(
+            "t1",
+            "translate",
+            "m",
+            "3",
+            "===PARAGRAPH 1===\n<p>Это абзац про вестигиум.</p>\n"
+            "===PARAGRAPH 2===\n<p>Ещё абзац с Сиуоллом.</p>",
+            meta={"chunk_id": "ch01_c01"},
+        )
+        issues = [
+            "grammar: p.1 «про вестигиум» → «о вестигиуме»",
+            "grammar: p.2 согласование сбито во всём абзаце",
+        ]
+        cache.put(
+            "j1",
+            "judge",
+            "m",
+            "5",
+            json.dumps({"score": 3, "issues": issues}),
+            meta={"chunk_id": "ch01_c01", "judged_stage": "translate"},
+        )
+        cache.close()
+
+        provider = MagicMock()
+        reply = MagicMock()
+        reply.text = '{"n": 1, "verdict": "accept", "why": "падеж"}'
+        reply.input_tokens, reply.output_tokens = 10, 5
+        provider.complete.return_value = reply
+
+        with patch("booktranslator.cli.create_stage_provider", return_value=provider):
+            result = runner.invoke(app, ["repair", str(epub), "--work", str(work), "-j", "2"])
+
+        assert result.exit_code == 0, result.output
+        assert "Applied:    1" in result.output
+        listing = (book_dir / "repair-unhandled.txt").read_text(encoding="utf-8")
+        assert "ch01_c01" in listing
+        assert "согласование сбито во всём абзаце" in listing
+        cache = Cache(book_dir / "cache.sqlite")
+        assert cache.list_stages()["repair"] == 1
+        assert cache.list_stages()["repair_verdicts"] == 1
+        cache.close()
+
+    def test_parallelism_below_one_is_refused(self, tmp_path: Path):
+        epub = write_minimal_epub(tmp_path / "book.epub")
+        result = runner.invoke(app, ["repair", str(epub), "--work", str(tmp_path), "-j", "0"])
+        assert result.exit_code == 1

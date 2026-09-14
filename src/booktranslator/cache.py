@@ -617,6 +617,8 @@ class Cache:
                 selected = full or stage == "judge" or _judged_stage_of(meta_json) in text_stages
             elif row_stage == "reflect_notes":
                 selected = "reflect" in text_stages
+            elif row_stage == "repair_verdicts":
+                selected = "repair" in text_stages
             else:
                 selected = full or row_stage in text_stages
             if not selected:

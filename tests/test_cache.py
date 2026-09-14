@@ -599,6 +599,14 @@ class TestClear:
         assert len(fresh_cache.get_judge_scores(judged_stage="translate")) == 2
         assert not selection.resets_chunking
 
+    def test_repair_takes_its_verdicts(self, fresh_cache: Cache):
+        _fill_book(fresh_cache)
+        fresh_cache.put("rv", "repair_verdicts", "m", "1", "[]", meta={"chunk_id": "ch01_c01"})
+        fresh_cache.clear(fresh_cache.select_for_clear("repair"))
+        stages = fresh_cache.list_stages()
+        assert "repair" not in stages and "repair_verdicts" not in stages
+        assert stages["verify"] == 2
+
     def test_reflect_takes_its_notes(self, fresh_cache: Cache):
         _fill_book(fresh_cache)
         fresh_cache.clear(fresh_cache.select_for_clear("reflect"))

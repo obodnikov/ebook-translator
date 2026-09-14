@@ -102,6 +102,11 @@ See [ARCHITECTURE.md §3, §5, §9](ARCHITECTURE.md); this file is the coding co
   paragraph that its own paragraph lacks — the sign of paragraphs mixed up, which XHTML checks
   cannot see. A failing patch is dropped and its paragraph kept; the chunk's other patches
   stand. Don't widen this to rejecting the chunk: that throws away every good edit with it.
+- Repair caches the gatekeeper's verdicts (`repair_verdicts`, outside the waterfall, cleared with
+  `repair`) under the call's key, rejections included, and the repaired text as a separate
+  `repair` row — only when something was accepted, since an unchanged copy would outrank a later
+  verify. A cached row must hold what its key names: the key is the model call, so the row is its
+  answer, not text derived from it.
 - A reply that fails to parse is never cached, so it is gone when the run ends. Write it to
   `work/<book>/failed/<stage>-<chunk>.txt` before raising, and log the failure with
   `finish_reason` and the length — 200 characters in an error message is not enough to tell a

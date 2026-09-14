@@ -1737,6 +1737,21 @@ def verify_cmd(
     )
 
 
+def _write_repair_unhandled(path: Path, unhandled: list[tuple[str, str, str]]) -> None:
+    """Write the judge's issues repair could not act on, grouped by chunk, for a human."""
+    lines = [
+        "# Замечания оценщика, которые починка не смогла превратить в точную замену.",
+        f"# btrans repair, {datetime.now():%Y-%m-%d %H:%M}. Их стоит просмотреть вручную.",
+    ]
+    current = None
+    for chunk_id, issue, why in sorted(unhandled):
+        if chunk_id != current:
+            lines += ["", chunk_id]
+            current = chunk_id
+        lines.append(f"  - [{why}] {issue}")
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
 @app.command("repair")
 def repair_cmd(
     epub: Path = typer.Argument(..., exists=True, dir_okay=False, help="Source EPUB."),
@@ -1766,6 +1781,12 @@ def repair_cmd(
         "--dry-run",
         help="Show what would be proposed without calling a model or writing anything.",
     ),
+    parallelism: int | None = typer.Option(
+        None,
+        "--parallelism",
+        "-j",
+        help="Number of chunks to repair concurrently (default 4).",
+    ),
 ) -> None:
     """Apply the judge's mechanical corrections, one vetted fix at a time.
 
@@ -1784,6 +1805,10 @@ def repair_cmd(
         verify_chunker_params,
     )
     from .repair import Repairer, RepairStats, propose
+
+    if parallelism is not None and parallelism < 1:
+        console.print("[red]--parallelism must be ≥ 1.[/red]")
+        raise typer.Exit(code=1)
 
     cfg = load_config(config_path if config_path.exists() else None)
     wanted = tuple(
@@ -1862,14 +1887,12 @@ def repair_cmd(
             console=console,
         ) as progress:
             task = progress.add_task("repair", total=len(waterfall))
-            for done, (cid, paras) in enumerate(sorted(waterfall.items()), 1):
-                try:
-                    repairer.repair_chunk(
-                        cid, paras, judge_map[cid]["issues"], originals.get(cid, ""), stats
+
+            def on_done(done: int, cid: str, error: Exception | None) -> None:
+                if error is not None:
+                    progress.console.print(
+                        f"[yellow]{cid}: {type(error).__name__}: {error}[/yellow]"
                     )
-                except Exception as e:  # noqa: BLE001
-                    stats.chunks_failed += 1
-                    console.print(f"[yellow]{cid}: {type(e).__name__}: {e}[/yellow]")
                 progress.update(
                     task,
                     completed=done,
@@ -1878,6 +1901,16 @@ def repair_cmd(
                         f"rejected {stats.rejected} failed {stats.chunks_failed}"
                     ),
                 )
+
+            repairer.repair_chunks(
+                [
+                    (cid, paras, judge_map[cid]["issues"], originals.get(cid, ""))
+                    for cid, paras in sorted(waterfall.items())
+                ],
+                stats,
+                parallelism=parallelism or 4,
+                on_done=on_done,
+            )
 
         console.print(
             f"\n[bold]Repair results:[/bold]\n"
@@ -1888,11 +1921,16 @@ def repair_cmd(
             f"  Failed: {stats.chunks_failed}\n"
             f"[dim]Tokens: {stats.input_tokens:,} in, {stats.output_tokens:,} out.[/dim]"
         )
+        unhandled_path = wd.root / "repair-unhandled.txt"
         if stats.unhandled:
+            _write_repair_unhandled(unhandled_path, stats.unhandled)
             console.print(
                 f"\n[dim]{len(stats.unhandled)} issues could not be turned into a "
-                f"substitution and were left for a human.[/dim]"
+                f"substitution and were left for a human: {unhandled_path}[/dim]"
             )
+        else:
+            # A list from an earlier run would describe text that has moved on.
+            unhandled_path.unlink(missing_ok=True)
     finally:
         cache.close()
 
@@ -2605,7 +2643,7 @@ def cache_clear_cmd(
         table.add_column("Stage")
         table.add_column("Rows", justify="right")
         table.add_column("Cost", justify="right")
-        order = [*CLEARABLE_STAGES, "reflect_notes"]
+        order = [*CLEARABLE_STAGES, "reflect_notes", "repair_verdicts"]
         for name in sorted(
             selection.by_stage,
             key=lambda n: (n not in order, order.index(n) if n in order else 0, n),

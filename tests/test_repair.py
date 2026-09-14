@@ -12,11 +12,18 @@ correctness requirement, not caution.
 
 from __future__ import annotations
 
+from pathlib import Path
+from unittest.mock import MagicMock
+
 import pytest
 
+from booktranslator.cache import Cache
+from booktranslator.prompts import render_prompt
+from booktranslator.provider import CompletionResult
 from booktranslator.repair import (
     MECHANICAL_CATEGORIES,
     Repairer,
+    RepairStats,
     Skip,
     apply_candidates,
     parse_issue,
@@ -267,3 +274,147 @@ class TestApplyingVerdicts:
         paras = ["<p>Рой мёртв.</p>", "<p>Ей было тридцать одного года.</p>"]
         cands = propose(paras, [GENDER, NUMERAL]).candidates
         assert self._decide(cands, {}) == paras
+
+
+class TestLoneVerdictObject:
+    """With one proposal, a model answered `{…}` instead of `[{…}]` on Foxglove
+    Summer ch12_c02 and the chunk failed. The verdict is the same either way."""
+
+    def test_a_single_object_is_one_verdict(self):
+        out = Repairer.parse_verdicts('{"n": 1, "verdict": "reject", "why": "форма верна"}')
+        assert out == {1: (False, "форма верна")}
+
+    def test_a_single_object_in_fences(self):
+        out = Repairer.parse_verdicts('```json\n{"n": 1, "verdict": "accept"}\n```')
+        assert out == {1: (True, "")}
+
+    def test_an_object_that_is_not_a_verdict_still_raises(self):
+        with pytest.raises(ValueError, match="not a JSON array"):
+            Repairer.parse_verdicts('{"result": "ok"}')
+
+
+# ---------------------------------------------------------------------------
+# The model pass: caching, re-runs, parallel chunks
+# ---------------------------------------------------------------------------
+
+REPAIR_PROMPT = Path(__file__).resolve().parents[1] / "prompts" / "repair.md"
+PARAS = ["<p>Рой мёртв.</p>", "<p>Ей было тридцать одного года.</p>"]
+
+
+def _verdicts(*accepts: bool) -> CompletionResult:
+    body = ",".join(
+        f'{{"n": {i}, "verdict": "{"accept" if ok else "reject"}", "why": "-"}}'
+        for i, ok in enumerate(accepts, 1)
+    )
+    return CompletionResult(
+        text=f"[{body}]", input_tokens=100, output_tokens=10, total_tokens=110, model="m", raw={}
+    )
+
+
+@pytest.fixture
+def cache(tmp_path: Path) -> Cache:
+    return Cache(tmp_path / "cache.sqlite")
+
+
+def _repairer(provider, cache: Cache) -> Repairer:
+    return Repairer(provider, REPAIR_PROMPT, cache, None, model="m")
+
+
+class TestRepairReruns:
+    def test_rerun_after_an_accepted_fix_is_free_and_same(self, cache):
+        provider = MagicMock()
+        provider.complete.return_value = _verdicts(True, False)
+        first = _repairer(provider, cache).repair_chunk(
+            "c1", PARAS, [GENDER, NUMERAL], "Bees is dead.", RepairStats()
+        )
+
+        stats = RepairStats()
+        second = _repairer(provider, cache).repair_chunk(
+            "c1", PARAS, [GENDER, NUMERAL], "Bees is dead.", stats
+        )
+
+        assert provider.complete.call_count == 1
+        assert second.paragraphs == first.paragraphs == ["<p>Рой мертва.</p>", PARAS[1]]
+        assert (stats.chunks_cached, stats.accepted, stats.rejected) == (1, 1, 1)
+
+    def test_rejecting_everything_is_remembered_but_is_not_a_stage(self, cache):
+        provider = MagicMock()
+        provider.complete.return_value = _verdicts(False, False)
+        for _ in range(2):
+            _repairer(provider, cache).repair_chunk(
+                "c1", PARAS, [GENDER, NUMERAL], "Bees is dead.", RepairStats()
+            )
+
+        assert provider.complete.call_count == 1, "the refusal was paid for twice"
+        # No `repair` entry: an unchanged copy would outrank a later verify.
+        assert cache.list_stages() == {"repair_verdicts": 1}
+
+    def test_a_row_from_before_verdicts_were_kept_is_used_as_it_stands(self, cache):
+        provider = MagicMock()
+        repairer = _repairer(provider, cache)
+        # Reproduce the old layout: the repaired text under the call's own key.
+        proposal = propose(PARAS, [GENDER])
+        context = {
+            "source_lang": "en",
+            "source_lang_name": "English",
+            "target_lang": "ru",
+            "target_lang_name": "Russian",
+            "glossary_block": "(no glossary provided)",
+            "original_text": "Bees is dead.",
+            "candidates": [
+                {
+                    "paragraph": c.paragraph,
+                    "note": c.issue.raw,
+                    "paragraph_text": PARAS[c.paragraph - 1],
+                    "old": c.old,
+                    "new": c.new,
+                }
+                for c in proposal.candidates
+            ],
+        }
+        system, user = render_prompt(repairer.prompt, context)
+        key = Cache.make_key("repair", "m", repairer.prompt.version, system, user)
+        old_text = "===PARAGRAPH 1===\n<p>Рой мертва.</p>\n===PARAGRAPH 2===\n" + PARAS[1]
+        cache.put(key, "repair", "m", "1", old_text, meta={"chunk_id": "c1", "accepted": 1})
+
+        stats = RepairStats()
+        result = repairer.repair_chunk("c1", PARAS, [GENDER], "Bees is dead.", stats)
+
+        provider.complete.assert_not_called()
+        assert result.paragraphs == ["<p>Рой мертва.</p>", PARAS[1]]
+        assert (stats.chunks_cached, stats.accepted, stats.chunks_repaired) == (1, 1, 1)
+
+    def test_unhandled_issues_carry_their_reason(self, cache):
+        stats = RepairStats()
+        _repairer(MagicMock(), cache).repair_chunk(
+            "c1", ["<p>Рой мёртв. Рой мёртв.</p>"], [GENDER], "", stats
+        )
+        assert stats.unhandled == [("c1", GENDER, Skip.QUOTE_AMBIGUOUS.value)]
+
+
+class TestParallelRepair:
+    def test_all_chunks_done_and_a_failure_does_not_stop_the_rest(self, cache):
+        provider = MagicMock()
+
+        def complete(**kwargs):
+            if "Chunk three" in kwargs["user"]:
+                raise RuntimeError("boom")
+            return _verdicts(True)
+
+        provider.complete.side_effect = complete
+        jobs = [
+            (f"c{i}", [f"<p>Рой мёртв. {name}</p>"], [GENDER], f"Chunk {name}")
+            for i, name in enumerate(["one", "two", "three", "four"], 1)
+        ]
+        stats = RepairStats(chunks_total=len(jobs))
+        seen: list[tuple[str, bool]] = []
+
+        _repairer(provider, cache).repair_chunks(
+            jobs,
+            stats,
+            parallelism=3,
+            on_done=lambda done, cid, err: seen.append((cid, err is None)),
+        )
+
+        assert sorted(seen) == [("c1", True), ("c2", True), ("c3", False), ("c4", True)]
+        assert (stats.chunks_failed, stats.chunks_repaired, stats.accepted) == (1, 3, 3)
