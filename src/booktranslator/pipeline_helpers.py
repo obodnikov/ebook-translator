@@ -121,8 +121,8 @@ def save_chunker_params(cache: Cache, target_words: int, overlap_paragraphs: int
             f"translated with target_words={saved_words}, "
             f"overlap={saved_overlap}; current config has "
             f"target_words={target_words}, overlap={overlap_paragraphs}. "
-            f"Use a different workdir or clear the cache to re-translate "
-            f"with new settings."
+            f"Use a different workdir, or run `btrans cache clear <book workdir>` "
+            f"to re-translate with new settings (the glossary is kept)."
         )
     cache.set_meta(
         CHUNKER_META_KEY,
@@ -154,7 +154,8 @@ def verify_chunker_params(cache: Cache, target_words: int, overlap_paragraphs: i
             f"current config has target_words={target_words}, "
             f"overlap={overlap_paragraphs}. "
             f"Chunk IDs will not match cached translations. "
-            f"Use the same chunker settings or re-translate."
+            f"Use the same chunker settings, or run `btrans cache clear <book workdir>` "
+            f"and re-translate."
         )
 
 

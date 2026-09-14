@@ -51,6 +51,9 @@ CREATE TABLE IF NOT EXISTS pipeline_meta (
 # Waterfall order: later stages take priority over earlier ones.
 STAGE_WATERFALL = ["translate", "reflect", "proofread", "style", "verify", "repair"]
 
+# Stages `btrans cache clear --stage` accepts, in pipeline order.
+CLEARABLE_STAGES = ["translate", "judge", "reflect", "proofread", "style", "verify", "repair"]
+
 
 def _is_measurement_run(meta_json: str | None) -> bool:
     """True for verdicts written by `btrans judge --no-cache`."""
@@ -103,6 +106,45 @@ class Preference:
     preferred_stage: str
     reason: str | None
     updated_at: str
+
+
+@dataclass
+class ClearSelection:
+    """What `Cache.clear` would delete, gathered before anything is touched."""
+
+    keys: list[str]
+    # {stage: (rows, cost_usd)} — shown to the user before they confirm.
+    by_stage: dict[str, tuple[int, float]]
+    preference_chunk_ids: list[str]
+    # True when the translations themselves go for the whole book, so the
+    # chunking they were cut with no longer binds the workdir.
+    resets_chunking: bool
+
+    @property
+    def cost_usd(self) -> float:
+        return sum(cost for _, cost in self.by_stage.values())
+
+    @property
+    def is_empty(self) -> bool:
+        return not self.keys and not self.preference_chunk_ids
+
+
+def text_stages_cleared_from(stage: str | None) -> list[str]:
+    """Waterfall stages whose output goes when clearing from `stage`.
+
+    A later stage rewrites the text of the one before it, so clearing a stage
+    also clears every stage after it: left behind, a later output would still
+    win the waterfall at assembly with text built on the deleted one. Judge
+    verdicts rewrite nothing, so clearing them leaves every text stage alone.
+    `None` means a full clear.
+    """
+    if stage is None:
+        return list(STAGE_WATERFALL)
+    if stage == "judge":
+        return []
+    if stage not in STAGE_WATERFALL:
+        raise ValueError(f"Unknown stage {stage!r}. Valid: {', '.join(CLEARABLE_STAGES)}")
+    return STAGE_WATERFALL[STAGE_WATERFALL.index(stage) :]
 
 
 class Cache:
@@ -544,6 +586,81 @@ class Cache:
         if row is None:
             return None
         return json.loads(row[0])
+
+    # ------------------------------------------------------------------
+    # Clearing (btrans cache clear)
+    # ------------------------------------------------------------------
+
+    def select_for_clear(
+        self, stage: str | None = None, chunk_ids: list[str] | None = None
+    ) -> ClearSelection:
+        """Collect the rows a clear from `stage` removes, without deleting.
+
+        The glossary row is never selected: it is built from the whole book,
+        not from chunks, and has its own `glossary extract --force`. Judge rows
+        go with the stage they scored. With `chunk_ids`, only rows and
+        preferences of those chunks are selected, and the chunking stays bound.
+        """
+        text_stages = set(text_stages_cleared_from(stage))
+        full = stage is None
+
+        query = "SELECT key, chunk_id, stage, cost_usd, meta_json FROM cache WHERE stage != ?"
+        params: list[Any] = ["glossary"]
+        if chunk_ids:
+            query += f" AND chunk_id IN ({','.join('?' * len(chunk_ids))})"
+            params.extend(chunk_ids)
+
+        keys: list[str] = []
+        by_stage: dict[str, tuple[int, float]] = {}
+        for key, _chunk_id, row_stage, cost, meta_json in self.conn.execute(query, params):
+            if row_stage == "judge":
+                selected = full or stage == "judge" or _judged_stage_of(meta_json) in text_stages
+            elif row_stage == "reflect_notes":
+                selected = "reflect" in text_stages
+            else:
+                selected = full or row_stage in text_stages
+            if not selected:
+                continue
+            keys.append(key)
+            rows, total = by_stage.get(row_stage, (0, 0.0))
+            by_stage[row_stage] = (rows + 1, total + (cost or 0.0))
+
+        pref_ids = [
+            p.chunk_id
+            for p in self.list_preferences()
+            if p.preferred_stage in text_stages and (not chunk_ids or p.chunk_id in chunk_ids)
+        ]
+        return ClearSelection(
+            keys=keys,
+            by_stage=by_stage,
+            preference_chunk_ids=pref_ids,
+            resets_chunking="translate" in text_stages and not chunk_ids,
+        )
+
+    def clear(self, selection: ClearSelection, meta_keys: list[str] | None = None) -> None:
+        """Delete a selection in one transaction: all of it or none of it."""
+        batch_size = 500
+        with self.conn:
+            for i in range(0, len(selection.keys), batch_size):
+                batch = selection.keys[i : i + batch_size]
+                self.conn.execute(
+                    f"DELETE FROM cache WHERE key IN ({','.join('?' * len(batch))})", batch
+                )
+            self.conn.executemany(
+                "DELETE FROM chunk_preferences WHERE chunk_id = ?",
+                [(cid,) for cid in selection.preference_chunk_ids],
+            )
+            self.conn.executemany(
+                "DELETE FROM pipeline_meta WHERE key = ?", [(k,) for k in meta_keys or []]
+            )
+
+    def backup_to(self, path: Path) -> None:
+        """Copy the database through SQLite, so a half-written page never lands in it."""
+        target = sqlite3.connect(path)
+        try:
+            self.conn.backup(target)
+        finally:
+            target.close()
 
     def close(self) -> None:
         self.conn.close()

@@ -10,6 +10,7 @@ without making real LLM calls. Covers:
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -543,3 +544,96 @@ class TestJudgeReceivesTheSourceText:
         # And the translation slot really does carry the Russian, so the test
         # would not pass merely because nothing was translated.
         assert "вестигиум" in "\n".join(capture["translations"].values())
+
+
+# ---------------------------------------------------------------------------
+# btrans cache clear
+# ---------------------------------------------------------------------------
+
+
+class TestCacheClearCommand:
+    """The command around Cache.select_for_clear / Cache.clear."""
+
+    def _book(self, tmp_path: Path) -> Path:
+        work = tmp_path / "foxglove-summer"
+        work.mkdir()
+        cache = Cache(work / "cache.sqlite")
+        cache.put("g", "glossary", "m", "1", "{}")
+        for stage in ("translate", "style"):
+            cache.put(f"{stage}-1", stage, "m", "1", "text", meta={"chunk_id": "ch01_c01"})
+        cache.put("translate-2", "translate", "m", "1", "text", meta={"chunk_id": "ch01_c02"})
+        save_chunker_params(cache, target_words=2000, overlap_paragraphs=1)
+        cache.close()
+        (work / "state.json").write_text(
+            '{"book_slug": "foxglove-summer", "current_stage": "translate", '
+            '"completed_stages": ["glossary", "translate"]}',
+            encoding="utf-8",
+        )
+        return work
+
+    def _completed(self, work: Path) -> list[str]:
+        return json.loads((work / "state.json").read_text(encoding="utf-8"))["completed_stages"]
+
+    def _stages(self, work: Path) -> dict[str, int]:
+        cache = Cache(work / "cache.sqlite")
+        try:
+            return cache.list_stages()
+        finally:
+            cache.close()
+
+    def test_full_clear_lets_translate_rechunk(self, tmp_path: Path):
+        work = self._book(tmp_path)
+
+        result = runner.invoke(app, ["cache", "clear", str(work), "--yes"])
+
+        assert result.exit_code == 0, result.output
+        assert self._stages(work) == {"glossary": 1}
+        assert "target_words=2000" in result.output
+        assert list(work.glob("cache.sqlite.bak-*")), "no backup written"
+        assert self._completed(work) == ["glossary"]
+        # The very error this command exists for no longer fires.
+        cache = Cache(work / "cache.sqlite")
+        save_chunker_params(cache, target_words=1200, overlap_paragraphs=1)
+        cache.close()
+
+    def test_refusal_deletes_nothing(self, tmp_path: Path):
+        work = self._book(tmp_path)
+        before = self._stages(work)
+
+        result = runner.invoke(app, ["cache", "clear", str(work)], input="n\n")
+
+        assert result.exit_code == 0, result.output
+        assert "Nothing deleted" in result.output
+        assert self._stages(work) == before
+        assert not list(work.glob("cache.sqlite.bak-*"))
+
+    def test_stage_with_chunk_keeps_chunking(self, tmp_path: Path):
+        work = self._book(tmp_path)
+
+        result = runner.invoke(
+            app,
+            ["cache", "clear", str(work), "--stage", "translate", "--chunk", "ch01_c01", "-y"],
+        )
+
+        assert result.exit_code == 0, result.output
+        assert self._stages(work) == {"glossary": 1, "translate": 1}
+        cache = Cache(work / "cache.sqlite")
+        with pytest.raises(ChunkerConfigMismatchError):
+            save_chunker_params(cache, target_words=1200, overlap_paragraphs=1)
+        cache.close()
+        assert self._completed(work) == ["glossary", "translate"]
+
+    def test_invalid_stage_rejected(self, tmp_path: Path):
+        work = self._book(tmp_path)
+        result = runner.invoke(app, ["cache", "clear", str(work), "--stage", "glossary"])
+        assert result.exit_code == 1
+        assert self._stages(work)["glossary"] == 1
+
+    def test_mismatch_error_names_the_command(self, tmp_path: Path):
+        cache = Cache(tmp_path / "cache.sqlite")
+        save_chunker_params(cache, target_words=2000, overlap_paragraphs=1)
+        with pytest.raises(ChunkerConfigMismatchError, match="btrans cache clear"):
+            save_chunker_params(cache, target_words=1200, overlap_paragraphs=1)
+        with pytest.raises(ChunkerConfigMismatchError, match="btrans cache clear"):
+            verify_chunker_params(cache, target_words=1200, overlap_paragraphs=1)
+        cache.close()

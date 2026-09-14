@@ -6,6 +6,7 @@ Commands:
     btrans series init SLUG --title "..." --author "..."
     btrans series show SLUG
     btrans translate EPUB [--series SLUG]
+    btrans cache clear BOOK_WORKDIR [--stage STAGE] [--chunk ID]
 """
 
 from __future__ import annotations
@@ -27,13 +28,14 @@ from rich.progress import (
 )
 from rich.table import Table
 
-from .cache import STAGE_WATERFALL, Cache
+from .cache import CLEARABLE_STAGES, STAGE_WATERFALL, Cache
 from .chunker import chunk_book
 from .config import load_config
 from .epub_io import read_book, read_book_structured, write_translated_epub
 from .glossary import extract_glossary, save_glossary
 from .models import Glossary, SeriesGlossary, SeriesGlossaryEntry, Stage
 from .pipeline_helpers import (
+    CHUNKER_META_KEY,
     ChunkerConfigMismatchError,
     build_reflect_input,
     collect_chunk_originals,
@@ -66,9 +68,11 @@ app = typer.Typer(
 glossary_app = typer.Typer(help="Glossary extraction and curation.")
 series_app = typer.Typer(help="Series-level curated glossary management.")
 cover_app = typer.Typer(help="Cover image replacement and translation.")
+cache_app = typer.Typer(help="Inspect and clear a book's translation cache.")
 app.add_typer(glossary_app, name="glossary")
 app.add_typer(series_app, name="series")
 app.add_typer(cover_app, name="cover")
+app.add_typer(cache_app, name="cache")
 
 console = Console()
 
@@ -2547,6 +2551,103 @@ def prefer_cmd(
         + (f" [dim]({reason})[/dim]" if reason else "")
     )
     cache.close()
+
+
+# ---------------------------------------------------------------------------
+# cache clear
+# ---------------------------------------------------------------------------
+
+
+@cache_app.command("clear")
+def cache_clear_cmd(
+    work_path: Path = typer.Argument(
+        ...,
+        exists=True,
+        file_okay=False,
+        help="Book workdir (e.g. work/foxglove-summer).",
+    ),
+    stage: str | None = typer.Option(
+        None,
+        "--stage",
+        help=(
+            f"Clear this stage and every stage after it ({', '.join(CLEARABLE_STAGES)}). "
+            "Omit to clear everything except the glossary."
+        ),
+    ),
+    chunks: list[str] | None = typer.Option(
+        None,
+        "--chunk",
+        help="Only clear these chunks (repeatable). Keeps the saved chunking.",
+    ),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Don't ask for confirmation."),
+) -> None:
+    """Delete cached stage results so they are produced again on the next run.
+
+    The glossary is always kept. A backup of cache.sqlite is written first.
+    """
+    if stage is not None and stage not in CLEARABLE_STAGES:
+        console.print(f"[red]Invalid stage {stage!r}. Valid: {', '.join(CLEARABLE_STAGES)}[/red]")
+        raise typer.Exit(code=1)
+    cache_path = work_path / "cache.sqlite"
+    if not cache_path.is_file():
+        console.print(f"[red]No cache.sqlite in {work_path}[/red]")
+        raise typer.Exit(code=1)
+
+    cache = Cache(cache_path)
+    try:
+        selection = cache.select_for_clear(stage, chunks)
+        chunking = cache.get_meta(CHUNKER_META_KEY) if selection.resets_chunking else None
+        if selection.is_empty and chunking is None:
+            console.print("[green]Nothing to clear.[/green]")
+            return
+
+        table = Table(title=f"To delete from {cache_path}")
+        table.add_column("Stage")
+        table.add_column("Rows", justify="right")
+        table.add_column("Cost", justify="right")
+        order = [*CLEARABLE_STAGES, "reflect_notes"]
+        for name in sorted(
+            selection.by_stage,
+            key=lambda n: (n not in order, order.index(n) if n in order else 0, n),
+        ):
+            rows, cost = selection.by_stage[name]
+            table.add_row(name, str(rows), f"${cost:.4f}")
+        console.print(table)
+        console.print(f"[bold]Paid for these rows:[/bold] ${selection.cost_usd:.4f}")
+        if selection.preference_chunk_ids:
+            console.print(
+                f"[bold]Stage preferences removed:[/bold] {len(selection.preference_chunk_ids)}"
+            )
+        if chunking is not None:
+            console.print(
+                f"[bold]Saved chunking forgotten:[/bold] "
+                f"target_words={chunking.get('target_words')}, "
+                f"overlap={chunking.get('overlap_paragraphs')}"
+            )
+
+        if not yes and not typer.confirm("Delete these entries?", default=False):
+            console.print("Nothing deleted.")
+            return
+
+        backup = work_path / f"cache.sqlite.bak-{datetime.now():%Y%m%d-%H%M%S}"
+        cache.backup_to(backup)
+        console.print(f"[dim]Backup: {backup}[/dim]")
+        cache.clear(selection, [CHUNKER_META_KEY] if chunking is not None else [])
+    finally:
+        cache.close()
+
+    if selection.resets_chunking:
+        wd = WorkDir(root=work_path, slug=work_path.name)
+        if wd.state_path.is_file():
+            state = wd.load_state()
+            state.completed_stages = [
+                s
+                for s in state.completed_stages
+                if s not in (Stage.TRANSLATE, Stage.PAUSE_2, Stage.DONE)
+            ]
+            wd.save_state(state)
+
+    console.print(f"[green]Deleted {len(selection.keys)} cached rows.[/green]")
 
 
 # ---------------------------------------------------------------------------
