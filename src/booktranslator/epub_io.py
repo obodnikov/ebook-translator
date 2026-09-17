@@ -13,6 +13,7 @@ left untouched in this first cut.
 
 from __future__ import annotations
 
+import logging
 import warnings
 import zipfile
 from dataclasses import dataclass, field
@@ -23,6 +24,8 @@ from lxml import etree
 from lxml import html as lxhtml
 
 from .models import BookMeta
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Flat read (used by glossary extraction)
@@ -59,6 +62,82 @@ def _chapter_text(document: epub.EpubHtml) -> str:
     return tree.text_content().strip()
 
 
+def read_package_version(path: Path) -> str:
+    """Read the EPUB package version the book declares ("2.0", "3.0", ...).
+
+    Falls back to "2.0" — the older, more conservative assumption — when the
+    package cannot be read, so a caller choosing markup by version errs
+    towards what every reader understands. The fallback is logged rather
+    than passed off as a declared 2.0: a book that is really EPUB3 would
+    otherwise quietly get the wrong markup.
+    """
+    try:
+        with zipfile.ZipFile(path, "r") as zf:
+            opf_name = _find_opf_name(zf)
+            if opf_name is None:
+                return _fall_back_to_epub2(
+                    path, "META-INF/container.xml names no package file we can find"
+                )
+            version = (etree.fromstring(zf.read(opf_name)).get("version") or "").strip()
+            if not version:
+                return _fall_back_to_epub2(path, f"{opf_name} declares no version")
+            return version
+    except (KeyError, OSError, zipfile.BadZipFile, etree.XMLSyntaxError) as exc:
+        return _fall_back_to_epub2(path, f"cannot read the package ({exc})")
+
+
+def _find_opf_name(zf: zipfile.ZipFile) -> str | None:
+    """Resolve the package file's path inside the archive.
+
+    The path comes from META-INF/container.xml, then has to be matched
+    against what the archive actually stores: some builds write it with a
+    leading slash, and some differ from the stored member in case alone.
+    """
+    try:
+        container = etree.fromstring(zf.read("META-INF/container.xml"))
+    except (KeyError, etree.XMLSyntaxError):
+        return None
+    ns_c = "urn:oasis:names:tc:opendocument:xmlns:container"
+    rootfile = container.find(f".//{{{ns_c}}}rootfile")
+    if rootfile is None:
+        return None
+    full_path = (rootfile.get("full-path") or "").strip().lstrip("/")
+    if not full_path:
+        return None
+
+    names = zf.namelist()
+    if full_path in names:
+        return full_path
+    lowered = full_path.lower()
+    for name in names:
+        if name.lower() == lowered:
+            return name
+    return None
+
+
+def _fall_back_to_epub2(path: Path, reason: str) -> str:
+    """Report an unreadable package version and assume the older format."""
+    logger.warning(
+        "Cannot read the EPUB package version of %s: %s. Assuming EPUB 2.0 — "
+        "if the book is really EPUB 3, reader notes will be built as endnotes "
+        "instead of popup footnotes.",
+        path.name,
+        reason,
+    )
+    return "2.0"
+
+
+def _version_from_book(book: epub.EpubBook, path: Path) -> str:
+    """Package version from the book ebooklib has already parsed.
+
+    Cheaper and more forgiving than reading the archive a second time —
+    ebooklib tolerates paths and encodings a plain lookup would miss. The
+    archive sniff stays as the fallback for a build it leaves blank.
+    """
+    version = str(getattr(book, "version", "") or "").strip()
+    return version or read_package_version(path)
+
+
 def read_book(path: Path) -> ExtractedBook:
     """Read an EPUB and return metadata + flat chapter texts."""
     with warnings.catch_warnings():
@@ -81,6 +160,7 @@ def read_book(path: Path) -> ExtractedBook:
         language=_first_metadata(book, "language", default="en"),
         word_count=word_count,
         chapters=len(chapters),
+        epub_version=_version_from_book(book, path),
     )
     return ExtractedBook(meta=meta, chapters=chapters, source_path=path)
 
@@ -216,6 +296,7 @@ def read_book_structured(path: Path) -> StructuredBook:
         language=_first_metadata(book, "language", default="en"),
         word_count=total_words,
         chapters=len(chapters),
+        epub_version=_version_from_book(book, path),
     )
     return StructuredBook(meta=meta, source_path=path, chapters=chapters)
 

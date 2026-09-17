@@ -69,3 +69,4 @@ reader_notes:
   enabled: true
   types: [concept, term]
   scope: first-in-book  # first-in-chapter | first-in-book | all
+  heading: Примечания  # заголовок блока примечаний; нужен только для EPUB 2

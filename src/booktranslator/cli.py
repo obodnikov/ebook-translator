@@ -1027,6 +1027,7 @@ def translate(
             work_dir=work_dir,
             book_title=book.meta.title,
             book_author=book.meta.author,
+            epub_version=book.meta.epub_version,
             preloaded_glossary=glossary,
             explicit=_notes_explicit,
         )
@@ -2977,6 +2978,7 @@ def assemble_cmd(
                 work_dir=work_dir,
                 book_title=book.meta.title,
                 book_author=book.meta.author,
+                epub_version=book.meta.epub_version,
                 preloaded_glossary=None,
                 explicit=_assemble_notes_explicit,
             )

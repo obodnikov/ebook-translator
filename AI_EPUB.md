@@ -1,8 +1,8 @@
 # AI rules — EPUB I/O, chunking, cover, assembly (Python)
 
-Scope: `src/booktranslator/epub_io.py`, `chunker.py`, `cover.py`, and the assemble path in
-`postprocess.py` / `cli.py` (`assemble`, `cover extract|replace|translate`). This layer turns an
-EPUB into translatable units and rebuilds it byte-faithfully. See
+Scope: `src/booktranslator/epub_io.py`, `chunker.py`, `cover.py`, `reader_notes.py`, and the
+assemble path in `postprocess.py` / `cli.py` (`assemble`, `cover extract|replace|translate|fix`).
+This layer turns an EPUB into translatable units and rebuilds it byte-faithfully. See
 [ARCHITECTURE.md §3 (steps 1–2, 7, 11), §4–5](ARCHITECTURE.md); this file is the coding contract.
 
 ## Language & build
@@ -78,6 +78,35 @@ source EPUB as immutable reference data:
   **image** provider (see [AI_PROVIDER.md](AI_PROVIDER.md)), never the text provider.
 - No image library. Sizes come from the file header, for the formats
   `_detect_image_mime_from_bytes` already recognizes; don't add Pillow for this.
+
+## Reader notes (`reader_notes.py`)
+
+- **The footnote markup follows the source book's package version**
+  (`BookMeta.epub_version`). Popup footnotes are an EPUB3 mechanism: there the note
+  goes in `<aside epub:type="footnote">`. EPUB2 has no such mechanism and does not allow
+  `<aside>` — a strict reader may drop the element and the note with it — so an EPUB2 book
+  gets visible endnotes at the end of the chapter, built from `<div>`. Don't collapse the two
+  paths into one, and don't hide the EPUB2 block: a hidden note with no popup leads nowhere.
+- **Create `epub:type` with the prefix bound** (`nsmap={"epub": EPUB_NS}`). Without it lxml
+  invents `ns0:type` for the books whose `<html>` declares no `xmlns:epub` — namespace-correct
+  but invisible to a reader matching the literal `epub:type`. The same trap as the cover's
+  `<meta name="cover">`; the test fixture must include a chapter with no `xmlns:epub`, or the
+  bug goes unnoticed.
+- Every marker carries an id and every note a link back to it. A reader without popups
+  navigates, and without a way back the reader is stranded at the end of the chapter.
+- Note styles go into the chapter's own `<head>`, never into the book's stylesheet — that file
+  is the book's asset and round-trip identity covers it.
+- Notes are numbered in reading order and the numbering rises through the book. Matching walks
+  the glossary per paragraph, so the numbers are corrected per chapter after injection. That
+  correction is all-or-nothing: plan the whole chapter first and change nothing unless every
+  marker resolved to a note, or a marker that could not be accounted for ends up pointing at an
+  id the renumbering has moved away.
+- **Version detection fails loudly.** `read_package_version` falls back to "2.0" because that is
+  what every reader understands, but it logs the fallback: an EPUB3 book mistaken for EPUB2 would
+  silently get the wrong markup. Take the version from the book ebooklib already parsed
+  (`_version_from_book`) and keep the archive sniff as the fallback.
+- Don't add `<p>` inside an EPUB2 note: `_find_paragraphs` would take it for prose if the
+  output is ever read back in.
 
 ## What stays out of this layer
 
