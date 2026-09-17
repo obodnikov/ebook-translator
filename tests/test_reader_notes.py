@@ -9,9 +9,11 @@ from lxml import etree
 
 from booktranslator.models import ReaderNotesConfig, SeriesGlossary, SeriesGlossaryEntry
 from booktranslator.reader_notes import (
+    NOTE_STYLE_ID,
     _build_candidates,
     _find_and_wrap_first_match,
     inject_reader_notes,
+    is_epub3,
 )
 
 XHTML_NS = "http://www.w3.org/1999/xhtml"
@@ -47,6 +49,34 @@ def _make_chapter(body_content: str) -> FakeChapterDoc:
     root = tree.getroot()
     paragraphs = root.findall(f".//{{{XHTML_NS}}}p")
     return FakeChapterDoc(tree=tree, paragraphs=paragraphs)
+
+
+def _make_epub2_chapter(body_content: str) -> FakeChapterDoc:
+    """A chapter shaped like the EPUB2 books we translate.
+
+    The difference that matters: <html> does not declare xmlns:epub. The
+    other fixture does, which is why it never caught lxml inventing a
+    prefix of its own for the epub:type attribute.
+    """
+    xhtml = f"""<?xml version="1.0" encoding="utf-8"?>
+<html xmlns="{XHTML_NS}">
+<head><title>Test</title></head>
+<body class="calibre2">
+{body_content}
+</body>
+</html>"""
+    tree = etree.parse(BytesIO(xhtml.encode("utf-8")))
+    root = tree.getroot()
+    return FakeChapterDoc(tree=tree, paragraphs=root.findall(f".//{{{XHTML_NS}}}p"))
+
+
+def _serialize(chapter: FakeChapterDoc) -> str:
+    return etree.tostring(chapter.tree, encoding="unicode")
+
+
+def _note_items(chapter: FakeChapterDoc) -> list[etree._Element]:
+    root = chapter.tree.getroot()
+    return [el for el in root.iter() if el.get("class") == "reader-note-item"]
 
 
 def _make_glossary(entries: list[dict]) -> SeriesGlossary:
@@ -526,12 +556,12 @@ class TestInjectReaderNotes:
         )
         config = ReaderNotesConfig(enabled=True, types=["concept"], scope="first-in-chapter")
 
-        stats = inject_reader_notes([chapter], glossary, config)
+        stats = inject_reader_notes([chapter], glossary, config, epub_version="3.0")
         assert stats.notes_injected == 1
         assert stats.chapters_modified == 1
         assert "vestigium" in stats.entries_matched
 
-        # Check footnote aside was added to body
+        # An EPUB3 book gets the aside a reader can pop up
         root = chapter.tree.getroot()
         asides = root.findall(f".//{{{XHTML_NS}}}aside")
         assert len(asides) == 1
@@ -662,3 +692,291 @@ class TestInjectReaderNotes:
 
         stats = inject_reader_notes([chapter], glossary, config)
         assert stats.notes_injected == 0
+
+
+# ---------------------------------------------------------------------------
+# Markup chosen by the source book's package version
+# ---------------------------------------------------------------------------
+
+_VESTIGIUM = {
+    "original": "vestigium",
+    "translation": "вестигиум",
+    "type": "concept",
+    "notes": "Magical trace left by spells.",
+}
+_FORMA = {
+    "original": "forma",
+    "translation": "форма",
+    "type": "concept",
+    "notes": "Basic unit of magic.",
+}
+
+
+def _config(scope: str = "first-in-chapter") -> ReaderNotesConfig:
+    return ReaderNotesConfig(enabled=True, types=["concept"], scope=scope)
+
+
+class TestIsEpub3:
+    def test_reads_the_version(self):
+        assert is_epub3("3.0") is True
+        assert is_epub3("3.2") is True
+        assert is_epub3("2.0") is False
+        assert is_epub3("") is False
+        assert is_epub3(None) is False
+
+
+class TestEpubPrefix:
+    """epub:type, never a prefix lxml invented for itself."""
+
+    def test_marker_uses_the_epub_prefix_when_the_book_declares_none(self):
+        chapter = _make_epub2_chapter(
+            f'<p xmlns="{XHTML_NS}">Он почувствовал вестигиум в комнате.</p>'
+        )
+        inject_reader_notes([chapter], _make_glossary([_VESTIGIUM]), _config(), "2.0")
+
+        out = _serialize(chapter)
+        assert 'epub:type="noteref"' in out
+        assert 'epub:type="footnote"' in out
+        assert "ns0:" not in out
+
+    def test_epub3_book_keeps_its_own_declaration(self):
+        chapter = _make_chapter(f'<p xmlns="{XHTML_NS}">Он почувствовал вестигиум.</p>')
+        inject_reader_notes([chapter], _make_glossary([_VESTIGIUM]), _config(), "3.0")
+
+        out = _serialize(chapter)
+        assert 'epub:type="noteref"' in out
+        assert "ns0:" not in out
+
+
+class TestEpub2Endnotes:
+    """EPUB2 has no footnote mechanism, and no <aside> either."""
+
+    def test_note_is_a_div_inside_a_notes_block(self):
+        chapter = _make_epub2_chapter(
+            f'<p xmlns="{XHTML_NS}">Он почувствовал вестигиум в комнате.</p>'
+        )
+        inject_reader_notes([chapter], _make_glossary([_VESTIGIUM]), _config(), "2.0")
+
+        root = chapter.tree.getroot()
+        assert root.findall(f".//{{{XHTML_NS}}}aside") == []
+
+        blocks = [el for el in root.iter(f"{{{XHTML_NS}}}div") if el.get("class") == "reader-notes"]
+        assert len(blocks) == 1
+        block = blocks[0]
+        assert block.get("role") == "doc-endnotes"
+        title = block[0]
+        assert title.get("class") == "reader-notes-title"
+        assert title.text == "Примечания"
+        notes = [el for el in block if el.get("class") == "reader-note-item"]
+        assert len(notes) == 1
+        assert notes[0].get("id") == "reader-note-1"
+        assert notes[0].get("role") == "doc-footnote"
+
+    def test_heading_comes_from_config(self):
+        chapter = _make_epub2_chapter(f'<p xmlns="{XHTML_NS}">Он почувствовал вестигиум.</p>')
+        config = ReaderNotesConfig(
+            enabled=True, types=["concept"], scope="first-in-chapter", heading="Notes"
+        )
+        inject_reader_notes([chapter], _make_glossary([_VESTIGIUM]), config, "2.0")
+
+        assert '<div class="reader-notes-title">Notes</div>' in _serialize(chapter)
+
+    def test_note_text_is_not_a_translatable_paragraph(self):
+        """A <p> here would be picked up as prose if the output is re-read."""
+        chapter = _make_epub2_chapter(f'<p xmlns="{XHTML_NS}">Он почувствовал вестигиум.</p>')
+        inject_reader_notes([chapter], _make_glossary([_VESTIGIUM]), _config(), "2.0")
+
+        root = chapter.tree.getroot()
+        paragraphs = root.findall(f".//{{{XHTML_NS}}}p")
+        assert len(paragraphs) == 1  # only the prose paragraph
+        assert "Magical trace" not in (paragraphs[0].text or "")
+
+
+class TestBacklink:
+    """A reader without popups follows the link and has to get back."""
+
+    def test_note_links_back_to_its_marker(self):
+        chapter = _make_epub2_chapter(f'<p xmlns="{XHTML_NS}">Он почувствовал вестигиум.</p>')
+        inject_reader_notes([chapter], _make_glossary([_VESTIGIUM]), _config(), "2.0")
+
+        root = chapter.tree.getroot()
+        marker = root.find(f".//{{{XHTML_NS}}}sup/{{{XHTML_NS}}}a")
+        assert marker.get("id") == "reader-note-1-ref"
+        assert marker.get("href") == "#reader-note-1"
+
+        back = root.find(f".//{{{XHTML_NS}}}a[@class='reader-note-back']")
+        assert back is not None
+        assert back.get("href") == "#reader-note-1-ref"
+        assert back.text == "↩"
+
+    def test_epub3_notes_get_a_backlink_too(self):
+        chapter = _make_chapter(f'<p xmlns="{XHTML_NS}">Он почувствовал вестигиум.</p>')
+        inject_reader_notes([chapter], _make_glossary([_VESTIGIUM]), _config(), "3.0")
+
+        root = chapter.tree.getroot()
+        back = root.find(f".//{{{XHTML_NS}}}a[@class='reader-note-back']")
+        assert back is not None
+        assert back.get("href") == "#reader-note-1-ref"
+
+
+class TestNoteOrder:
+    """Numbers follow the text, not the order the glossary was walked in."""
+
+    def test_two_notes_in_one_paragraph_are_numbered_in_reading_order(self):
+        # "форма" comes first in the text, "вестигиум" second; the glossary
+        # is walked in the other order.
+        chapter = _make_epub2_chapter(
+            f'<p xmlns="{XHTML_NS}">Сначала форма, потом вестигиум в комнате.</p>'
+        )
+        stats = inject_reader_notes(
+            [chapter], _make_glossary([_VESTIGIUM, _FORMA]), _config(), "2.0"
+        )
+        assert stats.notes_injected == 2
+
+        root = chapter.tree.getroot()
+        markers = [
+            sup.find(f"{{{XHTML_NS}}}a")
+            for sup in root.iter(f"{{{XHTML_NS}}}sup")
+            if sup.get("class") == "reader-note"
+        ]
+        assert [m.text for m in markers] == ["[1]", "[2]"]
+
+        # Every marker still points at a note that exists, and the notes
+        # are listed in the same order.
+        ids = [el.get("id") for el in root.iter() if el.get("class") == "reader-note-item"]
+        assert ids == ["reader-note-1", "reader-note-2"]
+        assert [m.get("href") for m in markers] == ["#reader-note-1", "#reader-note-2"]
+
+        # And each note still leads back to its own marker, not the other's.
+        marker_ids = [m.get("id") for m in markers]
+        assert marker_ids == ["reader-note-1-ref", "reader-note-2-ref"]
+        assert len(set(marker_ids)) == len(marker_ids)
+        backs = [
+            note.find(f".//{{{XHTML_NS}}}a[@class='reader-note-back']").get("href")
+            for note in _note_items(chapter)
+        ]
+        assert backs == [f"#{marker_id}" for marker_id in marker_ids]
+
+    def test_numbering_keeps_rising_across_chapters(self):
+        ch1 = _make_epub2_chapter(f'<p xmlns="{XHTML_NS}">Сначала форма, потом вестигиум.</p>')
+        ch2 = _make_epub2_chapter(f'<p xmlns="{XHTML_NS}">Снова форма здесь.</p>')
+        inject_reader_notes([ch1, ch2], _make_glossary([_VESTIGIUM, _FORMA]), _config(), "2.0")
+
+        def numbers(chapter):
+            root = chapter.tree.getroot()
+            return [
+                sup.find(f"{{{XHTML_NS}}}a").text
+                for sup in root.iter(f"{{{XHTML_NS}}}sup")
+                if sup.get("class") == "reader-note"
+            ]
+
+        assert numbers(ch1) == ["[1]", "[2]"]
+        assert numbers(ch2) == ["[3]"]
+
+
+class TestNoteStyles:
+    def test_styles_land_in_head_once(self):
+        chapter = _make_epub2_chapter(
+            f'<p xmlns="{XHTML_NS}">Он почувствовал вестигиум.</p>'
+            f'<p xmlns="{XHTML_NS}">И ещё форма рядом.</p>'
+        )
+        inject_reader_notes([chapter], _make_glossary([_VESTIGIUM, _FORMA]), _config(), "2.0")
+
+        root = chapter.tree.getroot()
+        styles = [el for el in root.iter(f"{{{XHTML_NS}}}style") if el.get("id") == NOTE_STYLE_ID]
+        assert len(styles) == 1
+        assert "reader-notes" in styles[0].text
+
+    def test_no_styles_when_nothing_was_injected(self):
+        chapter = _make_epub2_chapter(f'<p xmlns="{XHTML_NS}">Ничего подходящего здесь.</p>')
+        inject_reader_notes([chapter], _make_glossary([_VESTIGIUM]), _config(), "2.0")
+
+        root = chapter.tree.getroot()
+        assert root.findall(f".//{{{XHTML_NS}}}style") == []
+
+
+# The note text mentions the term it explains, so a pass that sees the note
+# in the tree must not mark the term inside it.
+_SELF_REFERRING = {
+    "original": "vestigium",
+    "translation": "вестигиум",
+    "type": "concept",
+    "notes": "Тот самый вестигиум, след магии.",
+}
+
+
+class TestSecondPassLeavesNotesAlone:
+    """The guard has to hold when the note is already in the document.
+
+    The first pass appends notes after matching, so the note body is not in
+    the tree while that pass runs — only a second pass can reach it. These
+    tests refresh the paragraph list in between, the way reading the output
+    back in would, and run the injection again.
+    """
+
+    def test_epub3_note_paragraph_is_not_marked(self):
+        chapter = _make_chapter(f'<p xmlns="{XHTML_NS}">Он почувствовал вестигиум в комнате.</p>')
+        glossary = _make_glossary([_SELF_REFERRING])
+        inject_reader_notes([chapter], glossary, _config("all"), "3.0")
+
+        # An EPUB3 note body is a <p>, so a re-read really would pick it up.
+        root = chapter.tree.getroot()
+        chapter.paragraphs = root.findall(f".//{{{XHTML_NS}}}p")
+        assert any(el.get("class") == "reader-note-text" for el in chapter.paragraphs)
+
+        inject_reader_notes([chapter], glossary, _config("all"), "3.0")
+
+        notes = _note_items(chapter)
+        for note in notes:
+            assert note.findall(f".//{{{XHTML_NS}}}sup") == []
+
+    def test_epub2_note_is_not_marked_and_the_block_is_not_duplicated(self):
+        chapter = _make_epub2_chapter(
+            f'<p xmlns="{XHTML_NS}">Он почувствовал вестигиум в комнате.</p>'
+        )
+        glossary = _make_glossary([_SELF_REFERRING])
+        inject_reader_notes([chapter], glossary, _config("all"), "2.0")
+
+        # An EPUB2 note body is a <div>, which a re-read would not treat as
+        # prose. Hand it in anyway: the guard must not depend on that.
+        root = chapter.tree.getroot()
+        chapter.paragraphs = root.findall(f".//{{{XHTML_NS}}}p") + [
+            el for el in root.iter(f"{{{XHTML_NS}}}div") if el.get("class") == "reader-note-text"
+        ]
+
+        inject_reader_notes([chapter], glossary, _config("all"), "2.0")
+
+        for note in _note_items(chapter):
+            assert note.findall(f".//{{{XHTML_NS}}}sup") == []
+
+        blocks = [el for el in root.iter(f"{{{XHTML_NS}}}div") if el.get("class") == "reader-notes"]
+        assert len(blocks) == 1
+        titles = [el for el in root.iter() if el.get("class") == "reader-notes-title"]
+        assert len(titles) == 1
+
+
+class TestRenumberFailsClosed:
+    """A chapter it cannot fully account for is left exactly as it was."""
+
+    def test_a_marker_without_a_note_stops_the_renumbering(self):
+        chapter = _make_epub2_chapter(
+            f'<p xmlns="{XHTML_NS}">Сначала форма, потом вестигиум в комнате.</p>'
+        )
+        inject_reader_notes([chapter], _make_glossary([_VESTIGIUM, _FORMA]), _config(), "2.0")
+
+        # Break one link the way a hand-edited book might: the marker now
+        # names a note that is not there.
+        root = chapter.tree.getroot()
+        markers = [
+            sup.find(f"{{{XHTML_NS}}}a")
+            for sup in root.iter(f"{{{XHTML_NS}}}sup")
+            if sup.get("class") == "reader-note"
+        ]
+        markers[0].set("href", "#reader-note-99")
+        before = etree.tostring(chapter.tree, encoding="unicode")
+
+        from booktranslator.reader_notes import _renumber_notes_in_reading_order
+
+        _renumber_notes_in_reading_order(root, XHTML_NS)
+
+        assert etree.tostring(chapter.tree, encoding="unicode") == before

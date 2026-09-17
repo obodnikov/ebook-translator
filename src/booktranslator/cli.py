@@ -1027,6 +1027,7 @@ def translate(
             work_dir=work_dir,
             book_title=book.meta.title,
             book_author=book.meta.author,
+            epub_version=book.meta.epub_version,
             preloaded_glossary=glossary,
             explicit=_notes_explicit,
         )
@@ -2977,6 +2978,7 @@ def assemble_cmd(
                 work_dir=work_dir,
                 book_title=book.meta.title,
                 book_author=book.meta.author,
+                epub_version=book.meta.epub_version,
                 preloaded_glossary=None,
                 explicit=_assemble_notes_explicit,
             )
@@ -3265,6 +3267,95 @@ def cover_translate_cmd(
     )
     if result.text:
         console.print(f"  [dim]Model note: {result.text[:200]}[/dim]")
+
+
+# ---------------------------------------------------------------------------
+# cover fix
+# ---------------------------------------------------------------------------
+
+
+@cover_app.command("fix")
+def cover_fix_cmd(
+    epub: Path = typer.Argument(..., exists=True, dir_okay=False, help="EPUB to repair."),
+    title: str | None = typer.Option(
+        None,
+        "--title",
+        "-t",
+        help="Write this into dc:title (default: leave it alone).",
+    ),
+    author: str | None = typer.Option(
+        None,
+        "--author",
+        "-a",
+        help="Write this into dc:creator (default: leave it alone).",
+    ),
+    out: Path | None = typer.Option(
+        None,
+        "--out",
+        "-o",
+        help="Output EPUB path (default: <source>-fixed.epub).",
+    ),
+) -> None:
+    """Repair the cover declaration of a finished book, image untouched.
+
+    Many source books never declare which image is the cover. A reader then
+    cannot find it and draws its own placeholder from the title and author
+    instead — which is why a translated book can show an English cover in a
+    library while carrying the translated one inside. This writes the
+    declaration the reader looks for, points it at the cover page, and brings
+    the size that page declares in line with the image actually in the book.
+
+    Nothing is generated and no model is called, so this costs nothing.
+
+    Examples:
+        btrans cover fix book-ru.epub
+        btrans cover fix book-ru.epub --title "Лето наперстянки" --author "Бен Ааронович"
+    """
+    from .cover import repair_cover
+
+    dest = out or epub.with_stem(f"{epub.stem}-fixed")
+
+    try:
+        cover, fixes = repair_cover(epub, dest, title=title, author=author)
+    except Exception as e:
+        console.print(f"[red]Cover repair failed:[/red] {e}")
+        raise typer.Exit(code=1) from e
+
+    console.print(
+        f"[bold]Cover:[/bold] {cover.archive_path} "
+        f"({cover.media_type}, {len(cover.raw_bytes):,} bytes)"
+    )
+
+    if not fixes.any_change():
+        console.print(
+            f"[green]Nothing to repair.[/green] This book already declares its cover.\n"
+            f"  Output: {dest} (a copy of the source)"
+        )
+        return
+
+    lines: list[str] = []
+    if fixes.cover_meta:
+        lines.append(f'  Declared the cover: <meta name="cover" content="{fixes.cover_meta}"/>')
+    if fixes.cover_property:
+        lines.append(f'  Declared the cover: properties="cover-image" on "{fixes.cover_property}"')
+    if fixes.guide_href:
+        lines.append(f"  Added the guide reference to the cover page: {fixes.guide_href}")
+    if fixes.page_size:
+        width, height = fixes.page_size
+        lines.append(f"  Cover page {fixes.page_path} now declares {width}x{height}")
+    if fixes.media_type:
+        lines.append(f"  Manifest media type: {fixes.media_type}")
+    if fixes.title:
+        lines.append(f"  dc:title: {fixes.title}")
+    if fixes.author:
+        lines.append(f"  dc:creator: {fixes.author}")
+
+    console.print("[green]Cover repaired.[/green]\n" + "\n".join(lines))
+    console.print(f"  Output: {dest}")
+    console.print(
+        "[dim]A reader that has already shown this book caches its cover: "
+        "remove the book from the library and add it again.[/dim]"
+    )
 
 
 # ---------------------------------------------------------------------------

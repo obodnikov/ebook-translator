@@ -2,7 +2,16 @@
 
 Uses the series glossary `notes` field as footnote content.
 Matches `translation` strings in the translated XHTML text and wraps
-the first occurrence (per scope) in an EPUB footnote-ref / aside pair.
+the first occurrence (per scope) in a footnote reference.
+
+The markup follows the package version of the source book. EPUB3 has a
+footnote mechanism — a reader turns `<aside epub:type="footnote">` into a
+popup — and there the note goes in an aside. EPUB2 has no such mechanism
+and does not even allow `<aside>`: a strict reader may drop the element and
+the note with it, and the reference then leads nowhere. So an EPUB2 book
+gets ordinary endnotes instead: a "Примечания" block at the end of the
+chapter, built from elements every reader keeps, with a link back to the
+place in the text.
 
 No LLM calls — purely deterministic string matching at assembly time.
 """
@@ -23,6 +32,191 @@ EPUB_NS = "http://www.idpf.org/2007/ops"
 XHTML_NS = "http://www.w3.org/1999/xhtml"
 
 NSMAP = {"epub": EPUB_NS, "xhtml": XHTML_NS}
+
+# Styles for the injected markup, added to the chapters that get notes.
+# They go into the chapter's own <head> rather than the book's stylesheet:
+# the stylesheet is the book's own asset and stays untouched.
+NOTE_STYLE_ID = "reader-notes-style"
+
+NOTE_STYLES = """
+sup.reader-note { font-size: 0.7em; vertical-align: super; line-height: 0; }
+.reader-notes {
+    margin-top: 2em;
+    padding-top: 0.6em;
+    border-top: 1px solid currentColor;
+    font-size: 0.85em;
+}
+.reader-notes-title { font-weight: bold; margin-bottom: 0.5em; }
+.reader-note-item { margin: 0 0 0.5em 0; }
+.reader-note-back { text-decoration: none; margin-left: 0.3em; }
+"""
+
+
+def is_epub3(package_version: str | None) -> bool:
+    """True when the book declares EPUB3, whose footnote markup differs."""
+    return (package_version or "").strip().startswith("3")
+
+
+# Classes on everything this module injects. Used to keep a second pass from
+# putting a marker inside a note it wrote earlier.
+_INJECTED_CLASSES = frozenset(
+    {"reader-note", "reader-notes", "reader-notes-title", "reader-note-item", "reader-note-text"}
+)
+
+
+def _build_note(
+    xhtml_ns: str,
+    note_id: str,
+    note_text: str,
+    *,
+    epub3: bool,
+) -> etree._Element:
+    """Build the element holding one note's text.
+
+    In EPUB3 that is `<aside epub:type="footnote">`, which is what a reader
+    turns into a popup. In EPUB2 `<aside>` is not a valid element and a
+    strict reader may drop it, so the note is an ordinary `<div>` — kept by
+    every reader — and the epub:type rides along for the readers that look.
+
+    Either way the note ends with a link back to its marker: a reader
+    without popups follows the reference, and without a way back the reader
+    is left at the end of the chapter.
+    """
+    tag = "aside" if epub3 else "div"
+    note = etree.Element(f"{{{xhtml_ns}}}{tag}", nsmap={"epub": EPUB_NS})
+    note.set(f"{{{EPUB_NS}}}type", "footnote")
+    note.set("role", "doc-footnote")
+    note.set("id", note_id)
+    note.set("class", "reader-note-item")
+
+    # EPUB3 keeps the <p> it always used; EPUB2 uses a <div> so the note
+    # text is not mistaken for a translatable paragraph on a later read.
+    body = etree.SubElement(note, f"{{{xhtml_ns}}}{'p' if epub3 else 'div'}")
+    body.set("class", "reader-note-text")
+    body.text = f"{note_text} "
+
+    back = etree.SubElement(body, f"{{{xhtml_ns}}}a")
+    back.set("class", "reader-note-back")
+    back.set("role", "doc-backlink")
+    back.set("href", f"#{note_id}-ref")
+    back.text = "\u21a9"
+    return note
+
+
+def _append_notes(
+    body: etree._Element,
+    notes: list[etree._Element],
+    xhtml_ns: str,
+    *,
+    epub3: bool,
+    heading: str,
+) -> None:
+    """Put a chapter's notes at the end of its body.
+
+    EPUB3 asides are appended bare — the reader pops them up and decides
+    whether to show them in the flow. EPUB2 notes are visible endnotes, so
+    they get a block of their own under a heading; hiding them there would
+    make the reference lead to nothing at all.
+
+    A chapter that already carries a block gets its notes added to it, so
+    running over the same document twice leaves one block rather than two.
+    """
+    if epub3:
+        for note in notes:
+            body.append(note)
+        return
+
+    section = _find_notes_block(body, xhtml_ns)
+    if section is None:
+        section = etree.SubElement(body, f"{{{xhtml_ns}}}div")
+        section.set("class", "reader-notes")
+        section.set("role", "doc-endnotes")
+        title = etree.SubElement(section, f"{{{xhtml_ns}}}div")
+        title.set("class", "reader-notes-title")
+        title.text = heading
+    for note in notes:
+        section.append(note)
+
+
+def _find_notes_block(body: etree._Element, xhtml_ns: str) -> etree._Element | None:
+    """The endnotes block already in this body, if there is one."""
+    for el in body.iter(f"{{{xhtml_ns}}}div"):
+        if el.get("class") == "reader-notes":
+            return el
+    return None
+
+
+def _ensure_note_styles(root: etree._Element, xhtml_ns: str) -> None:
+    """Add the note styles to the chapter's <head>, once."""
+    head = root.find(f"{{{xhtml_ns}}}head")
+    if head is None:
+        return
+    for style in head.findall(f"{{{xhtml_ns}}}style"):
+        if style.get("id") == NOTE_STYLE_ID:
+            return
+    style = etree.SubElement(head, f"{{{xhtml_ns}}}style")
+    style.set("type", "text/css")
+    style.set("id", NOTE_STYLE_ID)
+    style.text = NOTE_STYLES
+
+
+def _renumber_notes_in_reading_order(root: etree._Element, xhtml_ns: str) -> None:
+    """Make a chapter's note numbers follow the text.
+
+    Matching walks the glossary once per paragraph, so two notes in the same
+    paragraph are numbered in glossary order rather than reading order — a
+    chapter could read [23], [25], [24]. The chapter keeps the same set of
+    numbers, only which marker wears which changes, so the numbering still
+    rises through the book.
+    """
+    markers = [sup for sup in root.iter(f"{{{xhtml_ns}}}sup") if sup.get("class") == "reader-note"]
+    if len(markers) < 2:
+        return
+
+    notes_by_id = {
+        el.get("id"): el
+        for el in root.iter()
+        if isinstance(el.tag, str) and el.get("class") == "reader-note-item"
+    }
+
+    # Plan the whole chapter before touching anything. A marker we cannot
+    # account for means we stop: renumbering the rest would leave that one
+    # pointing at an id that no longer exists.
+    links: list[tuple[etree._Element, etree._Element]] = []
+    numbers: list[int] = []
+    for sup in markers:
+        link = sup.find(f"{{{xhtml_ns}}}a")
+        if link is None:
+            return
+        target = (link.get("href") or "").lstrip("#")
+        note = notes_by_id.get(target)
+        if note is None:
+            return  # a marker with no note of ours — leave everything alone
+        try:
+            numbers.append(int(target.rsplit("-", 1)[-1]))
+        except ValueError:
+            return  # not our numbering — leave everything alone
+        links.append((link, note))
+
+    for (link, note), number in zip(links, sorted(numbers), strict=True):
+        note_id = f"reader-note-{number}"
+        link.set("href", f"#{note_id}")
+        link.set("id", f"{note_id}-ref")
+        link.text = f"[{number}]"
+        note.set("id", note_id)
+        back = note.find(f".//{{{xhtml_ns}}}a[@class='reader-note-back']")
+        if back is not None:
+            back.set("href", f"#{note_id}-ref")
+
+    # The notes themselves have to follow the markers, not the order they
+    # were matched in. Re-appending a child moves it, so this reorders them
+    # inside their block without disturbing anything else.
+    ordered = [note for _, note in links]
+    container = ordered[0].getparent()
+    if container is not None and all(note.getparent() is container for note in ordered):
+        for note in ordered:
+            container.append(note)
+
 
 # ---------------------------------------------------------------------------
 # Russian word forms
@@ -259,13 +453,12 @@ def _find_and_wrap_first_match(
         # Skip <a> elements (would create nested links)
         if local == "a":
             return True
-        # Skip <aside epub:type="footnote"> regions
-        if local == "aside":
-            epub_type = el.get(f"{{{EPUB_NS}}}type", "")
-            if "footnote" in epub_type:
-                return True
-        # Skip existing reader-note <sup> elements
-        return local == "sup" and el.get("class", "") == "reader-note"
+        # Skip any footnote region, whatever element carries it: EPUB3 uses
+        # <aside epub:type="footnote">, EPUB2 an ordinary <div>.
+        if "footnote" in el.get(f"{{{EPUB_NS}}}type", ""):
+            return True
+        # Skip everything we injected ourselves, markers and note text alike
+        return el.get("class", "") in _INJECTED_CLASSES
 
     def _collect_text_nodes(el: etree._Element, inside_forbidden: bool = False) -> None:
         forbidden = inside_forbidden or _is_forbidden_ancestor(el)
@@ -330,11 +523,18 @@ def _find_and_wrap_first_match(
             before = text_val[: local_pos + match_len]
             after = text_val[local_pos + match_len :]
 
-            # Create the superscript noteref element
+            # Create the superscript noteref element.
+            # The nsmap matters: without it lxml invents a prefix of its own
+            # (ns0:type) for books whose <html> does not declare xmlns:epub —
+            # namespace-correct, but invisible to a reader matching the
+            # literal epub:type. With it the attribute reads epub:type, and
+            # the declaration is omitted where the book already has one.
             sup = etree.Element(f"{{{xhtml_ns}}}sup")
             sup.set("class", "reader-note")
-            a = etree.SubElement(sup, f"{{{xhtml_ns}}}a")
+            a = etree.SubElement(sup, f"{{{xhtml_ns}}}a", nsmap={"epub": EPUB_NS})
             a.set(f"{{{EPUB_NS}}}type", "noteref")
+            a.set("role", "doc-noteref")
+            a.set("id", f"{note_id}-ref")
             a.set("href", f"#{note_id}")
             # Extract the note number from note_id (e.g. "reader-note-3" -> "3")
             note_num = note_id.rsplit("-", 1)[-1]
@@ -367,8 +567,9 @@ def inject_reader_notes(
     chapters: list,  # list of ChapterDoc
     glossary: SeriesGlossary,
     config: ReaderNotesConfig,
+    epub_version: str = "2.0",
 ) -> InjectionStats:
-    """Inject EPUB footnotes into chapter trees based on glossary.
+    """Inject footnotes into chapter trees based on glossary.
 
     Modifies the lxml trees in-place. Call this AFTER rehydration and
     BEFORE write_translated_epub.
@@ -381,12 +582,18 @@ def inject_reader_notes(
         The series glossary to source notes from.
     config : ReaderNotesConfig
         Controls which types to annotate and scope.
+    epub_version : str
+        Package version of the source book, as `BookMeta.epub_version`
+        reports it. It decides the markup: popup footnotes in EPUB3,
+        visible endnotes in EPUB2, which has no footnote mechanism.
+        Defaults to the conservative "2.0".
 
     Returns
     -------
     InjectionStats
         Summary of what was injected.
     """
+    epub3 = is_epub3(epub_version)
     candidates = _build_candidates(glossary, config)
     stats = InjectionStats(total_candidates=len(candidates))
 
@@ -447,13 +654,9 @@ def inject_reader_notes(
                 )
 
                 if success:
-                    # Create the footnote aside element
-                    aside = etree.Element(f"{{{xhtml_ns}}}aside")
-                    aside.set(f"{{{EPUB_NS}}}type", "footnote")
-                    aside.set("id", note_id)
-                    p = etree.SubElement(aside, f"{{{xhtml_ns}}}p")
-                    p.text = candidate.note_text
-                    footnotes_for_chapter.append(aside)
+                    footnotes_for_chapter.append(
+                        _build_note(xhtml_ns, note_id, candidate.note_text, epub3=epub3)
+                    )
 
                     noted_in_chapter.add(entry_key)
                     noted_in_book.add(entry_key)
@@ -471,8 +674,15 @@ def inject_reader_notes(
                 # Try without namespace
                 body = root.find(".//body")
             if body is not None:
-                for aside in footnotes_for_chapter:
-                    body.append(aside)
+                _append_notes(
+                    body,
+                    footnotes_for_chapter,
+                    xhtml_ns,
+                    epub3=epub3,
+                    heading=config.heading,
+                )
+                _renumber_notes_in_reading_order(root, xhtml_ns)
+                _ensure_note_styles(root, xhtml_ns)
 
         if chapter_modified:
             stats.chapters_modified += 1
@@ -562,6 +772,7 @@ def inject_notes_for_cli(
     work_dir: Path,
     book_title: str,
     book_author: str,
+    epub_version: str = "2.0",
     preloaded_glossary: SeriesGlossary | None = None,
     explicit: bool = False,
 ) -> InjectionStats | None:
@@ -574,6 +785,9 @@ def inject_notes_for_cli(
     ----------
     notes_flag:
         Explicit CLI override (True/False) or None to use cfg.reader_notes.enabled.
+    epub_version:
+        Package version of the source book (``BookMeta.epub_version``). It
+        decides the footnote markup — see ``inject_reader_notes``.
     preloaded_glossary:
         Pass the already-loaded SeriesGlossary from ``translate`` to avoid
         a redundant load. ``assemble`` passes None and loads via
@@ -632,14 +846,17 @@ def inject_notes_for_cli(
         chapters=chapters,
         glossary=glossary,
         config=notes_config,
+        epub_version=epub_version,
     )
 
     if note_stats.notes_injected > 0:
+        style = "popup footnotes" if is_epub3(epub_version) else "endnotes per chapter"
         console.print(
             f"[bold]Reader notes:[/bold] {note_stats.notes_injected} "
-            f"footnotes injected across "
+            f"notes injected across "
             f"{note_stats.chapters_modified} chapters "
-            f"(from {note_stats.total_candidates} candidates)"
+            f"(from {note_stats.total_candidates} candidates)\n"
+            f"[dim]Source book is EPUB {epub_version} — using {style}.[/dim]"
         )
     else:
         console.print(

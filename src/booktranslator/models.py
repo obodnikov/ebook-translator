@@ -102,6 +102,9 @@ class ReaderNotesConfig(BaseModel):
     enabled: bool = True
     types: list[str] = Field(default_factory=lambda: ["concept", "term"])
     scope: Literal["first-in-chapter", "first-in-book", "all"] = "first-in-book"
+    # Heading over the endnotes block in EPUB2 books, which have no popup
+    # footnotes and show the notes at the end of the chapter instead.
+    heading: str = "Примечания"
 
 
 class CostConfig(BaseModel):
@@ -278,3 +281,7 @@ class BookMeta(BaseModel):
     language: str
     word_count: int
     chapters: int
+    # Package version as the source book declares it ("2.0", "3.0", ...).
+    # Reader notes need it: the footnote markup a reader understands differs
+    # between EPUB2 and EPUB3, and guessing wrong makes notes unreachable.
+    epub_version: str = "2.0"

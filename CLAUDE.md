@@ -27,7 +27,7 @@ waterfall, and supports pause/resume so a mid-run failure never restarts from sc
 
 | File | Scope |
 | --- | --- |
-| [AI_EPUB.md](AI_EPUB.md) | EPUB I/O, chunking, cover, assembly (`epub_io.py`, `chunker.py`, `cover.py`, assemble path): structure preservation, round-trip identity, xpath/inline-tag contracts. |
+| [AI_EPUB.md](AI_EPUB.md) | EPUB I/O, chunking, cover, reader notes, assembly (`epub_io.py`, `chunker.py`, `cover.py`, `reader_notes.py`, assemble path): structure preservation, round-trip identity, xpath/inline-tag contracts, markup that follows the source book's EPUB version. |
 | [AI_PIPELINE.md](AI_PIPELINE.md) | Pipeline state machine and stages (`pipeline_helpers.py`, `state.py`, `cache.py`, `translator.py`, `judge.py`, `reflect.py`, `postprocess.py`): pause/resume, the paragraph-count contract, cache keys, prompt versioning, the stage waterfall. |
 | [AI_PROVIDER.md](AI_PROVIDER.md) | Providers, prompts, config (`provider.py`, `prompts.py`, `config.py`, `models.py`): the split text/image routing, retries, Jinja2 + frontmatter prompts, secrets, cost logging. |
 
