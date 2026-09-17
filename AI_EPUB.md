@@ -19,7 +19,9 @@ source EPUB as immutable reference data:
 
 - **Round-trip identity.** Reading an EPUB and writing it back with no translations applied must
   reproduce assets, CSS, images, fonts, cover, nav/TOC, and spine order unchanged. Only text
-  nodes and a small set of metadata fields (`dc:language`, optionally `dc:title`) may ever change.
+  nodes, a small set of metadata fields (`dc:language`, optionally `dc:title` and `dc:creator`),
+  and the cover declaration may ever change — see "Cover" below for what the cover write repairs
+  and why.
 - **Edit text nodes in place, by xpath.** Locate each paragraph by its xpath in the original
   `lxml` tree and replace only its text content. **Preserve inline tags** (`<em>`, `<i>`, `<a>`,
   `<strong>`, …) and their order — never flatten them into plain text and never re-serialize a
@@ -48,15 +50,34 @@ source EPUB as immutable reference data:
 
 ## Cover (`cover.py`)
 
-- Three independent operations, all non-destructive (always produce a new EPUB, never edit the
+- Four independent operations, all non-destructive (always produce a new EPUB, never edit the
   source): **extract** (cover bytes → file), **replace** (user file → cover), **translate** (AI
-  image model re-renders the cover text in the target language).
+  image model re-renders the cover text in the target language), **fix** (repair the declaration
+  of a book already built, image untouched, no model call).
 - Cover detection follows the documented priority: EPUB2 `<meta name="cover">` → EPUB3
   `properties="cover-image"` → heuristic (first `image/*` with "cover" in id/href). Keep these
   strategies in order; don't silently pick the first image.
+- **Every cover write leaves the cover findable.** Writing the image is not enough: a reader that
+  cannot tell which image is the cover draws its own placeholder from the title and author, so
+  every write goes through `_write_cover_epub`, which also declares the cover when the source
+  never did — `<meta name="cover">` plus a `<guide>` reference for EPUB2, `properties="cover-image"`
+  for EPUB3 — and never both. Don't add a cover write path that skips it.
+- **The declared page size follows the image.** The cover page's `viewBox` and `<image>` size
+  describe the file that was there before; left alone, a new cover with different proportions gets
+  letterboxed. Read the size from the image header (`_image_dimensions`) and rewrite it. When the
+  size cannot be read, leave the markup alone — a stale size beats a wrong one. Touch only
+  attributes that are already a bare pixel count; a percentage or a unit is the book's own layout.
+- **New package elements must serialize without a namespace prefix.** These books declare
+  `<opf:metadata>`, and lxml reuses that prefix for a new child — readers that match a literal
+  `<meta name="cover">` would then miss it. Create elements through `_append_child`, which binds
+  the package namespace as the default.
+- Metadata this layer may write, beyond `dc:language`: `dc:title` and `dc:creator`, and only when
+  the caller passes a translation for them. Everything else in the package is reference data.
 - Cover translation is a *best-effort adaptation*, not pixel-perfect — set expectations in
   user-facing text, not by trying to match fonts exactly. The image model call goes through the
   **image** provider (see [AI_PROVIDER.md](AI_PROVIDER.md)), never the text provider.
+- No image library. Sizes come from the file header, for the formats
+  `_detect_image_mime_from_bytes` already recognizes; don't add Pillow for this.
 
 ## What stays out of this layer
 

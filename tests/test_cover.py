@@ -10,9 +10,13 @@ import pytest
 from lxml import etree
 
 from booktranslator.cover import (
+    CoverFixes,
+    CoverInfo,
+    _apply_opf_fixes,
     _build_default_prompt,
     _normalize_image_mime,
     find_cover_in_epub,
+    repair_cover,
     replace_cover,
     replace_cover_from_file,
 )
@@ -162,6 +166,33 @@ def _make_epub_relative_path_cover(tmp_path: Path) -> Path:
         zf.writestr("OEBPS/images/cover.jpg", cover_bytes)
 
     return epub_path
+
+
+def _rewrite_opf(
+    opf_bytes: bytes,
+    cover_href: str,
+    *,
+    new_media_type: str | None = None,
+    cover_page_href: str | None = None,
+    title: str | None = None,
+    author: str | None = None,
+) -> bytes | None:
+    """Run the package rewrite over raw OPF bytes, as _write_cover_epub does."""
+    cover = CoverInfo(
+        archive_path="ignored",
+        media_type="image/jpeg",
+        raw_bytes=b"",
+        manifest_href=cover_href,
+    )
+    return _apply_opf_fixes(
+        opf_bytes,
+        cover,
+        new_media_type=new_media_type,
+        cover_page_href=cover_page_href,
+        title=title,
+        author=author,
+        fixes=CoverFixes(),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -808,8 +839,6 @@ class TestManifestUpdate:
 
     def test_manifest_update_fails_on_missing_href(self, tmp_path: Path):
         """If manifest href doesn't match, should raise RuntimeError."""
-        from booktranslator.cover import _update_opf_cover_media_type
-
         opf_xml = b"""<?xml version="1.0"?>
 <package xmlns="http://www.idpf.org/2007/opf" version="2.0">
   <manifest>
@@ -818,16 +847,14 @@ class TestManifestUpdate:
 </package>"""
 
         with pytest.raises(RuntimeError, match="Failed to update OPF manifest"):
-            _update_opf_cover_media_type(
+            _rewrite_opf(
                 opf_xml,
                 "nonexistent/path.jpg",  # wrong href
-                "image/png",
+                new_media_type="image/png",
             )
 
     def test_manifest_update_exact_href_match(self, tmp_path: Path):
         """Should match by exact href, not suffix."""
-        from booktranslator.cover import _update_opf_cover_media_type
-
         # Two items with same filename suffix but different paths
         opf_xml = b"""<?xml version="1.0"?>
 <package xmlns="http://www.idpf.org/2007/opf" version="2.0">
@@ -837,11 +864,12 @@ class TestManifestUpdate:
   </manifest>
 </package>"""
 
-        result = _update_opf_cover_media_type(
+        result = _rewrite_opf(
             opf_xml,
             "../images/cover.jpg",  # exact href
-            "image/png",
+            new_media_type="image/png",
         )
+        assert result is not None
 
         result_str = result.decode("utf-8")
         # The "real" item should be updated
@@ -1006,3 +1034,463 @@ class TestCoverExtractCLI:
 
         assert result.exit_code == 0
         assert out_file.read_bytes() == cover_data
+
+
+# ---------------------------------------------------------------------------
+# Fixtures and tests: cover declaration, page size, metadata repair
+# ---------------------------------------------------------------------------
+
+
+def _fake_jpeg(width: int, height: int) -> bytes:
+    """A JPEG header just complete enough for the size reader."""
+    payload = b"\x08" + height.to_bytes(2, "big") + width.to_bytes(2, "big") + b"\x03" + b"\x00" * 9
+    return b"\xff\xd8\xff\xc0" + (len(payload) + 2).to_bytes(2, "big") + payload + b"\xff\xd9"
+
+
+def _fake_png(width: int, height: int) -> bytes:
+    """A PNG signature plus an IHDR chunk carrying the given size."""
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + (13).to_bytes(4, "big")
+        + b"IHDR"
+        + width.to_bytes(4, "big")
+        + height.to_bytes(4, "big")
+        + b"\x08\x02\x00\x00\x00"
+    )
+
+
+def _make_calibre_epub(
+    tmp_path: Path,
+    cover_bytes: bytes,
+    *,
+    cover_width: int = 964,
+    cover_height: int = 1537,
+    name: str = "calibre.epub",
+) -> Path:
+    """Create an EPUB shaped like the calibre/OceanofPDF books we translate.
+
+    Two traits matter here and both come from real files: the cover is never
+    declared (no <meta name="cover">, no <guide>), and the metadata element
+    itself carries a namespace prefix.
+    """
+    epub_path = tmp_path / name
+
+    container_xml = b"""<?xml version="1.0"?>
+<container xmlns="urn:oasis:names:tc:opendocument:xmlns:container" version="1.0">
+  <rootfiles>
+    <rootfile full-path="content.opf" media-type="application/oebps-package+xml"/>
+  </rootfiles>
+</container>"""
+
+    opf_xml = b"""<?xml version='1.0' encoding='utf-8'?>
+<package xmlns="http://www.idpf.org/2007/opf" version="2.0" unique-identifier="bookid">
+  <opf:metadata xmlns:dc="http://purl.org/dc/elements/1.1/" \
+xmlns:opf="http://www.idpf.org/2007/opf">
+    <dc:identifier id="bookid" opf:scheme="UUID">urn:uuid:abc</dc:identifier>
+    <dc:title>Foxglove Summer</dc:title>
+    <dc:creator opf:role="aut">Ben Aaronovitch</dc:creator>
+    <dc:language>ru</dc:language>
+  </opf:metadata>
+  <manifest>
+    <item id="titlepage" href="titlepage.xhtml" media-type="application/xhtml+xml"/>
+    <item id="ch1" href="index_split_003.html" media-type="application/xhtml+xml"/>
+    <item id="a2a1cover" href="cover.jpeg" media-type="image/jpeg"/>
+  </manifest>
+  <spine toc="ncx">
+    <itemref idref="titlepage" linear="yes"/>
+    <itemref idref="ch1" linear="yes"/>
+  </spine>
+</package>"""
+
+    titlepage = f"""<?xml version='1.0' encoding='utf-8'?>
+<html xmlns="http://www.w3.org/1999/xhtml">
+    <head><title>Cover</title></head>
+    <body>
+        <div>
+            <svg xmlns="http://www.w3.org/2000/svg"
+                 xmlns:xlink="http://www.w3.org/1999/xlink" version="1.1"
+                 width="100%" height="100%"
+                 viewBox="0 0 {cover_width} {cover_height}"
+                 preserveAspectRatio="xMidYMid meet">
+                <image width="{cover_width}" height="{cover_height}" xlink:href="cover.jpeg"/>
+            </svg>
+        </div>
+    </body>
+</html>""".encode()
+
+    with zipfile.ZipFile(epub_path, "w") as zf:
+        zf.writestr("mimetype", "application/epub+zip", compress_type=zipfile.ZIP_STORED)
+        zf.writestr("META-INF/container.xml", container_xml)
+        zf.writestr("content.opf", opf_xml)
+        zf.writestr("titlepage.xhtml", titlepage)
+        zf.writestr("index_split_003.html", b"<html><body><p>hi</p></body></html>")
+        zf.writestr("cover.jpeg", cover_bytes)
+
+    return epub_path
+
+
+class TestImageDimensions:
+    """The size reader, which decides what the cover page should declare."""
+
+    def test_jpeg(self):
+        from booktranslator.cover import _image_dimensions
+
+        assert _image_dimensions(_fake_jpeg(848, 1264)) == (848, 1264)
+
+    def test_jpeg_skips_leading_segments(self):
+        from booktranslator.cover import _image_dimensions
+
+        # A real file puts JFIF and EXIF segments before the frame header.
+        jfif = b"\xff\xe0" + (16).to_bytes(2, "big") + b"JFIF\x00" + b"\x00" * 9
+        data = _fake_jpeg(300, 400)
+        assert _image_dimensions(data[:2] + jfif + data[2:]) == (300, 400)
+
+    def test_png(self):
+        from booktranslator.cover import _image_dimensions
+
+        assert _image_dimensions(_fake_png(600, 900)) == (600, 900)
+
+    def test_gif(self):
+        from booktranslator.cover import _image_dimensions
+
+        data = b"GIF89a" + (64).to_bytes(2, "little") + (48).to_bytes(2, "little") + b"\x00" * 10
+        assert _image_dimensions(data) == (64, 48)
+
+    def test_bmp_negative_height_is_still_a_size(self):
+        from booktranslator.cover import _image_dimensions
+
+        data = (
+            b"BM"
+            + b"\x00" * 16
+            + (20).to_bytes(4, "little", signed=True)
+            + (-30).to_bytes(4, "little", signed=True)
+            + b"\x00" * 10
+        )
+        assert _image_dimensions(data) == (20, 30)
+
+    def test_webp_lossy(self):
+        from booktranslator.cover import _image_dimensions
+
+        data = (
+            b"RIFF"
+            + b"\x00" * 4
+            + b"WEBP"
+            + b"VP8 "
+            + b"\x00" * 4
+            + b"\x00" * 3
+            + b"\x9d\x01\x2a"
+            + (100).to_bytes(2, "little")
+            + (200).to_bytes(2, "little")
+        )
+        assert _image_dimensions(data) == (100, 200)
+
+    def test_unreadable_returns_none(self):
+        from booktranslator.cover import _image_dimensions
+
+        assert _image_dimensions(b"NOT_AN_IMAGE") is None
+        # TIFF is recognized as an image but its size is not read.
+        assert _image_dimensions(b"II\x2a\x00" + b"\x00" * 40) is None
+        # A truncated PNG header carries no size yet.
+        assert _image_dimensions(b"\x89PNG\r\n\x1a\n") is None
+
+
+class TestCoverDeclaration:
+    """A cover a reader can find, in books whose source never declared one."""
+
+    def test_epub2_declaration_and_guide_are_added(self, tmp_path: Path):
+        epub = _make_calibre_epub(tmp_path, _fake_jpeg(964, 1537))
+        dest = tmp_path / "out.epub"
+
+        _cover, fixes = repair_cover(epub, dest)
+
+        assert fixes.cover_meta == "a2a1cover"
+        assert fixes.guide_href == "titlepage.xhtml"
+        with zipfile.ZipFile(dest) as zf:
+            opf = zf.read("content.opf").decode("utf-8")
+        tree = etree.fromstring(opf.encode())
+        ns = {"opf": "http://www.idpf.org/2007/opf"}
+        meta = tree.find(".//opf:metadata/opf:meta[@name='cover']", ns)
+        assert meta is not None
+        assert meta.get("content") == "a2a1cover"
+        reference = tree.find("opf:guide/opf:reference[@type='cover']", ns)
+        assert reference is not None
+        assert reference.get("href") == "titlepage.xhtml"
+
+    def test_meta_cover_is_written_without_a_namespace_prefix(self, tmp_path: Path):
+        """Readers that match the literal <meta name="cover"> must find it.
+
+        The books we translate declare their metadata element as
+        <opf:metadata>, and lxml would reuse that prefix for a new child.
+        """
+        epub = _make_calibre_epub(tmp_path, _fake_jpeg(964, 1537))
+        dest = tmp_path / "out.epub"
+
+        repair_cover(epub, dest)
+
+        with zipfile.ZipFile(dest) as zf:
+            opf = zf.read("content.opf").decode("utf-8")
+        assert '<meta name="cover" content="a2a1cover"/>' in opf
+        assert "opf:meta " not in opf
+
+    def test_existing_declaration_is_left_alone(self, tmp_path: Path):
+        """A book that already declares its cover is not rewritten."""
+        epub = _make_epub2_with_cover(tmp_path, _fake_jpeg(100, 150))
+        dest = tmp_path / "out.epub"
+
+        _cover, fixes = repair_cover(epub, dest)
+
+        assert fixes.cover_meta is None
+        assert not fixes.any_change()
+        with zipfile.ZipFile(epub) as src, zipfile.ZipFile(dest) as out:
+            assert src.read("OEBPS/content.opf") == out.read("OEBPS/content.opf")
+
+    def test_epub3_gets_the_manifest_property_not_a_guide(self, tmp_path: Path):
+        """EPUB3 declares the cover on the manifest item, not in metadata."""
+        epub = _make_epub3_with_cover(tmp_path, _fake_png(500, 750))
+        dest = tmp_path / "out.epub"
+
+        _cover, fixes = repair_cover(epub, dest)
+
+        # The fixture already carries properties="cover-image", so nothing
+        # about the declaration should change, and no guide should appear.
+        assert fixes.cover_property is None
+        assert fixes.guide_href is None
+        with zipfile.ZipFile(dest) as zf:
+            opf = zf.read("content.opf").decode("utf-8")
+        assert "<guide" not in opf
+
+    def test_epub3_missing_property_is_added(self, tmp_path: Path):
+        epub_bytes = _fake_png(500, 750)
+        epub = _make_epub3_with_cover(tmp_path, epub_bytes)
+        # Drop the declaration to model a book that lost it.
+        stripped = tmp_path / "stripped.epub"
+        with zipfile.ZipFile(epub) as src, zipfile.ZipFile(stripped, "w") as dst:
+            for info in src.infolist():
+                data = src.read(info.filename)
+                if info.filename == "content.opf":
+                    data = data.replace(b' properties="cover-image"', b"")
+                dst.writestr(info.filename, data)
+
+        dest = tmp_path / "out.epub"
+        _cover, fixes = repair_cover(stripped, dest)
+
+        assert fixes.cover_property == "cover"
+        with zipfile.ZipFile(dest) as zf:
+            opf = zf.read("content.opf").decode("utf-8")
+        assert 'properties="cover-image"' in opf
+        assert "<guide" not in opf
+
+
+class TestCoverPageSize:
+    """The size the cover page declares has to follow the image it shows."""
+
+    def test_page_is_resized_to_the_new_image(self, tmp_path: Path):
+        epub = _make_calibre_epub(tmp_path, _fake_jpeg(964, 1537))
+        dest = tmp_path / "out.epub"
+
+        replace_cover(epub, dest, _fake_jpeg(848, 1264), "image/jpeg")
+
+        with zipfile.ZipFile(dest) as zf:
+            page = zf.read("titlepage.xhtml").decode("utf-8")
+        tree = etree.fromstring(page.encode())
+        svg = tree.find(".//{http://www.w3.org/2000/svg}svg")
+        assert svg is not None
+        assert svg.get("viewBox") == "0 0 848 1264"
+        # A percentage is the book's layout choice and must survive.
+        assert svg.get("width") == "100%"
+        image = svg.find("{http://www.w3.org/2000/svg}image")
+        assert image.get("width") == "848"
+        assert image.get("height") == "1264"
+
+    def test_repair_resizes_against_the_cover_already_in_the_book(self, tmp_path: Path):
+        """Our own earlier output: new cover written, old size left behind."""
+        epub = _make_calibre_epub(
+            tmp_path, _fake_jpeg(848, 1264), cover_width=964, cover_height=1537
+        )
+        dest = tmp_path / "out.epub"
+
+        _cover, fixes = repair_cover(epub, dest)
+
+        assert fixes.page_size == (848, 1264)
+        assert fixes.page_path == "titlepage.xhtml"
+        with zipfile.ZipFile(dest) as zf:
+            page = zf.read("titlepage.xhtml").decode("utf-8")
+        assert 'viewBox="0 0 848 1264"' in page
+
+    def test_matching_size_is_left_alone(self, tmp_path: Path):
+        epub = _make_calibre_epub(tmp_path, _fake_jpeg(964, 1537))
+        dest = tmp_path / "out.epub"
+
+        _cover, fixes = repair_cover(epub, dest)
+
+        assert fixes.page_size is None
+        with zipfile.ZipFile(epub) as src, zipfile.ZipFile(dest) as out:
+            assert src.read("titlepage.xhtml") == out.read("titlepage.xhtml")
+
+    def test_unreadable_image_leaves_the_page_untouched(self, tmp_path: Path):
+        """Better a stale size than a wrong one."""
+        epub = _make_calibre_epub(tmp_path, b"\xff\xd8\xff")
+        dest = tmp_path / "out.epub"
+
+        _cover, fixes = repair_cover(epub, dest)
+
+        assert fixes.page_size is None
+        with zipfile.ZipFile(epub) as src, zipfile.ZipFile(dest) as out:
+            assert src.read("titlepage.xhtml") == out.read("titlepage.xhtml")
+
+
+class TestCoverMetadata:
+    """Title and author, so a reader's own placeholder is not in English."""
+
+    def test_repair_sets_title_and_author(self, tmp_path: Path):
+        epub = _make_calibre_epub(tmp_path, _fake_jpeg(964, 1537))
+        dest = tmp_path / "out.epub"
+
+        _cover, fixes = repair_cover(epub, dest, title="Лето наперстянки", author="Бен Ааронович")
+
+        assert fixes.title == "Лето наперстянки"
+        assert fixes.author == "Бен Ааронович"
+        with zipfile.ZipFile(dest) as zf:
+            tree = etree.fromstring(zf.read("content.opf"))
+        ns = {"dc": "http://purl.org/dc/elements/1.1/"}
+        assert tree.find(".//dc:title", ns).text == "Лето наперстянки"
+        assert tree.find(".//dc:creator", ns).text == "Бен Ааронович"
+
+    def test_translate_cover_writes_title_and_author(self, tmp_path: Path):
+        from booktranslator.cover import translate_cover
+        from booktranslator.provider import ImageGenerationResult
+
+        epub = _make_calibre_epub(tmp_path, _fake_jpeg(964, 1537))
+        dest = tmp_path / "out.epub"
+
+        mock_provider = MagicMock()
+        mock_provider.generate_image.return_value = ImageGenerationResult(
+            image_bytes=_fake_jpeg(848, 1264),
+            mime_type="image/jpeg",
+            text="",
+            model="test/model",
+        )
+
+        translate_cover(
+            source_epub=epub,
+            dest_epub=dest,
+            provider=mock_provider,
+            model="test/model",
+            title_translation="Лето наперстянки",
+            author_name="Бен Ааронович",
+            target_lang="Russian",
+        )
+
+        with zipfile.ZipFile(dest) as zf:
+            tree = etree.fromstring(zf.read("content.opf"))
+            page = zf.read("titlepage.xhtml").decode("utf-8")
+        ns = {"dc": "http://purl.org/dc/elements/1.1/"}
+        assert tree.find(".//dc:title", ns).text == "Лето наперстянки"
+        assert tree.find(".//dc:creator", ns).text == "Бен Ааронович"
+        assert 'viewBox="0 0 848 1264"' in page
+
+    def test_untranslated_title_is_left_alone(self, tmp_path: Path):
+        epub = _make_calibre_epub(tmp_path, _fake_jpeg(964, 1537))
+        dest = tmp_path / "out.epub"
+
+        _cover, fixes = repair_cover(epub, dest)
+
+        assert fixes.title is None
+        with zipfile.ZipFile(dest) as zf:
+            tree = etree.fromstring(zf.read("content.opf"))
+        ns = {"dc": "http://purl.org/dc/elements/1.1/"}
+        assert tree.find(".//dc:title", ns).text == "Foxglove Summer"
+
+
+class TestRepairKeepsTheBookIntact:
+    def test_image_and_every_other_file_survive(self, tmp_path: Path):
+        cover_bytes = _fake_jpeg(848, 1264)
+        epub = _make_calibre_epub(tmp_path, cover_bytes)
+        dest = tmp_path / "out.epub"
+
+        repair_cover(epub, dest, title="Лето наперстянки")
+
+        with zipfile.ZipFile(epub) as src, zipfile.ZipFile(dest) as out:
+            assert out.namelist() == src.namelist()
+            assert out.read("cover.jpeg") == cover_bytes
+            assert out.read("index_split_003.html") == src.read("index_split_003.html")
+            assert out.read("META-INF/container.xml") == src.read("META-INF/container.xml")
+        # mimetype stays the first entry and stays uncompressed
+        with zipfile.ZipFile(dest) as out:
+            first = out.infolist()[0]
+            assert first.filename == "mimetype"
+            assert first.compress_type == zipfile.ZIP_STORED
+
+    def test_same_source_and_destination_is_rejected(self, tmp_path: Path):
+        epub = _make_calibre_epub(tmp_path, _fake_jpeg(964, 1537))
+
+        with pytest.raises(ValueError, match="Source and destination.*same"):
+            repair_cover(epub, epub)
+
+    def test_no_cover_raises(self, tmp_path: Path):
+        epub = _make_epub_no_cover(tmp_path)
+
+        with pytest.raises(ValueError, match="No cover image found"):
+            repair_cover(epub, tmp_path / "out.epub")
+
+
+class TestCoverFixCli:
+    def test_fix_reports_what_it_changed(self, tmp_path: Path):
+        from typer.testing import CliRunner
+
+        from booktranslator.cli import app
+
+        epub = _make_calibre_epub(tmp_path, _fake_jpeg(848, 1264))
+        out = tmp_path / "fixed.epub"
+
+        runner = CliRunner()
+        result = runner.invoke(
+            app,
+            [
+                "cover",
+                "fix",
+                str(epub),
+                "--out",
+                str(out),
+                "--title",
+                "Лето наперстянки",
+            ],
+        )
+
+        assert result.exit_code == 0, result.output
+        assert "Cover repaired" in result.output
+        assert out.exists()
+        with zipfile.ZipFile(out) as zf:
+            opf = zf.read("content.opf").decode("utf-8")
+        assert '<meta name="cover" content="a2a1cover"/>' in opf
+        assert 'type="cover"' in opf
+        assert "Лето наперстянки" in opf
+
+    def test_fix_says_so_when_nothing_is_wrong(self, tmp_path: Path):
+        from typer.testing import CliRunner
+
+        from booktranslator.cli import app
+
+        epub = _make_epub2_with_cover(tmp_path, _fake_jpeg(100, 150))
+        out = tmp_path / "fixed.epub"
+
+        runner = CliRunner()
+        result = runner.invoke(app, ["cover", "fix", str(epub), "--out", str(out)])
+
+        assert result.exit_code == 0, result.output
+        assert "Nothing to repair" in result.output
+
+    def test_fix_refuses_to_overwrite_the_source(self, tmp_path: Path):
+        from typer.testing import CliRunner
+
+        from booktranslator.cli import app
+
+        epub = _make_calibre_epub(tmp_path, _fake_jpeg(964, 1537))
+        before = epub.read_bytes()
+
+        runner = CliRunner()
+        result = runner.invoke(app, ["cover", "fix", str(epub), "--out", str(epub)])
+
+        assert result.exit_code == 1
+        assert "Source and destination" in result.output
+        assert epub.read_bytes() == before
