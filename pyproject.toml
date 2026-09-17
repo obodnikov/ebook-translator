@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "book-translator"
-version = "0.7.0"
+version = "0.8.0"
 description = "Translate EPUB books from English to Russian via OpenRouter LLMs."
 requires-python = ">=3.12"
 authors = [{ name = "eobomik" }]
