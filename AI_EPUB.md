@@ -47,6 +47,9 @@ source EPUB as immutable reference data:
   deterministic.
 - Overlap paragraphs (prev/next) are **context only** — they are fed to the model but never
   re-translated or written back. Don't let overlap text leak into the output.
+- Overlap is **always source text**: `ChunkSet` renders it once, before the translator starts
+  replacing paragraphs in the same tree. It goes into the prompt and so into the cache key; read
+  from the live tree, the key would depend on which neighbour finished first.
 
 ## Cover (`cover.py`)
 

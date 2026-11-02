@@ -443,6 +443,14 @@ def translate(
         "--limit-chunks",
         help="Translate only the first N chunks (for quick tests).",
     ),
+    allow_failed_chunks: bool = typer.Option(
+        False,
+        "--allow-failed-chunks",
+        help=(
+            "Go on to the later stages and write the EPUB even though some chunks failed: "
+            "their paragraphs stay in the source language."
+        ),
+    ),
     parallelism: int | None = typer.Option(
         None,
         "--parallelism",
@@ -629,6 +637,7 @@ def translate(
     wd = WorkDir.for_book(work_dir, book.meta.title)
     state = wd.load_state()
     state.current_stage = Stage.TRANSLATE
+    state.last_error = None
     wd.save_state(state)
     console.print(f"[bold]Workdir:[/bold]  {wd.root}")
 
@@ -714,10 +723,26 @@ def translate(
         )
 
     if stats.chunks_failed:
+        failed_ids = ", ".join(sorted(stats.failed_chunk_ids))
+        state.last_error = f"translate: {stats.chunks_failed} chunks failed: {failed_ids}"
+        wd.save_state(state)
+        if not allow_failed_chunks:
+            # The later stages cost money and only polish what is there. Going on would
+            # end in a part-English book marked as done.
+            cache.close()
+            console.print(
+                f"[red]Error:[/red] {stats.chunks_failed} chunks failed: {failed_ids}\n"
+                "[dim]Stopped before the later stages; no EPUB was written.\n"
+                "Re-run the same command to ask for them again (the cache keeps the rest). "
+                f"Rejected replies are in {wd.root / 'failed'}.\n"
+                "To go on anyway, with those paragraphs left in the original language, "
+                "add --allow-failed-chunks.[/dim]",
+                soft_wrap=True,  # keep the chunk ids and the path on one line
+            )
+            raise typer.Exit(code=1)
         console.print(
-            f"[yellow]Warning:[/yellow] {stats.chunks_failed} chunks failed; "
-            "the output EPUB will have those paragraphs in the original language. "
-            "Re-run the same command to retry failed chunks (cache keeps successes)."
+            f"[yellow]Warning:[/yellow] {stats.chunks_failed} chunks failed: {failed_ids}; "
+            "the output EPUB will have those paragraphs in the original language."
         )
 
     # ------------------------------------------------------------------

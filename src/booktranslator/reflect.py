@@ -225,13 +225,14 @@ class Reflector:
             return cached.content
 
         # Validate BEFORE caching, like translate: this reply competes in the
-        # waterfall, so it must hold the paragraph count and parse as XHTML.
+        # waterfall, so it must hold the paragraph count, parse as XHTML and line
+        # up with the source.
         reply = self._checker.ask(
             self._complete_retranslate,
             system,
             user,
             chunk_id=chunk_id,
-            expected=expected,
+            source=original_paragraphs,
             stats=stats,
         )
         with self._lock:
@@ -243,7 +244,7 @@ class Reflector:
                 content=reply.text,
                 input_tokens=reply.input_tokens,
                 output_tokens=reply.output_tokens,
-                meta={"chunk_id": chunk_id},
+                meta=reply.meta(chunk_id),
             )
             stats.chunks_reflected += 1
 

@@ -31,7 +31,7 @@ from .cache import Cache
 from .models import SeriesGlossary
 from .prompts import Prompt, load_prompt, render_prompt
 from .provider import CompletionResult, OpenRouterProvider
-from .replies import parse_fragment
+from .replies import MIN_TELLING_SENTENCE, SENTENCE_END_RE, parse_fragment
 from .series import render_for_prompt
 
 logger = logging.getLogger(__name__)
@@ -115,12 +115,7 @@ def _breaks_dialogue_dash(before: str, after: str) -> bool:
     return bool(_OPENS_WITH_DASH.match(before)) and bool(_OPENS_WITH_GUILLEMET.match(after))
 
 
-# A sentence has to be at least this long before finding it inside another
-# paragraph's patch means the paragraphs were mixed up. Short lines — "Да.",
-# "– Хорошо, – сказал я." — recur in any novel and prove nothing.
-_MIN_BORROWED_SENTENCE = 40
 _TAG_RE = re.compile(r"<[^>]+>")
-_SENTENCE_END_RE = re.compile(r"(?<=[.!?…»])\s+")
 
 
 def _plain_text(fragment: str) -> str:
@@ -141,12 +136,8 @@ def _borrowed_paragraph(idx: int, new_text: str, paragraphs: list[str]) -> int |
     for other, paragraph in enumerate(paragraphs):
         if other == idx:
             continue
-        for sentence in _SENTENCE_END_RE.split(_plain_text(paragraph)):
-            if (
-                len(sentence) >= _MIN_BORROWED_SENTENCE
-                and sentence in patch
-                and sentence not in own
-            ):
+        for sentence in SENTENCE_END_RE.split(_plain_text(paragraph)):
+            if len(sentence) >= MIN_TELLING_SENTENCE and sentence in patch and sentence not in own:
                 return other + 1
     return None
 

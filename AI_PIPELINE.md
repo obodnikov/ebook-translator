@@ -21,6 +21,8 @@ See [ARCHITECTURE.md §3, §5, §9](ARCHITECTURE.md); this file is the coding co
   `pipeline_helpers.py` for the established behaviour; preserve it.
 - Never "fix" a count mismatch by padding, dropping, or merging paragraphs silently. The fallback
   is: use the latest stage output that *does* satisfy the count (waterfall), and flag the chunk.
+  The one repair of a mismatch, `replies.rebuild_over_split_reply`, is described under "Errors &
+  resilience"; don't widen it.
 
 ## Cache (`cache.py`) — keys and the waterfall
 
@@ -33,7 +35,10 @@ See [ARCHITECTURE.md §3, §5, §9](ARCHITECTURE.md); this file is the coding co
   the last-written row is correct.
 - Invalidation is explicit: bump `prompt_version`, change the model, or invalidate a specific
   chunk/stage. Do not clear the whole cache as a shortcut — it throws away paid work.
-- Never write a result to the cache before it has passed validation (count + parse).
+- Never write a result to the cache before it has passed validation (count + parse + alignment).
+- A prompt must not depend on the order chunks finish in, or a second run pays again for chunks
+  it already has. Keep overlap as source text (AI_EPUB.md); the first Tainted Cup run showed 5–7
+  healthy chunks re-bought on a `-j 8` re-run and 48 on `-j 1` before that was fixed.
 
 ## Prompt versioning drives correctness *and* cost
 
@@ -41,6 +46,16 @@ See [ARCHITECTURE.md §3, §5, §9](ARCHITECTURE.md); this file is the coding co
   key. If you change a prompt's behaviour, **bump its version** so stale cached outputs are
   invalidated. Forgetting this silently serves old translations — treat a prompt edit without a
   version bump as a bug.
+- A version bump doesn't remove the rows of the old version. A `reflect` row outranks a new
+  `translate` row in the waterfall, so on a book in progress the later stages would go on reading
+  the old text. Tell the user to run `btrans cache clear <book> --stage translate` first.
+- The translate prompt's "Direct speech" section is load-bearing, examples included. Version 4 only
+  forbade splitting a paragraph, which left the model no way to write speech after narration: 16 of
+  132 first replies were rejected (four of the five saved ones for splitting), and half the chunks
+  of The Tainted Cup opened speech with guillemets. With the examples, the ten hardest chunks of
+  that book had no split and every speech paragraph opened with an em dash. The same version also
+  needed the ellipsis line: without it, three of the ten switched to three dots. Measure again on
+  real chunks when editing it.
 
 ## State machine, pause/resume (`state.py`, `pipeline_helpers.py`)
 
@@ -89,13 +104,52 @@ See [ARCHITECTURE.md §3, §5, §9](ARCHITECTURE.md); this file is the coding co
     no JSON to repair, and turning prose into patches would let it invent text nobody vetted.
     These are full-price calls, so a run gets a budget (`PostProcessor._retry_budget`) — a model
     that has stopped following the format must not silently double the cost of the stage.
-- A translate or reflect reply is checked in full before it is cached: exactly N markers **and**
-  every paragraph one well-formed XHTML element (`replies.parse_paragraphs`). The count alone is
-  not enough — a paragraph missing `</p>`, two `<p>` under one marker, or the model's own
-  "wait, I mis-numbered" pasted between markers all pass it. A rejected **fresh** reply is asked
-  for once more with the reason appended (`replies.RETRY_NOTE`, in code so no prompt version
-  changes), within the run's `replies.retry_budget`. A cached reply that fails is reported with
-  the `btrans cache clear` command that removes it — never re-bought.
+- A translate or reflect reply is checked in full before it is cached: exactly N markers, every
+  paragraph one well-formed XHTML element (`replies.parse_paragraphs`), **and** every paragraph
+  lined up with its source (`replies.check_alignment`). The count alone is not enough — a
+  paragraph missing `</p>`, or the model's own "wait, I mis-numbered" pasted between markers, both
+  pass it. So does a reply with a hole in it: a model that split a paragraph and noticed the count
+  was off keeps the count right by dropping a line of speech or the end of the chunk, and that
+  reply is N well-formed elements. So does a paragraph printed twice: one marker holding that
+  paragraph and the next, then the next again under its own marker. The judge cannot be the
+  safeguard: it runs after the row is cached, and it missed one of the eight such chunks in The
+  Tainted Cup. The alignment limits are measured (see the comment in `replies.py`), so measure again
+  on real caches before moving them.
+  A rejected **fresh** reply is asked for once more with the reason appended
+  (`replies.RETRY_NOTE`, in code so no prompt version changes), naming every bad paragraph, within
+  the run's `replies.retry_budget`. A cached reply that fails is reported with the
+  `btrans cache clear` command that removes it — never re-bought. The alignment check applies to
+  fresh replies only.
+- A reply has two repairs, both for a paragraph the model split, and nothing else is repaired.
+  They exist because the text is all there and a re-ask costs a whole chunk; the re-ask is also the
+  worse answer, since a model told "exactly N" keeps splitting and stops at marker N. Keep them
+  narrow, because the same shapes can hide other defects:
+  - `replies.join_split_paragraphs`: same-looking sibling elements under **one** marker become one
+    element. The joined text must fit the source paragraph and repeat nothing of the neighbouring
+    markers, because two elements under one marker can also be the next source paragraph in the
+    wrong place (The Tainted Cup ch52_c02), and joining that prints it twice.
+  - `replies.rebuild_over_split_reply`: too many markers, numbered 1 to M, where each extra marker
+    is narration followed by speech from one source paragraph that opens that way, and each part
+    is about as long as the same part of the source. Comparing only the whole paragraph rebuilt just
+    52% of 375 known-answer trials exactly, and 78 came out wrong and still passed every later
+    check. Numbering that restarts means two answers in one reply. Too few markers, or anything
+    else, stays rejected.
+
+  Neither is silent: each is logged and recorded in the row's meta (`joined_paragraphs`,
+  `rebuilt_paragraphs`), and the result goes through every check above. They live in `ReplyChecker`,
+  not in `parse_fragment`, because post-processing patches are checked with that function and a
+  patch with two elements must stay rejected. The cached row holds the repaired text, so that later
+  readers see one element per marker.
+- A failed translate chunk stops `btrans translate` once the other chunks are done: no later stage,
+  no EPUB, no `done` in `state.json`, the chunk ids in `last_error`, exit code 1. "Skip the chunk and
+  continue" (ARCHITECTURE §9) means continue with the other chunks of the stage. The later stages
+  cost money and only polish what is there, and going on ends in a part-English book marked as
+  done. `--allow-failed-chunks` goes on when the user decides to; `last_error` still says what failed.
+- `replies.parse_fragment` forgives two slips that lose no text and that a re-ask does not reliably
+  cure: a bare `&`, and an `epub:` attribute whose `xmlns:epub` declaration the model left off
+  (The Tainted Cup ch36_c04 failed both asks over that alone). The cached row keeps the model's
+  reply, so every reader of a fragment must go through this function. Keep this to slips of markup:
+  a fragment that holds two elements, or anything but one element, stays rejected.
 - A chunk goes into the live tree whole or not at all: parse every paragraph first, then splice.
 - The waterfall that feeds proofread / style / verify / repair skips a stage whose paragraphs do
   not parse, the same way it skips a count mismatch. Those passes send patches for changed
