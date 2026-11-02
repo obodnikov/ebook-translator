@@ -61,9 +61,10 @@ class Translator:
         model: str,
         source_lang: str = "en",
         target_lang: str = "ru",
+        reasoning_effort: str | None = None,
     ):
         self.provider = provider
-        self.prompt: Prompt = load_prompt(prompt_path)
+        self.prompt: Prompt = load_prompt(prompt_path, reasoning_effort)
         self.cache = cache
         self.glossary = glossary
         self.model = model
@@ -117,16 +118,15 @@ class Translator:
             max_tokens=self.prompt.max_tokens,
             reasoning_effort=self.prompt.reasoning_effort,
         )
-        # Guard: empty content means the provider routed the answer
-        # elsewhere (tool call / reasoning_content) — e.g. kiro-gateway with
-        # web_search or fake reasoning enabled. Raise BEFORE caching so a
-        # poisoned empty response is never written to the cache.
+        # Guard: empty content can mean the provider returned a tool call
+        # instead, e.g. kiro-gateway with web_search enabled. Raise BEFORE
+        # caching so a poisoned empty response is never written to the cache.
         if not result.text.strip():
             raise ValueError(
                 "Model returned empty content "
                 f"(finish_reason={result.finish_reason!r}). The provider may have "
-                "returned a tool call or put the answer in reasoning_content — "
-                "check WEB_SEARCH_ENABLED / FAKE_REASONING on the gateway."
+                "returned a tool call — check WEB_SEARCH_ENABLED / FAKE_REASONING "
+                "on the gateway."
             )
         return result
 

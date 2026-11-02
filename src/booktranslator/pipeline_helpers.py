@@ -38,6 +38,7 @@ def _create_provider_from_config(provider_cfg: ProviderConfig) -> OpenRouterProv
         api_key_env=provider_cfg.api_key_env,
         extra_headers=provider_cfg.extra_headers or None,
         max_response_bytes=provider_cfg.max_response_bytes,
+        timeout_seconds=provider_cfg.timeout_seconds,
     )
 
 

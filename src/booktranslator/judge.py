@@ -71,10 +71,11 @@ class Judge:
         target_lang: str = "ru",
         judged_stage: str = "translate",
         run_id: str | None = None,
+        reasoning_effort: str | None = None,
     ):
         self.provider = provider
         self.prompt_path = prompt_path
-        self.prompt: Prompt = load_prompt(prompt_path)
+        self.prompt: Prompt = load_prompt(prompt_path, reasoning_effort)
         self.cache = cache
         self.glossary = glossary
         self.model = model
@@ -240,8 +241,8 @@ class Judge:
             if not raw_text.strip():
                 raise EmptyCompletionError(
                     "Judge model returned empty content "
-                    f"(finish_reason={result.finish_reason!r}). Reasoning shares the "
-                    "response budget with the answer — lower reasoning_effort."
+                    f"(finish_reason={result.finish_reason!r}). If it reasoned at length, "
+                    "lower the reasoning level."
                 )
 
         # Validate BEFORE caching: _parse_judge_response raises on invalid JSON,

@@ -5,11 +5,15 @@ from __future__ import annotations
 from enum import StrEnum
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
+
+# What `reasoning_effort` may be set to. Not every model takes every value: an
+# endpoint that cannot honour one lowers it or drops it, see ReasoningConfig.
+ReasoningEffort = Literal["none", "minimal", "low", "medium", "high", "xhigh", "max"]
 
 
 class ProviderConfig(BaseModel):
@@ -18,11 +22,14 @@ class ProviderConfig(BaseModel):
     base_url: str = "https://openrouter.ai/api/v1"
     api_key_env: str = "OPENROUTER_API_KEY"
     extra_headers: dict[str, str] = Field(default_factory=dict)
-    # Largest response this endpoint can return, in bytes. Reasoning and answer
-    # share it. None means no known ceiling (OpenRouter). kiro-gateway caps
-    # around 23 000 and gives no warning of its own — see
-    # docs/design/2026-08-03-judge-repair-stage-and-reasoning-on-gateway.md §4.
+    # Warn when a response gets this close to a limit the endpoint is known to
+    # have, in bytes. None means no known limit. kiro-gateway used to cut
+    # responses near 23 KB; that no longer reproduces (70 KB came back whole on
+    # 2026-11-01), so its shipped config leaves this unset.
     max_response_bytes: int | None = None
+    # How long to wait for one answer. A timeout is final, not retried: the
+    # endpoint keeps working on an abandoned request, so a retry pays twice.
+    timeout_seconds: float = 600.0
 
 
 class ProvidersConfig(BaseModel):
@@ -53,6 +60,32 @@ class ModelsConfig(BaseModel):
     verify: str = "anthropic/claude-sonnet-4.6"
     repair: str = "anthropic/claude-sonnet-4.6"
     cover: str = "google/gemini-3.1-flash-image-preview"
+
+
+class ReasoningConfig(BaseModel):
+    """Reasoning level per text stage, replacing `reasoning_effort` from its prompt.
+
+    The prompt's value is the same whichever endpoint runs it, while what a
+    level means and costs depends on the endpoint. Unset keeps the prompt's value.
+
+    The level is more than a thinking switch. On kiro-gateway `low` lowers the
+    effort of the whole answer: on 3 fragments the judge wrote 16 remarks at
+    `low` and 50 at `high` (Haiku 5.5). And `none` is not always off: Sonnet 5.5
+    cannot stop reasoning, so `none` runs it at its default level.
+
+    A typo here must fail loudly, not silently fall back to the prompt's value.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    glossary: ReasoningEffort | None = None
+    translate: ReasoningEffort | None = None
+    judge: ReasoningEffort | None = None
+    reflect: ReasoningEffort | None = None
+    proofread: ReasoningEffort | None = None
+    style: ReasoningEffort | None = None
+    verify: ReasoningEffort | None = None
+    repair: ReasoningEffort | None = None
 
 
 class ChunkerConfig(BaseModel):
@@ -165,6 +198,7 @@ class Config(BaseModel):
     chunker: ChunkerConfig = Field(default_factory=ChunkerConfig)
     translate: TranslateConfig = Field(default_factory=TranslateConfig)
     models: ModelsConfig = Field(default_factory=ModelsConfig)
+    reasoning: ReasoningConfig = Field(default_factory=ReasoningConfig)
     reflection: ReflectionConfig = Field(default_factory=ReflectionConfig)
     pauses: PausesConfig = Field(default_factory=PausesConfig)
     stages: StagesConfig = Field(default_factory=StagesConfig)

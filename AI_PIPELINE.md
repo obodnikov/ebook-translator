@@ -56,6 +56,9 @@ See [ARCHITECTURE.md §3, §5, §9](ARCHITECTURE.md); this file is the coding co
 
 ## Judge / reflect (`judge.py`, `reflect.py`)
 
+- `reflection.trigger_score` is calibrated to one judge: another model or level moves the scores,
+  so re-measure the threshold when either changes. Compare final text after all stages, not text
+  right after reflect: later stages fix much of the same.
 - Judge is a cheap scoring pass (1–5). Reflect (Andrew Ng's method) runs only on low-scoring
   chunks or under `--reflect-all`; it must re-validate the paragraph-count contract on its output
   before it can win the waterfall. A reflect pass that returns identical text is a no-op — don't

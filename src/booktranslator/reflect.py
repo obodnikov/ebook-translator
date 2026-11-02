@@ -70,10 +70,11 @@ class Reflector:
         model: str,
         source_lang: str = "en",
         target_lang: str = "ru",
+        reasoning_effort: str | None = None,
     ):
         self.provider = provider
-        self.reflect_prompt: Prompt = load_prompt(reflect_prompt_path)
-        self.translate_prompt: Prompt = load_prompt(translate_prompt_path)
+        self.reflect_prompt: Prompt = load_prompt(reflect_prompt_path, reasoning_effort)
+        self.translate_prompt: Prompt = load_prompt(translate_prompt_path, reasoning_effort)
         self.cache = cache
         self.glossary = glossary
         self.model = model

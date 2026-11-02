@@ -262,10 +262,10 @@ nohup btrans translate book.epub > run.log 2>&1 &
 
 #### Шаг 6: Reflect (условно)
 
-- Триггер: score ≤ 3 ИЛИ флаг `--reflect-all`.
+- Триггер: score ≤ `reflection.trigger_score` ИЛИ флаг `--reflect-all`.
 - Метод Эндрю Ына: рефлексия по переводу → список замечаний → повторный перевод с учётом замечаний.
 - Два промпта: `prompts/reflect.md` (критика) + reuse `translate.md` с добавленным полем `reflection_notes`.
-- Модель: `anthropic/claude-sonnet-4.6` с extended thinking включённым.
+- Модель и уровень рассуждения: `models.reflect`, `reasoning.reflect`.
 
 #### Шаг 7: Assemble preview
 
@@ -475,7 +475,7 @@ class OpenRouterProvider:
         messages: list[Message],
         temperature: float = 0.3,
         max_tokens: int | None = None,
-        extended_thinking: bool = False,
+        reasoning_effort: str | None = None,
     ) -> CompletionResult:
         # Использует openai SDK с base_url=https://openrouter.ai/api/v1
         # Retry с экспоненциальным backoff на 429, 500, 502, 503.
@@ -655,9 +655,13 @@ models:
   verify:     anthropic/claude-sonnet-4.6
   cover:      google/gemini-3.1-flash-image-preview
 
+# Уровень рассуждения по стадиям, поверх reasoning_effort из промпта.
+# Значения для kiro-gateway и их обоснование: docs/design/2026-11-01-native-reasoning-on-gateway.md
+reasoning:
+  translate: medium
+
 reflection:
-  trigger_score: 3       # reflect если judge <= 3
-  extended_thinking: true
+  trigger_score: 2       # reflect если judge <= 2; калибруется под конкретного оценщика
 
 pauses:
   after_glossary: true

@@ -1,5 +1,5 @@
 ---
-version: 3
+version: 4
 model: anthropic/claude-sonnet-4.6
 temperature: 0.3
 max_tokens: 12000
@@ -67,6 +67,10 @@ Your translation must be an XHTML fragment with:
   similar elements — copy them verbatim.
 
 Do not introduce new tags. Do not strip existing ones.
+
+One source paragraph is always exactly one element in your translation. Never split a paragraph
+in two, not even to put a line of dialogue on its own line as {{ target_lang_name }} typography
+would: keep the narration and the speech inside the same element, in the same order as the source.
 
 ## Output format
 

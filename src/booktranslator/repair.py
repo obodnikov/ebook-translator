@@ -265,9 +265,10 @@ class Repairer:
         categories: tuple[str, ...] = MECHANICAL_CATEGORIES,
         source_lang: str = "en",
         target_lang: str = "ru",
+        reasoning_effort: str | None = None,
     ):
         self.provider = provider
-        self.prompt: Prompt = load_prompt(prompt_path)
+        self.prompt: Prompt = load_prompt(prompt_path, reasoning_effort)
         self.cache = cache
         self.model = model
         self.categories = categories

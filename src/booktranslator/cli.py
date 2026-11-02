@@ -49,6 +49,7 @@ from .pipeline_helpers import (
     save_chunker_params,
     verify_chunker_params,
 )
+from .provider import credits_used
 from .series import (
     SeriesWorkDir,
     init_series,
@@ -75,6 +76,13 @@ app.add_typer(cover_app, name="cover")
 app.add_typer(cache_app, name="cache")
 
 console = Console()
+
+
+def _credits_note() -> str:
+    """The credits spent by this command, for providers that report them."""
+    used = credits_used()
+    return f" Credits: {used:,.1f}." if used else ""
+
 
 DEFAULT_WORK_DIR = Path("work")
 DEFAULT_CONFIG = Path("configs/default.yaml")
@@ -177,6 +185,7 @@ def glossary_extract(
             source_lang=cfg.source_lang,
             target_lang=cfg.target_lang,
             known_terms=known_terms,
+            reasoning_effort=cfg.reasoning.glossary,
         )
     except Exception as e:
         wd.raw_glossary_path.write_text(str(e), encoding="utf-8")
@@ -217,7 +226,10 @@ def _print_glossary_summary(glossary_obj: Glossary, result) -> None:
     console.print(table)
 
     if result is not None:
-        console.print(f"[dim]Tokens: {result.input_tokens} in, {result.output_tokens} out[/dim]")
+        console.print(
+            f"[dim]Tokens: {result.input_tokens} in, "
+            f"{result.output_tokens} out.{_credits_note()}[/dim]"
+        )
     else:
         console.print("[dim]Served from cache (no tokens used)[/dim]")
 
@@ -672,6 +684,7 @@ def translate(
         model=chosen_model,
         source_lang=cfg.source_lang,
         target_lang=cfg.target_lang,
+        reasoning_effort=cfg.reasoning.translate,
     )
 
     with Progress(
@@ -738,6 +751,7 @@ def translate(
                     model=judge_model,
                     source_lang=cfg.source_lang,
                     target_lang=cfg.target_lang,
+                    reasoning_effort=cfg.reasoning.judge,
                 )
 
                 judge_parallelism = min(parallelism or cfg.translate.parallelism, 8) or 4
@@ -824,6 +838,7 @@ def translate(
                 model=reflect_model,
                 source_lang=cfg.source_lang,
                 target_lang=cfg.target_lang,
+                reasoning_effort=cfg.reasoning.reflect,
             )
 
             # Build reflect input using shared helper (O(n), not O(n²))
@@ -952,6 +967,7 @@ def translate(
             model=pp_model,
             source_lang=cfg.source_lang,
             target_lang=cfg.target_lang,
+            reasoning_effort=getattr(cfg.reasoning, pp_stage),
         )
 
         pp_parallelism = min(parallelism or cfg.translate.parallelism, 8) or 4
@@ -1111,7 +1127,7 @@ def translate(
         f"\n[green]Translated EPUB:[/green] {out_path}\n"
         f"[dim]{' '.join(summary_parts)}\n"
         f"Tokens: {stats.input_tokens:,} in, "
-        f"{stats.output_tokens:,} out.[/dim]"
+        f"{stats.output_tokens:,} out.{_credits_note()}[/dim]"
     )
 
     # Helpful tips
@@ -1287,6 +1303,7 @@ def judge_cmd(
         target_lang=cfg.target_lang,
         judged_stage=from_stage,
         run_id=run_id,
+        reasoning_effort=cfg.reasoning.judge,
     )
 
     if parallelism is not None and parallelism < 1:
@@ -1337,7 +1354,7 @@ def judge_cmd(
             f"{judge_stats.chunks_cached} cached, "
             f"{judge_stats.chunks_failed} failed. "
             f"Tokens: {judge_stats.input_tokens:,} in, "
-            f"{judge_stats.output_tokens:,} out.[/dim]"
+            f"{judge_stats.output_tokens:,} out.{_credits_note()}[/dim]"
         )
     else:
         console.print("[yellow]No chunks were judged.[/yellow]")
@@ -1496,6 +1513,7 @@ def reflect_cmd(
         model=reflect_model,
         source_lang=cfg.source_lang,
         target_lang=cfg.target_lang,
+        reasoning_effort=cfg.reasoning.reflect,
     )
 
     if parallelism is not None and parallelism < 1:
@@ -1539,7 +1557,7 @@ def reflect_cmd(
         f"  No change: {reflect_stats.chunks_unchanged}/{reflect_stats.chunks_total}\n"
         f"  Failed: {reflect_stats.chunks_failed}/{reflect_stats.chunks_total}\n"
         f"[dim]Tokens: {reflect_stats.input_tokens:,} in, "
-        f"{reflect_stats.output_tokens:,} out.[/dim]"
+        f"{reflect_stats.output_tokens:,} out.{_credits_note()}[/dim]"
     )
 
 
@@ -1877,6 +1895,7 @@ def repair_cmd(
             categories=wanted,
             source_lang=cfg.source_lang,
             target_lang=cfg.target_lang,
+            reasoning_effort=cfg.reasoning.repair,
         )
 
         stats = RepairStats(chunks_total=len(waterfall))
@@ -1920,7 +1939,8 @@ def repair_cmd(
             f"  Rejected:   {stats.rejected}\n"
             f"  Chunks changed: {stats.chunks_repaired}/{stats.chunks_total}\n"
             f"  Failed: {stats.chunks_failed}\n"
-            f"[dim]Tokens: {stats.input_tokens:,} in, {stats.output_tokens:,} out.[/dim]"
+            f"[dim]Tokens: {stats.input_tokens:,} in, "
+            f"{stats.output_tokens:,} out.{_credits_note()}[/dim]"
         )
         unhandled_path = wd.root / "repair-unhandled.txt"
         if stats.unhandled:
@@ -2050,6 +2070,7 @@ def _run_postprocess_cmd(
             model=chosen_model,
             source_lang=cfg.source_lang,
             target_lang=cfg.target_lang,
+            reasoning_effort=getattr(cfg.reasoning, stage),
         )
 
         effective_parallelism = parallelism or 4
@@ -2087,7 +2108,7 @@ def _run_postprocess_cmd(
             f"  Unchanged: {pp_stats.chunks_unchanged}/{pp_stats.chunks_total}\n"
             f"  Failed: {pp_stats.chunks_failed}/{pp_stats.chunks_total}\n"
             f"[dim]Tokens: {pp_stats.input_tokens:,} in, "
-            f"{pp_stats.output_tokens:,} out.[/dim]"
+            f"{pp_stats.output_tokens:,} out.{_credits_note()}[/dim]"
         )
     finally:
         cache.close()

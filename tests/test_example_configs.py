@@ -26,7 +26,7 @@ import pytest
 import yaml
 
 from booktranslator.config import load_config
-from booktranslator.models import Config, ModelsConfig, ProvidersConfig
+from booktranslator.models import Config, ModelsConfig, ProvidersConfig, ReasoningConfig
 from booktranslator.pipeline_helpers import _TEXT_STAGES, create_stage_provider
 
 CONFIGS_DIR = Path(__file__).resolve().parent.parent / "configs"
@@ -108,6 +108,9 @@ class TestSchemaCoversEveryStage:
             f"stages {sorted(missing)} can be routed but have no models.<stage> entry — "
             f"add them to ModelsConfig"
         )
+
+    def test_reasoning_config_has_an_entry_per_text_stage(self):
+        assert set(ReasoningConfig.model_fields) == set(_TEXT_STAGES)
 
     def test_models_config_has_no_entries_beyond_the_stages_and_cover(self):
         extra = set(ModelsConfig.model_fields) - set(_TEXT_STAGES) - {"cover"}

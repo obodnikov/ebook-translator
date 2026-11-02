@@ -34,14 +34,25 @@ This is a deliberate split (`ProvidersConfig.text` vs `ProvidersConfig.image`, s
 - Retry transient failures (429, 500, 502, 503) with exponential backoff (`RetryConfig`,
   `tenacity`); do not retry permanent 4xx. Surface the final error rather than returning empty
   output that a later stage would treat as a valid (empty) translation.
+- Retries belong to `complete()` alone: the SDK client stays at `max_retries=0`, or its retries
+  multiply ours. A timeout (`CompletionTimeoutError`), an empty answer (`EmptyCompletionError`)
+  and a refusal (`RefusalError`) are final: the same request fails the same way, and on
+  kiro-gateway an abandoned request keeps spending credits.
+- `finish_reason` is not evidence of a good answer: kiro-gateway reports `stop` for an empty one.
+  Judge a reply by its content and by the stage's contract.
 - Log cost/tokens to `work/<book>/log.jsonl`, but **never log raw API keys or full book text**.
   `cost-report.json` carries aggregate cost only.
 
 ## Prompts (`prompts.py`) — frontmatter + Jinja2
 
 - A prompt file is markdown with YAML frontmatter (`version`, `model`, `temperature`,
-  `max_tokens`) plus `# System` / `# User` sections, loaded by `load_prompt` and rendered by
-  `render_prompt`. Keep prompt *content* in `prompts/*.md`, not inlined in Python.
+  `max_tokens`, `reasoning_effort`) plus `# System` / `# User` sections, loaded by `load_prompt`
+  and rendered by `render_prompt`. Keep prompt *content* in `prompts/*.md`, not inlined in Python.
+- The reasoning level of a stage is `cfg.reasoning.<stage>` if set, else the frontmatter value.
+  Pass it to `load_prompt(path, level)`: a level that differs from the frontmatter joins the
+  version (`4+medium`), and through it the cache key. Don't add it to cache keys separately. What a
+  level means depends on the model and endpoint, so choose levels by measuring, see
+  [docs/design/2026-11-01-native-reasoning-on-gateway.md](docs/design/2026-11-01-native-reasoning-on-gateway.md).
 - `version` is part of the cache key (see [AI_PIPELINE.md](AI_PIPELINE.md)) — **bump it whenever
   you change a prompt's behaviour**. A prompt edit without a version bump silently serves stale
   cached output.

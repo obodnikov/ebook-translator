@@ -5,9 +5,10 @@ from __future__ import annotations
 import base64
 import logging
 import os
+import threading
 from dataclasses import dataclass, field
 
-from openai import APIStatusError, OpenAI
+from openai import APIStatusError, APITimeoutError, OpenAI
 from tenacity import (
     retry,
     retry_if_exception_type,
@@ -20,9 +21,11 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_BASE_URL = "https://openrouter.ai/api/v1"
 
-# Warn once a response gets this close to the provider's response ceiling.
-# There is no earlier signal: kiro-gateway returns finish_reason="stop" even
-# when it truncates (docs/design/2026-08-03-...md §4.4).
+# How long to wait for one answer unless the config says otherwise: the SDK's
+# own default, made explicit because a timeout now ends the call.
+DEFAULT_TIMEOUT_SECONDS = 600.0
+
+# Warn once a response gets this close to a limit configured for the provider.
 RESPONSE_SIZE_WARN_RATIO = 0.85
 
 
@@ -31,6 +34,28 @@ RESPONSE_SIZE_WARN_RATIO = 0.85
 MAX_RETRY_AFTER_SECONDS = 300.0
 
 _backoff = wait_exponential(multiplier=2, min=2, max=60)
+
+_credits_lock = threading.Lock()
+_credits_used = 0.0
+
+
+def credits_used() -> float:
+    """Credits this process has spent so far, for providers that report them.
+
+    kiro-gateway does (`usage.credits_used`), and it is the one reliable cost
+    figure there: its token counts read 0 on large requests. Calls that came
+    back empty are included, they were paid for too.
+    """
+    with _credits_lock:
+        return _credits_used
+
+
+def _add_credits(usage: object) -> None:
+    global _credits_used
+    spent = getattr(usage, "credits_used", None)
+    if isinstance(spent, int | float):
+        with _credits_lock:
+            _credits_used += spent
 
 
 def retry_after_seconds(error: BaseException | None) -> float | None:
@@ -76,12 +101,30 @@ class EmptyCompletionError(ValueError):
     """The provider returned no content.
 
     Permanent, not transient: retrying the identical request cannot help.
-    The usual cause is the response ceiling — injected reasoning is ordinary
-    output and competes with the answer for the same budget, so a verbose
-    reasoning pass can leave nothing for the answer itself.
+    The usual cause is reasoning that never ended in an answer. Measured on the
+    translate prompt: Sonnet 4.6 at `high` and Haiku 5.5 at `xhigh` and `max`
+    wrote about 30 KB of reasoning and no answer, with finish_reason "stop".
 
     Subclasses ValueError because that is what the stages raised for this
     failure before the check moved here, and callers catch it that way.
+    """
+
+
+class RefusalError(EmptyCompletionError):
+    """The provider declined the request and sent no answer.
+
+    An empty answer whose cause is known, so it fails the same way, with the
+    provider's own explanation instead of advice about reasoning.
+    """
+
+
+class CompletionTimeoutError(RuntimeError):
+    """No answer arrived within the provider's timeout.
+
+    Final, not retried: the cause is nearly always the reasoning level, so the
+    same request would time out again, and the endpoint keeps working on an
+    abandoned request. Sonnet 5 at `max` took 10 minutes per answer and paid for
+    the attempt the client had given up on.
     """
 
 
@@ -122,6 +165,7 @@ class OpenRouterProvider:
         api_key_env: str = "OPENROUTER_API_KEY",
         extra_headers: dict[str, str] | None = None,
         max_response_bytes: int | None = None,
+        timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
     ):
         key = api_key or os.environ.get(api_key_env)
         if not key:
@@ -143,18 +187,24 @@ class OpenRouterProvider:
         self._base_url = resolved_base_url
         self._extra_headers = default_headers.copy()
         self._max_response_bytes = max_response_bytes
+        self._timeout_seconds = timeout_seconds
+        self._warned_about_none: set[str] = set()
 
         self.client = OpenAI(
             base_url=resolved_base_url,
             api_key=key,
             default_headers=default_headers or None,
+            timeout=timeout_seconds,
+            # Retries belong to `complete` alone. The SDK's own two, nested
+            # inside its five attempts, made up to 15 requests out of one call.
+            max_retries=0,
         )
 
     @retry(
         reraise=True,
-        # Retry anything transient, but not EmptyCompletionError: it is
-        # permanent, and the identical request would fail the same way.
-        retry=retry_if_not_exception_type(EmptyCompletionError),
+        # Retry anything transient, but not these: they are permanent, and the
+        # identical request would fail the same way.
+        retry=retry_if_not_exception_type((EmptyCompletionError, CompletionTimeoutError)),
         stop=stop_after_attempt(5),
         wait=_wait_before_retry,
     )
@@ -185,7 +235,8 @@ class OpenRouterProvider:
             kwargs["response_format"] = response_format
         # Pass reasoning_effort via extra_body so it merges into the request
         # body as a non-standard field understood by kiro-gateway and some
-        # OpenRouter models (e.g. reasoning_effort: "none" disables thinking).
+        # OpenRouter models. "none" disables thinking only on models that can
+        # stop it; see _warn_if_reasoned_despite_none.
         if reasoning_effort is not None:
             # Merge into extra_body rather than overwriting, so other callers
             # can also set extra_body fields without conflict.
@@ -193,7 +244,17 @@ class OpenRouterProvider:
             extra["reasoning_effort"] = reasoning_effort
             kwargs["extra_body"] = extra
 
-        response = self.client.chat.completions.create(**kwargs)
+        try:
+            response = self.client.chat.completions.create(**kwargs)
+        except APITimeoutError as e:
+            raise CompletionTimeoutError(
+                f"{model} did not answer within {self._timeout_seconds:.0f} s at "
+                f"reasoning_effort={reasoning_effort!r}. Lower the level (`reasoning:` in the "
+                "config) or raise timeout_seconds for this provider."
+            ) from e
+
+        usage = response.usage
+        _add_credits(usage)
 
         choice = response.choices[0]
         message = choice.message
@@ -206,22 +267,30 @@ class OpenRouterProvider:
         )
 
         if not text.strip():
+            refusal = getattr(message, "refusal", None)
+            if not isinstance(refusal, str):
+                refusal = ""
+            if refusal or finish_reason == "content_filter":
+                raise RefusalError(
+                    f"{model} declined the request (finish_reason={finish_reason!r}): "
+                    f"{refusal or 'no explanation given'}"
+                )
             # Do NOT fall back to `reasoning`: it is a draft of the model's
             # thinking, not the answer. Caching it would put nonsense into the
             # book. finish_reason is no help either — kiro-gateway reports
-            # "stop" even when it truncates.
+            # "stop" even for an empty answer.
             raise EmptyCompletionError(
                 f"{model} returned no content "
                 f"(finish_reason={finish_reason!r}, reasoning={len(reasoning)} chars). "
-                "Reasoning shares the response budget with the answer: shrink the chunk "
-                "(chunker.target_words) or lower reasoning_effort in the prompt. "
+                "If it reasoned at length, lower the level (`reasoning:` in the config or "
+                "reasoning_effort in the prompt) or shrink the chunk (chunker.target_words). "
                 "Raising max_tokens helps on OpenRouter but not on kiro-gateway, "
                 "which never forwards it upstream."
             )
 
+        self._warn_if_reasoned_despite_none(reasoning_effort, reasoning, model)
         self._warn_if_near_response_ceiling(text, reasoning, model)
 
-        usage = response.usage
         input_tokens = getattr(usage, "prompt_tokens", 0) or 0
         output_tokens = getattr(usage, "completion_tokens", 0) or 0
         total_tokens = getattr(usage, "total_tokens", input_tokens + output_tokens)
@@ -237,15 +306,33 @@ class OpenRouterProvider:
             raw=response.model_dump() if hasattr(response, "model_dump") else {},
         )
 
+    def _warn_if_reasoned_despite_none(
+        self, reasoning_effort: str | None, reasoning: str, model: str
+    ) -> None:
+        """Say once per model that `none` did not stop it from reasoning.
+
+        Sonnet 5.5 cannot stop: kiro-gateway drops the setting and the model runs
+        at its default level, at about twice the credits of `low` on a translation.
+        Nothing else reports this.
+        """
+        if reasoning_effort != "none" or not reasoning or model in self._warned_about_none:
+            return
+        self._warned_about_none.add(model)
+        logger.warning(
+            "%s reasoned (%d chars) despite reasoning_effort=none: it cannot switch reasoning "
+            "off, so `none` means its default level here. Set the level under `reasoning:` "
+            "in the config; `low` is the cheapest.",
+            model,
+            len(reasoning),
+        )
+
     def _warn_if_near_response_ceiling(self, text: str, reasoning: str, model: str) -> None:
         """Log a warning when a response approaches the configured size limit.
 
-        `max_response_bytes` is a cautious threshold, not the provider's exact
-        limit: a 23 644-byte response came back whole while a 26 825-byte one
-        was cut off mid-JSON, and the real limit looks to be counted in tokens
-        rather than bytes. Reasoning and answer share the budget, so both are
-        counted here. Silence means nothing on its own — the next, slightly
-        longer chunk may be the one that comes back empty.
+        `max_response_bytes` is a cautious threshold for an endpoint known to
+        cut long responses. Both reasoning and answer are counted, since a limit
+        on output may cover both. kiro-gateway once cut responses near 23 KB;
+        that no longer reproduces, so its shipped config sets no threshold.
         """
         if not self._max_response_bytes:
             return
