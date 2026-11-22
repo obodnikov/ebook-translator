@@ -31,8 +31,15 @@ from rich.table import Table
 from .cache import CLEARABLE_STAGES, STAGE_WATERFALL, Cache, stages_on_disk
 from .chunker import chunk_book
 from .config import load_config
-from .epub_io import PARAGRAPH_RULES, read_book, read_book_structured, write_translated_epub
+from .epub_io import (
+    PARAGRAPH_RULES,
+    ChapterDoc,
+    read_book,
+    read_book_structured,
+    write_translated_epub,
+)
 from .glossary import extract_glossary, save_glossary
+from .markup import restore_book_markup
 from .models import Glossary, SeriesGlossary, SeriesGlossaryEntry, Stage
 from .pipeline_helpers import (
     CHUNKER_META_KEY,
@@ -87,6 +94,21 @@ def _require_current_paragraph_rules(wd: WorkDir, *, starting: bool = False) -> 
     except ParagraphRulesMismatchError as e:
         console.print(f"[red]Error:[/red] {e}")
         raise typer.Exit(code=1) from e
+
+
+def _restore_markup(chapters: list[ChapterDoc], source_chapters: list[ChapterDoc]) -> None:
+    """Take lost markers and attributes from the source book, and say so."""
+    report = restore_book_markup(chapters, source_chapters)
+    if not report:
+        return
+    console.print(f"[dim]Markup restored from the source in {len(report)} paragraph(s):[/dim]")
+    for name, number, done in report:
+        console.print(
+            f"  {name.rsplit('/', 1)[-1]}, paragraph {number}: {', '.join(done)}",
+            markup=False,
+            highlight=False,
+            soft_wrap=True,
+        )
 
 
 def _credits_note() -> str:
@@ -673,8 +695,9 @@ def translate(
     # source text the moment translation starts. Judge, reflect and verify all
     # need the real original to compare against, so they read it from a second
     # copy of the book that nothing writes to. Re-reading costs ~0.03s.
+    source_book = read_book_structured(epub)
     source_chunk_set = chunk_book(
-        read_book_structured(epub),
+        source_book,
         target_words=cfg.chunker.target_words,
         overlap_paragraphs=cfg.chunker.overlap_paragraphs,
     )
@@ -1067,6 +1090,9 @@ def translate(
         rehydrated, _ = rehydrate_book_from_waterfall(cache, chunk_set)
         if rehydrated:
             console.print(f"[dim]Rehydrated {rehydrated} chunks from post-processing.[/dim]")
+
+    # Before the notes, which add ids of their own that the source does not have.
+    _restore_markup(book.chapters, source_book.chapters)
 
     # --- Reader notes injection (after rehydrate, before write) ---
     from .reader_notes import GlossaryLoadError, inject_notes_for_cli
@@ -3029,6 +3055,10 @@ def assemble_cmd(
                         soft_wrap=True,  # keep the command copyable on one line
                     )
             raise typer.Exit(code=1)
+
+        # Before the notes, as in translate. The trees hold the translation by now,
+        # so the source is read again.
+        _restore_markup(book.chapters, read_book_structured(epub).chapters)
 
         # --- Reader notes injection ---
         from .reader_notes import GlossaryLoadError, inject_notes_for_cli
