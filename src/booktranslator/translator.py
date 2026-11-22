@@ -5,9 +5,9 @@ Per-chunk flow:
      fragments, optional overlap).
   2. Check cache. Miss -> call provider.
   3. Check the reply before caching it: exactly N paragraphs, every one a
-     well-formed XHTML element, all of them lined up with the source. A
-     rejected fresh reply is asked for once more, with the reason appended
-     (see `replies.RETRY_NOTE`).
+     well-formed XHTML element, all of them lined up with the source and free
+     of damaged text. A rejected fresh reply is asked for once more, with the
+     reason appended (see `replies.RETRY_NOTE`).
   4. Replace the corresponding paragraph subtrees in the chapter's
      lxml tree with the translated fragments — all of them or none.
 """
@@ -28,7 +28,7 @@ from .models import SeriesGlossary
 from .prompts import Prompt, load_prompt, render_prompt
 from .provider import CompletionResult, OpenRouterProvider
 from .replies import ReplyChecker, parse_cached_paragraphs
-from .series import render_for_prompt
+from .series import render_for_prompt, translations_text
 
 logger = logging.getLogger(__name__)
 
@@ -84,6 +84,7 @@ class Translator:
             prompt_version=str(self.prompt.version),
             cache_path=getattr(cache, "path", None),
             lock=self._lock,
+            allowed=translations_text(glossary),
         )
 
     # -- prompt building ---------------------------------------------------

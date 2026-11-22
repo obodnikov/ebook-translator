@@ -224,6 +224,70 @@ class TestRepeatedText:
         check_alignment(source, reply)
 
 
+class TestAuthorsRefrain:
+    """The Faith of Beasts ch44_c01: neighbouring paragraphs end on the same sentence.
+
+    The translation repeats it because the source does. Only as much as the source
+    repeats is allowed, and never the whole of the neighbour, unless that is the source.
+    """
+
+    REFRAIN = "He heard them, but he would not leave his place on the hill."
+    RU_REFRAIN = "Он слышал их, но так и не покинул своего места на холме."
+    ELDERS = "The elders called to him with promises of comfort, wine and long feasting."
+    RU_ELDERS = "Старейшины звали его, суля ему покой, вино и долгие пиры."
+    YOUNG = "The young called to him with offers to join their games and lead their hunts."
+    RU_YOUNG = "Молодые звали его, предлагая войти в их игры и возглавить охоту."
+
+    def test_a_refrain_of_the_source_passes(self):
+        check_alignment(
+            [f"<p>{self.ELDERS} {self.REFRAIN}</p>", f"<p>{self.YOUNG} {self.REFRAIN}</p>"],
+            [
+                f"<p>{self.RU_ELDERS} {self.RU_REFRAIN}</p>",
+                f"<p>{self.RU_YOUNG} {self.RU_REFRAIN}</p>",
+            ],
+        )
+
+    def test_a_refrain_standing_as_a_paragraph_passes(self):
+        check_alignment(
+            [f"<p>{self.ELDERS} {self.REFRAIN}</p>", f"<p>{self.REFRAIN}</p>"],
+            [f"<p>{self.RU_ELDERS} {self.RU_REFRAIN}</p>", f"<p>{self.RU_REFRAIN}</p>"],
+        )
+
+    def test_a_paragraph_the_author_printed_twice_passes(self):
+        check_alignment([f"<p>{self.REFRAIN}</p>"] * 2, [f"<p>{self.RU_REFRAIN}</p>"] * 2)
+
+    def test_the_same_repeat_without_one_in_the_source_is_rejected(self):
+        with pytest.raises(ValueError, match="comes again"):
+            check_alignment(
+                [f"<p>{self.ELDERS} {self.REFRAIN}</p>", f"<p>{self.YOUNG}</p>"],
+                [
+                    f"<p>{self.RU_ELDERS} {self.RU_REFRAIN}</p>",
+                    f"<p>{self.RU_YOUNG} {self.RU_REFRAIN}</p>",
+                ],
+            )
+
+    def test_a_refrain_does_not_cover_the_whole_neighbour(self):
+        following = f"{self.RU_YOUNG} {self.RU_REFRAIN}"
+        with pytest.raises(ValueError, match="comes again"):
+            check_alignment(
+                [f"<p>{self.ELDERS} {self.REFRAIN}</p>", f"<p>{self.YOUNG} {self.REFRAIN}</p>"],
+                [f"<p>{self.RU_ELDERS} {following}</p>", f"<p>{following}</p>"],
+            )
+
+    def test_a_refrain_does_not_cover_a_sentence_that_was_added(self):
+        """Bee Speaker ch23_c01, planted: one repeat in the source, another one in the reply."""
+        short = "Perhaps we ended the world."
+        added = "И всё же уничтожить целый мир было бы большим достижением."
+        with pytest.raises(ValueError, match="comes again"):
+            check_alignment(
+                [f"<p>{short}</p>", f"<p>{self.YOUNG} {short} It is an achievement.</p>"],
+                [
+                    f"<p>Быть может, мы уничтожили мир. {added}</p>",
+                    f"<p>{self.RU_YOUNG} Быть может, мы уничтожили мир. {added}</p>",
+                ],
+            )
+
+
 def _reply(*fragments: str) -> str:
     return "\n".join(f"===PARAGRAPH {n}===\n{f}" for n, f in enumerate(fragments, start=1))
 

@@ -28,16 +28,18 @@ from rich.progress import (
 )
 from rich.table import Table
 
-from .cache import CLEARABLE_STAGES, STAGE_WATERFALL, Cache
+from .cache import CLEARABLE_STAGES, STAGE_WATERFALL, Cache, stages_on_disk
 from .chunker import chunk_book
 from .config import load_config
-from .epub_io import read_book, read_book_structured, write_translated_epub
+from .epub_io import PARAGRAPH_RULES, read_book, read_book_structured, write_translated_epub
 from .glossary import extract_glossary, save_glossary
 from .models import Glossary, SeriesGlossary, SeriesGlossaryEntry, Stage
 from .pipeline_helpers import (
     CHUNKER_META_KEY,
     ChunkerConfigMismatchError,
+    ParagraphRulesMismatchError,
     build_reflect_input,
+    check_paragraph_rules,
     collect_chunk_originals,
     collect_preferred_translations,
     collect_stage_translations,
@@ -76,6 +78,15 @@ app.add_typer(cover_app, name="cover")
 app.add_typer(cache_app, name="cache")
 
 console = Console()
+
+
+def _require_current_paragraph_rules(wd: WorkDir, *, starting: bool = False) -> None:
+    """Exit before the first write when the workdir holds text of other paragraph rules."""
+    try:
+        check_paragraph_rules(wd, starting=starting)
+    except ParagraphRulesMismatchError as e:
+        console.print(f"[red]Error:[/red] {e}")
+        raise typer.Exit(code=1) from e
 
 
 def _credits_note() -> str:
@@ -635,7 +646,10 @@ def translate(
         )
 
     wd = WorkDir.for_book(work_dir, book.meta.title)
+    _require_current_paragraph_rules(wd, starting=True)
     state = wd.load_state()
+    if "translate" not in stages_on_disk(wd.cache_path):
+        state.paragraph_rules = PARAGRAPH_RULES
     state.current_stage = Stage.TRANSLATE
     state.last_error = None
     wd.save_state(state)
@@ -744,6 +758,10 @@ def translate(
             f"[yellow]Warning:[/yellow] {stats.chunks_failed} chunks failed: {failed_ids}; "
             "the output EPUB will have those paragraphs in the original language."
         )
+    # A translation begun under earlier rules earns the mark only here, with every chunk
+    # asked under these ones: until then its old rows could still be assembled.
+    state.paragraph_rules = PARAGRAPH_RULES
+    wd.save_state(state)
 
     # ------------------------------------------------------------------
     # Judge pass
@@ -1258,6 +1276,7 @@ def judge_cmd(
     glossary = _resolve_glossary(series, glossary_path, work_dir, cfg, book)
 
     wd = WorkDir.for_book(work_dir, book.meta.title)
+    _require_current_paragraph_rules(wd)
     cache = Cache(wd.cache_path)
 
     # Get translated chunk IDs
@@ -1462,6 +1481,7 @@ def reflect_cmd(
     glossary = _resolve_glossary(series, glossary_path, work_dir, cfg, book)
 
     wd = WorkDir.for_book(work_dir, book.meta.title)
+    _require_current_paragraph_rules(wd)
     cache = Cache(wd.cache_path)
 
     # Get judge scores
@@ -1865,6 +1885,7 @@ def repair_cmd(
 
     glossary = _resolve_glossary(series, glossary_path, work_dir, cfg, book)
     wd = WorkDir.for_book(work_dir, book.meta.title)
+    _require_current_paragraph_rules(wd)
     cache = Cache(wd.cache_path)
 
     try:
@@ -2014,6 +2035,7 @@ def _run_postprocess_cmd(
     glossary = _resolve_glossary(series, glossary_path, work_dir, cfg, book)
 
     wd = WorkDir.for_book(work_dir, book.meta.title)
+    _require_current_paragraph_rules(wd)
     cache = Cache(wd.cache_path)
 
     try:
@@ -2854,6 +2876,7 @@ def assemble_cmd(
         )
         raise typer.Exit(code=1)
 
+    _require_current_paragraph_rules(WorkDir(root=work_path, slug=work_path.name))
     cache = Cache(cache_path)
     try:
         # Total unique chunks

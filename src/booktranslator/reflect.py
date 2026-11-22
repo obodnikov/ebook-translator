@@ -21,7 +21,7 @@ from .models import SeriesGlossary
 from .prompts import Prompt, load_prompt, render_prompt
 from .provider import CompletionResult, OpenRouterProvider
 from .replies import ReplyChecker, parse_cached_paragraphs
-from .series import render_for_prompt
+from .series import render_for_prompt, translations_text
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +89,7 @@ class Reflector:
             prompt_version=str(self.translate_prompt.version),
             cache_path=getattr(cache, "path", None),
             lock=self._lock,
+            allowed=translations_text(glossary),
         )
 
     def _build_reflect_context(

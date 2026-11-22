@@ -37,8 +37,8 @@ from .cache import Cache
 from .models import SeriesGlossary
 from .prompts import Prompt, load_prompt, render_prompt
 from .provider import OpenRouterProvider
-from .replies import split_markers
-from .series import render_for_prompt
+from .replies import split_markers, text_damage
+from .series import render_for_prompt, translations_text
 
 logger = logging.getLogger(__name__)
 
@@ -275,6 +275,7 @@ class Repairer:
         self.source_lang = source_lang
         self.target_lang = target_lang
         self._glossary_block = render_for_prompt(glossary) if glossary else "(no glossary provided)"
+        self._allowed = translations_text(glossary)
         self._lock = threading.Lock()
 
     # -- response parsing ---------------------------------------------------
@@ -461,6 +462,10 @@ class Repairer:
         rejected: list[tuple[Candidate, str]] = []
         for i, c in enumerate(proposal.candidates, 1):
             ok, why = verdicts.get(i, (False, "нет вердикта — считаем отказом"))
+            if ok:
+                before = paragraphs[c.paragraph - 1]
+                if damage := text_damage(before, before.replace(c.old, c.new, 1), self._allowed):
+                    ok, why = False, f"правка портит текст: {damage}"
             (accepted if ok else rejected).append((c, why))
 
         out_paragraphs = apply_candidates(paragraphs, [c for c, _ in accepted])

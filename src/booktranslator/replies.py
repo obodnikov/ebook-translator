@@ -7,6 +7,8 @@ under one marker, or the model's own commentary ("wait, I got the number
 wrong") pasted between them. It can also have N well-formed elements and a
 hole in the text: a model that split a paragraph and noticed the count was off
 keeps the count right by dropping a line of speech or the end of the chunk.
+And it can line up and still be damaged inside a paragraph: a broken character,
+a word in two alphabets, a sentence that stops in the middle (`check_text`).
 Those have to be caught before the reply is cached — once cached, every later
 run reads the same broken text back without asking the model again.
 
@@ -71,6 +73,26 @@ _MAX_JOINED_RATIO = 1.4
 # "– Хорошо, – сказал я." — recur in any novel and prove nothing.
 MIN_TELLING_SENTENCE = 40
 SENTENCE_END_RE = re.compile(r"(?<=[.!?…»])\s+")
+# A refrain of the author's is looked for in the source, where it may be shorter
+# than in its translation and end on an English closing quote.
+_MIN_REFRAIN_SENTENCE = math.floor(MIN_TELLING_SENTENCE / _MAX_LENGTH_RATIO)
+_SOURCE_SENTENCE_END_RE = re.compile(r'(?<=[.!?…»”"’])\s+')
+
+# Damage inside a paragraph, measured on some 85,000 cached paragraphs of six books,
+# all stages. A word in two alphabets was real damage in all 37 places it was found, a
+# broken character and a paragraph cut short in the one place each. A Latin capital
+# proves nothing (IT-отдел), and neither do the loanwords Russian spells in Latin (web-сайт).
+_BROKEN_CHARACTER = "\ufffd"
+_WORD_RE = re.compile(r"[^\W\d_]+(?:-[^\W\d_]+)*")
+_JOINED_ALPHABETS_RE = re.compile(r"[А-Яа-яЁё][a-z]|[a-z][А-Яа-яЁё]")
+_LATIN_COMPOUND_RE = re.compile(r"([a-z]{3,})-[а-яё]")
+_LATIN_LOANWORDS = frozenset({"web", "online", "offline", "email", "mail", "wifi", "jpeg", "pdf"})
+_CYRILLIC_RE = re.compile(r"[А-Яа-яЁё]")
+_SOURCE_PARAGRAPH_END_RE = re.compile(r"[.!?…][\"”’»)]*$")
+_REPLY_PARAGRAPH_END_RE = re.compile(r"[.!?…:;,—–»\"“”'’)\]*\d-]$")
+_MIN_CUT_SHORT_SOURCE = 60
+# Only reported, never rejected: `nia` in a Pithian line and `pro bono` look the same.
+_ENGLISH_WORD_RE = re.compile(r"(?<=[А-Яа-яЁё])[ ,]+([a-z]{3,})(?![\w./@:])")
 
 # Rebuilding an over-split reply: a source paragraph that opens with narration and
 # then speech may take two reply paragraphs, when the first is narration alone, the
@@ -232,6 +254,28 @@ def _lost_speech(source: str, reply: str) -> bool:
     return reply.endswith(":") or len(reply) < _LOST_SPEECH_RATIO * len(source)
 
 
+def _shared_sentences(text: str, following: str, end: re.Pattern[str], shortest: int) -> int:
+    """How many sentences of `text` come again in `following`."""
+    return sum(len(sentence) >= shortest and sentence in following for sentence in end.split(text))
+
+
+def _is_doubled(source: str, next_source: str, reply: str, following: str) -> bool:
+    """The reply repeats the next paragraph, and not because the author does."""
+    repeated = _shared_sentences(reply, following, SENTENCE_END_RE, MIN_TELLING_SENTENCE)
+    if not repeated:
+        return False
+    if len(reply) > _MAX_JOINED_RATIO * max(len(source), _MIN_COMPARED_CHARS):
+        return True  # longer than its own source, so something was added
+    if source == next_source and reply == following:
+        return False  # the author printed the paragraph twice
+    if following in reply and (source == next_source or next_source not in source):
+        return True  # the whole neighbour is here, and in the source it is not
+    in_source = _shared_sentences(
+        source, next_source, _SOURCE_SENTENCE_END_RE, _MIN_REFRAIN_SENTENCE
+    )
+    return repeated > in_source
+
+
 def check_alignment(source_fragments: list[str], reply_fragments: list[str]) -> None:
     """Raise ValueError when paragraphs no longer match their source paragraphs.
 
@@ -256,11 +300,10 @@ def check_alignment(source_fragments: list[str], reply_fragments: list[str]) -> 
         )
     repeats = [
         number
-        for number, ((_, reply), (_, following)) in enumerate(pairwise(pairs), start=1)
-        if any(
-            len(sentence) >= MIN_TELLING_SENTENCE and sentence in following
-            for sentence in SENTENCE_END_RE.split(reply)
+        for number, ((source, reply), (next_source, following)) in enumerate(
+            pairwise(pairs), start=1
         )
+        if _is_doubled(source, next_source, reply, following)
     ]
     if repeats:
         raise ValueError(
@@ -277,6 +320,71 @@ def check_alignment(source_fragments: list[str], reply_fragments: list[str]) -> 
             f"{_numbered(lost)} of {total}: the source has direct speech here and the "
             f"translation left it out. First: {pairs[lost[0] - 1][1][:80]!r}"
         )
+
+
+def _spaced_text(fragment: str) -> str:
+    """The text with a space for every tag, so that `слово<br/>word` is two words."""
+    return " ".join(_TAG_RE.sub(" ", fragment).split())
+
+
+def _is_two_alphabets(word: str) -> bool:
+    compound = _LATIN_COMPOUND_RE.match(word)
+    if compound and compound[1] not in _LATIN_LOANWORDS:
+        return True
+    return bool(_JOINED_ALPHABETS_RE.search(word))
+
+
+def text_damage(source: str, reply: str, allowed: str = "") -> str | None:
+    """What is damaged in one paragraph, or None.
+
+    `source` is what the paragraph was made from: the original for a translation,
+    the paragraph before the edit for a patch. What is already there is not this
+    reply's damage, nor is a word the glossary prescribes (`allowed`): rejecting
+    that would fail every chunk with the term, on both asks.
+    """
+    if _BROKEN_CHARACTER in reply and _BROKEN_CHARACTER not in source:
+        at = reply.index(_BROKEN_CHARACTER)
+        return f"a broken character at {reply[max(at - 20, 0) : at + 20]!r}"
+    known = {*_WORD_RE.findall(_spaced_text(source)), *_WORD_RE.findall(allowed)}
+    for word in _WORD_RE.findall(_spaced_text(reply)):
+        if _is_two_alphabets(word) and word not in known:
+            return f"{word!r} is one word in two alphabets"
+    before, after = _visible_text(source), _visible_text(reply)
+    if (
+        len(before) >= _MIN_CUT_SHORT_SOURCE
+        and len(after) < _MIN_LENGTH_RATIO * len(before)
+        and _CYRILLIC_RE.search(after)
+        and _SOURCE_PARAGRAPH_END_RE.search(before)
+        and not _REPLY_PARAGRAPH_END_RE.search(after)
+    ):
+        return f"the paragraph is cut short at {after[-40:]!r}"
+    return None
+
+
+def check_text(source_fragments: list[str], reply_fragments: list[str], allowed: str = "") -> None:
+    """Raise ValueError when the text inside a paragraph is damaged."""
+    damaged = [
+        (number, damage)
+        for number, (source, reply) in enumerate(
+            zip(source_fragments, reply_fragments, strict=True), start=1
+        )
+        if (damage := text_damage(source, reply, allowed))
+    ]
+    if damaged:
+        numbers = _numbered([number for number, _ in damaged])
+        raise ValueError(
+            f"{numbers} of {len(reply_fragments)}: damaged text, {damaged[0][1]}. "
+            "Write each word in one alphabet and each paragraph to its end."
+        )
+
+
+def untranslated_words(fragment: str) -> list[str]:
+    """Lower-case Latin words in the middle of Russian text, for a person to look at."""
+    return [
+        word
+        for word in _ENGLISH_WORD_RE.findall(_spaced_text(fragment))
+        if word not in _LATIN_LOANWORDS
+    ]
 
 
 def _append_text(element: etree._Element, text: str) -> None:
@@ -519,7 +627,9 @@ class ReplyChecker:
         prompt_version: str,
         cache_path: Path | None,
         lock: threading.Lock,
+        allowed: str = "",
     ):
+        self.allowed = allowed
         self.stage = stage
         self.model = model
         self.prompt_version = prompt_version
@@ -571,7 +681,19 @@ class ReplyChecker:
         text, rebuilt = rebuild_over_split_reply(text, source)
         text, joined = join_split_paragraphs(text, source)
         elements = parse_paragraphs(text, len(source))
-        check_alignment(source, split_paragraphs(text, len(source)))
+        fragments = split_paragraphs(text, len(source))
+        check_alignment(source, fragments)
+        check_text(source, fragments, self.allowed)
+        for number, fragment in enumerate(fragments, start=1):
+            if words := untranslated_words(fragment):
+                logger.warning(
+                    "%s chunk %s: paragraph %d has Latin words in Russian text (%s). "
+                    "Kept as it is: check that they are meant.",
+                    self.stage,
+                    chunk_id,
+                    number,
+                    ", ".join(words),
+                )
         if rebuilt:
             logger.warning(
                 "%s chunk %s: %s came back split over two markers and rebuilt into one element.",

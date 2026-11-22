@@ -302,6 +302,9 @@ class PipelineState(BaseModel):
     completed_stages: list[Stage] = Field(default_factory=list)
     total_cost_usd: float = 0.0
     last_error: str | None = None
+    # `epub_io.PARAGRAPH_RULES` the book's translation was started under.
+    # None: before the rules had versions.
+    paragraph_rules: int | None = None
 
 
 # ---------------------------------------------------------------------------

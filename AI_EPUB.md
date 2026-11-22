@@ -29,6 +29,21 @@ source EPUB as immutable reference data:
 - **Never reorder or rename** spine items, manifest entries, or asset paths. New bytes (translated
   cover) go into a *new* output EPUB; the source file is never mutated in place.
 
+## What counts as a paragraph (`_find_paragraphs`)
+
+- **Units never nest.** A wrapper whose text is all inside its paragraphs (the usual
+  `<blockquote><p>…`) gives those paragraphs; one with text of its own is a single unit, paragraphs
+  and all. A unit inside another is sent to the model twice, and its own translation is spliced
+  into an element that replacing the outer one already detached: A Drop of Corruption lost every
+  later edit inside its quotes that way, silently.
+- **Text counts however deep it is** (`<p><em><span>T</span>he…`). Only text found deep down is
+  filtered, for the watermark, bare addresses and numbers without letters. Don't apply that filter
+  to direct text: it would move the paragraph positions of every book.
+- **A change to which elements are listed bumps `PARAGRAPH_RULES`.** Cached text fits a book by
+  position, and a shifted chunk can keep its count (Shroud ch11_c02, 23 paragraphs both ways), so
+  no count check catches it. Measure on the source books first: how many chunks change, and that
+  no text drops out.
+
 ## XML / entity hygiene
 
 - The translation round-trips through JSON and Jinja2, so XML special characters (`&`, `<`, `>`)

@@ -24,6 +24,18 @@ See [ARCHITECTURE.md §3, §5, §9](ARCHITECTURE.md); this file is the coding co
   The one repair of a mismatch, `replies.rebuild_over_split_reply`, is described under "Errors &
   resilience"; don't widen it.
 
+## Paragraph rules of a workdir
+
+- `state.json` records the `epub_io.PARAGRAPH_RULES` its translation was made under. Every command
+  that fits cached text to the book (translate, judge, reflect, proofread, style, verify, repair,
+  assemble) calls `pipeline_helpers.check_paragraph_rules` **before its first write**, opening a
+  `Cache` included: a refused workdir stays byte for byte as it was. A new command of that kind
+  calls it too.
+- A finished workdir of other rules, or one with rows of later stages, is refused. Don't add a
+  compatibility mode with the old rules: books already translated are not changed. An unfinished
+  one with translations only may go on through `translate`, and earns the mark only when that
+  stage is through, since until then its old rows could be assembled under the new positions.
+
 ## Cache (`cache.py`) — keys and the waterfall
 
 - The cache is SQLite keyed by `sha256(chunk_text + model + prompt_version + glossary_hash +
@@ -115,11 +127,22 @@ See [ARCHITECTURE.md §3, §5, §9](ARCHITECTURE.md); this file is the coding co
   safeguard: it runs after the row is cached, and it missed one of the eight such chunks in The
   Tainted Cup. The alignment limits are measured (see the comment in `replies.py`), so measure again
   on real caches before moving them.
+  A repeat is the author's only as far as the source repeats, in a paragraph no longer than its
+  source, and never the whole neighbour unless the source has that too (The Faith of Beasts
+  ch44_c01 ends neighbouring paragraphs on one sentence). Keep all three conditions: each was
+  needed to keep every planted repeat that was caught before.
   A rejected **fresh** reply is asked for once more with the reason appended
   (`replies.RETRY_NOTE`, in code so no prompt version changes), naming every bad paragraph, within
   the run's `replies.retry_budget`. A cached reply that fails is reported with the
   `btrans cache clear` command that removes it — never re-bought. The alignment check applies to
   fresh replies only.
+- `replies.check_text` looks inside each paragraph of a fresh reply and rejects a broken character,
+  a word in two alphabets and a paragraph cut short; post-processing and repair drop an edit that
+  brings one in (`replies.text_damage`, against the paragraph before the edit). What the source or
+  the glossary already holds is never damage: rejecting a prescribed term would fail every chunk
+  that has it. An English word in Russian text is **only logged** (`untranslated_words`): `nia` in
+  a Pithian line and `pro bono` look the same, and a rejection there stops a book for nothing.
+  Measure false alarms on real caches before adding a rule that rejects.
 - A reply has two repairs, both for a paragraph the model split, and nothing else is repaired.
   They exist because the text is all there and a re-ask costs a whole chunk; the re-ask is also the
   worse answer, since a model told "exactly N" keeps splitting and stops at marker N. Keep them
