@@ -21,7 +21,7 @@ from .models import SeriesGlossary
 from .prompts import Prompt, load_prompt, render_prompt
 from .provider import CompletionResult, OpenRouterProvider
 from .replies import ReplyChecker, parse_cached_paragraphs
-from .series import render_for_prompt
+from .series import render_for_prompt, translations_text
 
 logger = logging.getLogger(__name__)
 
@@ -70,10 +70,11 @@ class Reflector:
         model: str,
         source_lang: str = "en",
         target_lang: str = "ru",
+        reasoning_effort: str | None = None,
     ):
         self.provider = provider
-        self.reflect_prompt: Prompt = load_prompt(reflect_prompt_path)
-        self.translate_prompt: Prompt = load_prompt(translate_prompt_path)
+        self.reflect_prompt: Prompt = load_prompt(reflect_prompt_path, reasoning_effort)
+        self.translate_prompt: Prompt = load_prompt(translate_prompt_path, reasoning_effort)
         self.cache = cache
         self.glossary = glossary
         self.model = model
@@ -88,6 +89,7 @@ class Reflector:
             prompt_version=str(self.translate_prompt.version),
             cache_path=getattr(cache, "path", None),
             lock=self._lock,
+            allowed=translations_text(glossary),
         )
 
     def _build_reflect_context(
@@ -224,13 +226,14 @@ class Reflector:
             return cached.content
 
         # Validate BEFORE caching, like translate: this reply competes in the
-        # waterfall, so it must hold the paragraph count and parse as XHTML.
+        # waterfall, so it must hold the paragraph count, parse as XHTML and line
+        # up with the source.
         reply = self._checker.ask(
             self._complete_retranslate,
             system,
             user,
             chunk_id=chunk_id,
-            expected=expected,
+            source=original_paragraphs,
             stats=stats,
         )
         with self._lock:
@@ -242,7 +245,7 @@ class Reflector:
                 content=reply.text,
                 input_tokens=reply.input_tokens,
                 output_tokens=reply.output_tokens,
-                meta={"chunk_id": chunk_id},
+                meta=reply.meta(chunk_id),
             )
             stats.chunks_reflected += 1
 

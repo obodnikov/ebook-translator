@@ -5,8 +5,9 @@ Per-chunk flow:
      fragments, optional overlap).
   2. Check cache. Miss -> call provider.
   3. Check the reply before caching it: exactly N paragraphs, every one a
-     well-formed XHTML element. A rejected fresh reply is asked for once
-     more, with the reason appended (see `replies.RETRY_NOTE`).
+     well-formed XHTML element, all of them lined up with the source and free
+     of damaged text. A rejected fresh reply is asked for once more, with the
+     reason appended (see `replies.RETRY_NOTE`).
   4. Replace the corresponding paragraph subtrees in the chapter's
      lxml tree with the translated fragments — all of them or none.
 """
@@ -16,7 +17,7 @@ from __future__ import annotations
 import logging
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from lxml import etree
@@ -27,7 +28,7 @@ from .models import SeriesGlossary
 from .prompts import Prompt, load_prompt, render_prompt
 from .provider import CompletionResult, OpenRouterProvider
 from .replies import ReplyChecker, parse_cached_paragraphs
-from .series import render_for_prompt
+from .series import render_for_prompt, translations_text
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +46,7 @@ class TranslateStats:
     chunks_cached: int = 0
     chunks_translated: int = 0
     chunks_failed: int = 0
+    failed_chunk_ids: list[str] = field(default_factory=list)
     retries: int = 0
     input_tokens: int = 0
     output_tokens: int = 0
@@ -61,9 +63,10 @@ class Translator:
         model: str,
         source_lang: str = "en",
         target_lang: str = "ru",
+        reasoning_effort: str | None = None,
     ):
         self.provider = provider
-        self.prompt: Prompt = load_prompt(prompt_path)
+        self.prompt: Prompt = load_prompt(prompt_path, reasoning_effort)
         self.cache = cache
         self.glossary = glossary
         self.model = model
@@ -81,6 +84,7 @@ class Translator:
             prompt_version=str(self.prompt.version),
             cache_path=getattr(cache, "path", None),
             lock=self._lock,
+            allowed=translations_text(glossary),
         )
 
     # -- prompt building ---------------------------------------------------
@@ -117,16 +121,15 @@ class Translator:
             max_tokens=self.prompt.max_tokens,
             reasoning_effort=self.prompt.reasoning_effort,
         )
-        # Guard: empty content means the provider routed the answer
-        # elsewhere (tool call / reasoning_content) — e.g. kiro-gateway with
-        # web_search or fake reasoning enabled. Raise BEFORE caching so a
-        # poisoned empty response is never written to the cache.
+        # Guard: empty content can mean the provider returned a tool call
+        # instead, e.g. kiro-gateway with web_search enabled. Raise BEFORE
+        # caching so a poisoned empty response is never written to the cache.
         if not result.text.strip():
             raise ValueError(
                 "Model returned empty content "
                 f"(finish_reason={result.finish_reason!r}). The provider may have "
-                "returned a tool call or put the answer in reasoning_content — "
-                "check WEB_SEARCH_ENABLED / FAKE_REASONING on the gateway."
+                "returned a tool call — check WEB_SEARCH_ENABLED / FAKE_REASONING "
+                "on the gateway."
             )
         return result
 
@@ -184,10 +187,16 @@ class Translator:
             with self._lock:
                 stats.chunks_cached += 1
         else:
-            # Validate BEFORE caching: paragraph count and every paragraph
-            # well-formed (AI_PIPELINE.md). A rejected reply is never cached.
+            # Validate BEFORE caching: paragraph count, every paragraph well-formed
+            # and lined up with its source (AI_PIPELINE.md). A rejected reply is
+            # never cached.
             reply = self._checker.ask(
-                self._complete, system, user, chunk_id=chunk.id, expected=expected, stats=stats
+                self._complete,
+                system,
+                user,
+                chunk_id=chunk.id,
+                source=context["main_fragments"],
+                stats=stats,
             )
             elements = reply.elements
             with self._lock:
@@ -199,7 +208,7 @@ class Translator:
                     content=reply.text,
                     input_tokens=reply.input_tokens,
                     output_tokens=reply.output_tokens,
-                    meta={"chunk_id": chunk.id},
+                    meta=reply.meta(chunk.id),
                 )
                 stats.chunks_translated += 1
 
@@ -212,6 +221,7 @@ class Translator:
         # asking it for originals returns the translation. Any stage that
         # compares against the source (judge, reflect, verify) must read from a
         # separately built ChunkSet; see `source_chunk_set` in cli.translate.
+        # Overlap is the exception: `ChunkSet` keeps it as source text.
         with self._lock:
             chapter = chunk_set.book.chapters[chunk.chapter_index]
             for para_idx, new_el in zip(chunk.paragraph_indexes, elements, strict=True):
@@ -236,6 +246,7 @@ class Translator:
                     self.translate_chunk(chunk_set, chunk, stats)
                 except Exception as e:
                     stats.chunks_failed += 1
+                    stats.failed_chunk_ids.append(chunk.id)
                     logger.warning("Chunk %s failed: %s", chunk.id, e)
                 if on_progress:
                     on_progress(i + 1, total, chunk, stats)
@@ -256,6 +267,7 @@ class Translator:
                 if err is not None:
                     with self._lock:
                         stats.chunks_failed += 1
+                        stats.failed_chunk_ids.append(chunk.id)
                     logger.warning("Chunk %s failed: %s", chunk.id, err)
                 done_count += 1
                 if on_progress:

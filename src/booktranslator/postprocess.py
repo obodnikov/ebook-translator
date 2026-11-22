@@ -31,8 +31,14 @@ from .cache import Cache
 from .models import SeriesGlossary
 from .prompts import Prompt, load_prompt, render_prompt
 from .provider import CompletionResult, OpenRouterProvider
-from .replies import parse_fragment
-from .series import render_for_prompt
+from .replies import (
+    MIN_TELLING_SENTENCE,
+    SENTENCE_END_RE,
+    parse_fragment,
+    text_damage,
+    untranslated_words,
+)
+from .series import render_for_prompt, translations_text
 
 logger = logging.getLogger(__name__)
 
@@ -115,12 +121,7 @@ def _breaks_dialogue_dash(before: str, after: str) -> bool:
     return bool(_OPENS_WITH_DASH.match(before)) and bool(_OPENS_WITH_GUILLEMET.match(after))
 
 
-# A sentence has to be at least this long before finding it inside another
-# paragraph's patch means the paragraphs were mixed up. Short lines — "Да.",
-# "– Хорошо, – сказал я." — recur in any novel and prove nothing.
-_MIN_BORROWED_SENTENCE = 40
 _TAG_RE = re.compile(r"<[^>]+>")
-_SENTENCE_END_RE = re.compile(r"(?<=[.!?…»])\s+")
 
 
 def _plain_text(fragment: str) -> str:
@@ -141,12 +142,8 @@ def _borrowed_paragraph(idx: int, new_text: str, paragraphs: list[str]) -> int |
     for other, paragraph in enumerate(paragraphs):
         if other == idx:
             continue
-        for sentence in _SENTENCE_END_RE.split(_plain_text(paragraph)):
-            if (
-                len(sentence) >= _MIN_BORROWED_SENTENCE
-                and sentence in patch
-                and sentence not in own
-            ):
+        for sentence in SENTENCE_END_RE.split(_plain_text(paragraph)):
+            if len(sentence) >= MIN_TELLING_SENTENCE and sentence in patch and sentence not in own:
                 return other + 1
     return None
 
@@ -210,9 +207,10 @@ class PostProcessor:
         model: str,
         source_lang: str = "en",
         target_lang: str = "ru",
+        reasoning_effort: str | None = None,
     ):
         self.provider = provider
-        self.prompt: Prompt = load_prompt(prompt_path)
+        self.prompt: Prompt = load_prompt(prompt_path, reasoning_effort)
         self.cache = cache
         self.glossary = glossary
         self.stage: PostprocessStage = stage
@@ -221,6 +219,7 @@ class PostProcessor:
         self.target_lang = target_lang
 
         self._glossary_block = render_for_prompt(glossary) if glossary else "(no glossary provided)"
+        self._allowed = translations_text(glossary)
         self._lock = threading.Lock()
         self._retry_budget_warned = False
 
@@ -408,9 +407,34 @@ class PostProcessor:
                     borrowed,
                 )
                 continue
+            if self._damages(p_idx, input_paragraphs[idx], new_text):
+                continue
             output[idx] = new_text
 
         return output, output != list(input_paragraphs)
+
+    def _damages(self, number: int, before: str, after: str) -> bool:
+        """True, and logged, when an edit damages the text of its paragraph.
+
+        An English word the edit brought in is reported and no more: it can be meant.
+        """
+        if damage := text_damage(before, after, self._allowed):
+            logger.warning(
+                "%s: patch for paragraph %s damages the text (%s) — keeping the original paragraph",
+                self.stage,
+                number,
+                damage,
+            )
+            return True
+        if words := set(untranslated_words(after)) - set(untranslated_words(before)):
+            logger.warning(
+                "%s: patch for paragraph %s brings Latin words into Russian text (%s) — "
+                "applied, check that they are meant",
+                self.stage,
+                number,
+                ", ".join(sorted(words)),
+            )
+        return False
 
     def _is_delta_response(self, text: str) -> bool:
         """Heuristic: does this response look like delta format?
@@ -713,6 +737,17 @@ class PostProcessor:
         else:
             # Legacy full-text format: parse paragraph markers
             _fragments = self._parse_response(raw_text, expected)
+            if cached is None:
+                # A fresh answer only: a cached row was paid for and stands as it is.
+                kept = [
+                    before if after != before and self._damages(number, before, after) else after
+                    for number, (before, after) in enumerate(
+                        zip(translated_paragraphs, _fragments, strict=True), start=1
+                    )
+                ]
+                if kept != _fragments:
+                    _fragments = kept
+                    raw_text = self._reconstruct_full_text(kept)
             output_paragraphs = _fragments
 
             # Determine if content changed

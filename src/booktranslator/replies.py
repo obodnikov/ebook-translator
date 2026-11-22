@@ -4,18 +4,30 @@ Translate and reflect both ask a model for N paragraphs, each an XHTML
 element that gets spliced into the book. A reply can carry the right number
 of markers and still be unusable: a paragraph missing its `</p>`, two `<p>`
 under one marker, or the model's own commentary ("wait, I got the number
-wrong") pasted between them. Those have to be caught before the reply is
-cached — once cached, every later run reads the same broken text back
-without asking the model again.
+wrong") pasted between them. It can also have N well-formed elements and a
+hole in the text: a model that split a paragraph and noticed the count was off
+keeps the count right by dropping a line of speech or the end of the chunk.
+And it can line up and still be damaged inside a paragraph: a broken character,
+a word in two alphabets, a sentence that stops in the middle (`check_text`).
+Those have to be caught before the reply is cached — once cached, every later
+run reads the same broken text back without asking the model again.
+
+Two things are repaired instead of rejected, because all the text is there and
+a re-ask costs a whole chunk: a paragraph split under its one marker
+(`join_split_paragraphs`) and a paragraph split over two markers
+(`rebuild_over_split_reply`). Nothing else is, and both results go through every
+check above.
 """
 
 from __future__ import annotations
 
 import logging
+import math
 import re
 import threading
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from itertools import pairwise
 from pathlib import Path
 from typing import Protocol
 
@@ -32,6 +44,67 @@ PARAGRAPH_MARKER_RE = re.compile(r"^===PARAGRAPH\s+(\d+)===\s*$", re.MULTILINE)
 # Used to fix stray ampersands in LLM output like "M&S", "AT&T".
 _BARE_AMPERSAND_RE = re.compile(r"&(?!(?:amp|lt|gt|quot|apos|#\d+|#x[0-9a-fA-F]+);)")
 
+_EPUB_NS = "http://www.idpf.org/2007/ops"
+_EPUB_ATTRIBUTE_RE = re.compile(r"\sepub:[\w-]+\s*=")
+_FIRST_TAG_RE = re.compile(r"^\s*<[A-Za-z][\w.-]*")
+
+_TAG_RE = re.compile(r"<[^>]+>")
+# How direct speech shows in the source, and in a translation of it.
+_SOURCE_SPEECH_RE = re.compile(r'[“"‘]')
+_REPLY_SPEECH_RE = re.compile(r'[—–―«»„“”"]')
+
+# A paragraph and its translation run about as long as each other: the median
+# chunk came out at 0.97-1.01 of the source on five books. The limits below were
+# measured on those books: they flag the 8 chunks of The Tainted Cup that really
+# lost text, and none of the 468 chunks of Bear Head, Bee Speaker, Shroud and
+# Foxglove Summer. Measure again on real caches before changing them. A false
+# alarm is a paid re-ask, a miss is a hole in the book.
+_MIN_COMPARED_CHARS = 30  # shorter lines vary too much to say anything
+_MIN_LENGTH_RATIO = 0.55
+_MAX_LENGTH_RATIO = 1.8
+_MAX_OFF_PARAGRAPHS = 2  # a translator may be free with a paragraph or two
+_LOST_SPEECH_RATIO = 0.6
+# Real splits joined back came to 0.82-1.27 of their source paragraph. The one
+# false shape seen, The Tainted Cup ch52_c02, came to 1.83: under one marker the
+# model wrote that paragraph and the next one, then the next one again.
+_MAX_JOINED_RATIO = 1.4
+# A sentence has to be at least this long before finding it inside another
+# paragraph means the paragraphs were mixed up. Short lines — "Да.",
+# "– Хорошо, – сказал я." — recur in any novel and prove nothing.
+MIN_TELLING_SENTENCE = 40
+SENTENCE_END_RE = re.compile(r"(?<=[.!?…»])\s+")
+# A refrain of the author's is looked for in the source, where it may be shorter
+# than in its translation and end on an English closing quote.
+_MIN_REFRAIN_SENTENCE = math.floor(MIN_TELLING_SENTENCE / _MAX_LENGTH_RATIO)
+_SOURCE_SENTENCE_END_RE = re.compile(r'(?<=[.!?…»”"’])\s+')
+
+# Damage inside a paragraph, measured on some 85,000 cached paragraphs of six books,
+# all stages. A word in two alphabets was real damage in all 37 places it was found, a
+# broken character and a paragraph cut short in the one place each. A Latin capital
+# proves nothing (IT-отдел), and neither do the loanwords Russian spells in Latin (web-сайт).
+_BROKEN_CHARACTER = "\ufffd"
+_WORD_RE = re.compile(r"[^\W\d_]+(?:-[^\W\d_]+)*")
+_JOINED_ALPHABETS_RE = re.compile(r"[А-Яа-яЁё][a-z]|[a-z][А-Яа-яЁё]")
+_LATIN_COMPOUND_RE = re.compile(r"([a-z]{3,})-[а-яё]")
+_LATIN_LOANWORDS = frozenset({"web", "online", "offline", "email", "mail", "wifi", "jpeg", "pdf"})
+_CYRILLIC_RE = re.compile(r"[А-Яа-яЁё]")
+_SOURCE_PARAGRAPH_END_RE = re.compile(r"[.!?…][\"”’»)]*$")
+_REPLY_PARAGRAPH_END_RE = re.compile(r"[.!?…:;,—–»\"“”'’)\]*\d-]$")
+_MIN_CUT_SHORT_SOURCE = 60
+# Only reported, never rejected: `nia` in a Pithian line and `pro bono` look the same.
+_ENGLISH_WORD_RE = re.compile(r"(?<=[А-Яа-яЁё])[ ,]+([a-z]{3,})(?![\w./@:])")
+
+# Rebuilding an over-split reply: a source paragraph that opens with narration and
+# then speech may take two reply paragraphs, when the first is narration alone, the
+# second opens as speech, and each is about as long as the same part of the source
+# (a ratio below e^0.75, about twice, either way). Nothing else. Measured on The
+# Tainted Cup: 235 of 235 good translations split at random came back exactly, and
+# with a looser rule that compared only the whole paragraph, 52% did.
+_NARRATION_THEN_SPEECH_RE = re.compile(r'^([^“"‘]{3,}?)\s*([“"‘].*)$', re.DOTALL)
+_OPENS_AS_SPEECH_RE = re.compile(r'^[—–―«„“"]')
+_MAX_PART_MISMATCH = 0.75
+_SPLIT_PENALTY = 1.0
+
 # Appended to the user message when a reply is rejected. Kept in code, not in
 # the prompt file: it is only ever sent on the second ask, so the prompt
 # version — and every cached result under it — stays untouched.
@@ -43,8 +116,11 @@ RETRY_NOTE = """
 
 Answer again for the same paragraphs. Output exactly {expected} `===PARAGRAPH N===`
 markers, numbered 1 to {expected}, each followed by exactly ONE well-formed XHTML
-element with every tag closed. No commentary, no corrections, nothing before,
-between or after the paragraphs."""
+element with every tag closed. Each source paragraph is translated in full under its
+own marker, in the order of the source: narration and speech stay together in one
+element, you never drop a line to make the count fit, and marker {expected} holds the
+last source paragraph, never an earlier one. No commentary, no corrections, nothing
+before, between or after the paragraphs."""
 
 # Retries are full-price calls, so a run gets a small budget: enough to absorb
 # the odd bad reply, not enough to pay twice for a whole stage.
@@ -65,6 +141,19 @@ def escape_bare_ampersands(fragment: str) -> str:
     instruction is easy to miss on a long chunk.
     """
     return _BARE_AMPERSAND_RE.sub("&amp;", fragment)
+
+
+def declare_epub_prefix(fragment: str) -> str:
+    """Add `xmlns:epub` when a model kept an `epub:` attribute and lost its declaration.
+
+    A page-break marker comes with the declaration on its paragraph, and now and then a
+    model copies the marker without it. The text is fine and lxml refuses the whole
+    fragment, so as with a bare `&`, this is fixed here rather than paid for again.
+    """
+    if "xmlns:epub" in fragment or not _EPUB_ATTRIBUTE_RE.search(fragment):
+        return fragment
+    declaration = f' xmlns:epub="{_EPUB_NS}"'
+    return _FIRST_TAG_RE.sub(lambda tag: tag.group(0) + declaration, fragment, count=1)
 
 
 def _strip_code_fence(text: str) -> str:
@@ -109,7 +198,7 @@ def split_paragraphs(text: str, expected_n: int) -> list[str]:
 
 def parse_fragment(fragment: str) -> etree._Element:
     """Parse one translated paragraph into an lxml element, or raise ValueError."""
-    fragment = escape_bare_ampersands(fragment)
+    fragment = declare_epub_prefix(escape_bare_ampersands(fragment))
     try:
         return etree.fromstring(fragment)
     except etree.XMLSyntaxError as e:
@@ -118,18 +207,354 @@ def parse_fragment(fragment: str) -> etree._Element:
         ) from e
 
 
+def _numbered(numbers: list[int]) -> str:
+    label = "Paragraph" if len(numbers) == 1 else "Paragraphs"
+    return f"{label} {', '.join(map(str, numbers))}"
+
+
 def parse_paragraphs(text: str, expected_n: int) -> list[etree._Element]:
     """Split a reply and parse every paragraph; all of them or ValueError.
 
-    The error names the paragraph, so the log says where the reply broke.
+    The error names every broken paragraph, numbers first: it goes into the second
+    ask cut to `RETRY_NOTE`'s limit, and a model told of only the first one leaves
+    the others as they were.
     """
     elements: list[etree._Element] = []
+    broken: list[tuple[int, ValueError]] = []
     for number, fragment in enumerate(split_paragraphs(text, expected_n), start=1):
         try:
             elements.append(parse_fragment(fragment))
         except ValueError as e:
-            raise ValueError(f"Paragraph {number} of {expected_n}: {e}") from e
+            broken.append((number, e))
+    if broken:
+        numbers = _numbered([number for number, _ in broken])
+        first_error = broken[0][1]
+        if len(broken) == 1:
+            raise ValueError(f"{numbers} of {expected_n}: {first_error}") from first_error
+        raise ValueError(f"{numbers} of {expected_n} are broken. First: {first_error}") from (
+            first_error
+        )
     return elements
+
+
+def _visible_text(fragment: str) -> str:
+    return " ".join(_TAG_RE.sub("", fragment).split())
+
+
+def _with_markers(fragments: list[str]) -> str:
+    return "\n".join(
+        f"===PARAGRAPH {number}===\n{fragment}" for number, fragment in enumerate(fragments, 1)
+    )
+
+
+def _lost_speech(source: str, reply: str) -> bool:
+    """The source paragraph has direct speech; its translation is narration alone."""
+    if not _SOURCE_SPEECH_RE.search(source) or _REPLY_SPEECH_RE.search(reply):
+        return False
+    return reply.endswith(":") or len(reply) < _LOST_SPEECH_RATIO * len(source)
+
+
+def _shared_sentences(text: str, following: str, end: re.Pattern[str], shortest: int) -> int:
+    """How many sentences of `text` come again in `following`."""
+    return sum(len(sentence) >= shortest and sentence in following for sentence in end.split(text))
+
+
+def _is_doubled(source: str, next_source: str, reply: str, following: str) -> bool:
+    """The reply repeats the next paragraph, and not because the author does."""
+    repeated = _shared_sentences(reply, following, SENTENCE_END_RE, MIN_TELLING_SENTENCE)
+    if not repeated:
+        return False
+    if len(reply) > _MAX_JOINED_RATIO * max(len(source), _MIN_COMPARED_CHARS):
+        return True  # longer than its own source, so something was added
+    if source == next_source and reply == following:
+        return False  # the author printed the paragraph twice
+    if following in reply and (source == next_source or next_source not in source):
+        return True  # the whole neighbour is here, and in the source it is not
+    in_source = _shared_sentences(
+        source, next_source, _SOURCE_SENTENCE_END_RE, _MIN_REFRAIN_SENTENCE
+    )
+    return repeated > in_source
+
+
+def check_alignment(source_fragments: list[str], reply_fragments: list[str]) -> None:
+    """Raise ValueError when paragraphs no longer match their source paragraphs.
+
+    Both lists have the same length: this looks for what the count cannot see, a
+    reply whose paragraphs moved down the source or lost part of their text.
+    """
+    pairs = [
+        (_visible_text(source), _visible_text(reply))
+        for source, reply in zip(source_fragments, reply_fragments, strict=True)
+    ]
+    total = len(pairs)
+    off = [
+        number
+        for number, (source, reply) in enumerate(pairs, start=1)
+        if len(source) >= _MIN_COMPARED_CHARS
+        and not _MIN_LENGTH_RATIO <= len(reply) / len(source) <= _MAX_LENGTH_RATIO
+    ]
+    if len(off) > _MAX_OFF_PARAGRAPHS:
+        raise ValueError(
+            f"{_numbered(off)} of {total} are far from their source paragraph in length: "
+            "the paragraphs no longer line up, so text was moved or dropped."
+        )
+    repeats = [
+        number
+        for number, ((source, reply), (next_source, following)) in enumerate(
+            pairwise(pairs), start=1
+        )
+        if _is_doubled(source, next_source, reply, following)
+    ]
+    if repeats:
+        raise ValueError(
+            f"{_numbered(repeats)} of {total}: a sentence here comes again in the next "
+            "paragraph, so a paragraph holds the translation of its neighbour as well."
+        )
+    lost = [
+        number
+        for number, (source, reply) in enumerate(pairs, start=1)
+        if _lost_speech(source, reply)
+    ]
+    if lost:
+        raise ValueError(
+            f"{_numbered(lost)} of {total}: the source has direct speech here and the "
+            f"translation left it out. First: {pairs[lost[0] - 1][1][:80]!r}"
+        )
+
+
+def _spaced_text(fragment: str) -> str:
+    """The text with a space for every tag, so that `слово<br/>word` is two words."""
+    return " ".join(_TAG_RE.sub(" ", fragment).split())
+
+
+def _is_two_alphabets(word: str) -> bool:
+    compound = _LATIN_COMPOUND_RE.match(word)
+    if compound and compound[1] not in _LATIN_LOANWORDS:
+        return True
+    return bool(_JOINED_ALPHABETS_RE.search(word))
+
+
+def text_damage(source: str, reply: str, allowed: str = "") -> str | None:
+    """What is damaged in one paragraph, or None.
+
+    `source` is what the paragraph was made from: the original for a translation,
+    the paragraph before the edit for a patch. What is already there is not this
+    reply's damage, nor is a word the glossary prescribes (`allowed`): rejecting
+    that would fail every chunk with the term, on both asks.
+    """
+    if _BROKEN_CHARACTER in reply and _BROKEN_CHARACTER not in source:
+        at = reply.index(_BROKEN_CHARACTER)
+        return f"a broken character at {reply[max(at - 20, 0) : at + 20]!r}"
+    known = {*_WORD_RE.findall(_spaced_text(source)), *_WORD_RE.findall(allowed)}
+    for word in _WORD_RE.findall(_spaced_text(reply)):
+        if _is_two_alphabets(word) and word not in known:
+            return f"{word!r} is one word in two alphabets"
+    before, after = _visible_text(source), _visible_text(reply)
+    if (
+        len(before) >= _MIN_CUT_SHORT_SOURCE
+        and len(after) < _MIN_LENGTH_RATIO * len(before)
+        and _CYRILLIC_RE.search(after)
+        and _SOURCE_PARAGRAPH_END_RE.search(before)
+        and not _REPLY_PARAGRAPH_END_RE.search(after)
+    ):
+        return f"the paragraph is cut short at {after[-40:]!r}"
+    return None
+
+
+def check_text(source_fragments: list[str], reply_fragments: list[str], allowed: str = "") -> None:
+    """Raise ValueError when the text inside a paragraph is damaged."""
+    damaged = [
+        (number, damage)
+        for number, (source, reply) in enumerate(
+            zip(source_fragments, reply_fragments, strict=True), start=1
+        )
+        if (damage := text_damage(source, reply, allowed))
+    ]
+    if damaged:
+        numbers = _numbered([number for number, _ in damaged])
+        raise ValueError(
+            f"{numbers} of {len(reply_fragments)}: damaged text, {damaged[0][1]}. "
+            "Write each word in one alphabet and each paragraph to its end."
+        )
+
+
+def untranslated_words(fragment: str) -> list[str]:
+    """Lower-case Latin words in the middle of Russian text, for a person to look at."""
+    return [
+        word
+        for word in _ENGLISH_WORD_RE.findall(_spaced_text(fragment))
+        if word not in _LATIN_LOANWORDS
+    ]
+
+
+def _append_text(element: etree._Element, text: str) -> None:
+    if len(element):
+        element[-1].tail = (element[-1].tail or "") + text
+    else:
+        element.text = (element.text or "") + text
+
+
+def _sibling_parts(fragment: str) -> list[etree._Element] | None:
+    """The same-looking sibling elements in `fragment`; None if it holds anything else."""
+    declaration = f' xmlns:epub="{_EPUB_NS}"' if _EPUB_ATTRIBUTE_RE.search(fragment) else ""
+    try:
+        holder = etree.fromstring(
+            f"<holder{declaration}>{escape_bare_ampersands(fragment)}</holder>"
+        )
+    except etree.XMLSyntaxError:
+        return None
+    parts = list(holder)
+    if len(parts) < 2 or (holder.text or "").strip() or not isinstance(parts[0].tag, str):
+        return None
+    first = parts[0]
+    for part in parts:
+        same_look = part.tag == first.tag and dict(part.attrib) == dict(first.attrib)
+        if not same_look or (part.tail or "").strip():
+            return None
+    return parts
+
+
+def _are_one_paragraph(parts: list[etree._Element], source: str, neighbours: list[str]) -> bool:
+    """The parts fit one source paragraph and repeat nothing of the neighbouring markers."""
+    texts = [" ".join("".join(part.itertext()).split()) for part in parts]
+    limit = _MAX_JOINED_RATIO * max(len(_visible_text(source)), _MIN_COMPARED_CHARS)
+    if sum(map(len, texts)) > limit:
+        return False
+    nearby = " ".join(_visible_text(neighbour) for neighbour in neighbours)
+    return not any(
+        len(text) >= MIN_TELLING_SENTENCE and text[:MIN_TELLING_SENTENCE] in nearby
+        for text in texts
+    )
+
+
+def _merged(parts: list[etree._Element]) -> str:
+    first = parts[0]
+    for part in parts[1:]:
+        _append_text(first, f" {part.text or ''}")
+        for child in list(part):
+            first.append(child)
+    first.tail = None
+    return etree.tostring(first, encoding="unicode")
+
+
+def join_split_paragraphs(text: str, source_fragments: list[str]) -> tuple[str, list[int]]:
+    """Join a paragraph the model split in two under its one marker.
+
+    Returns the reply and the numbers of the paragraphs joined; a reply with nothing
+    to join comes back as it was.
+
+    This is what the prompt asks for, nothing is lost, and a re-ask costs a whole
+    chunk. It is deliberately narrow, because two elements under one marker can also
+    be a second source paragraph in the wrong place, and joining that would print it
+    twice: only same-looking siblings, only if the result fits the source paragraph,
+    and only if no part repeats a neighbouring marker. A wrong number of markers is
+    left to be rejected: it can't be repaired without guessing.
+    """
+    fragments = split_markers(text)
+    if fragments is None or len(fragments) != len(source_fragments):
+        return text, []
+    joined: list[int] = []
+    for number, source in enumerate(source_fragments, start=1):
+        parts = _sibling_parts(fragments[number - 1])
+        neighbours = fragments[max(number - 2, 0) : number - 1] + fragments[number : number + 1]
+        if parts is not None and _are_one_paragraph(parts, source, neighbours):
+            fragments[number - 1] = _merged(parts)
+            joined.append(number)
+    if not joined:
+        return text, []
+    return _with_markers(fragments), joined
+
+
+def _mismatch(source: str, reply: str) -> float:
+    return abs(math.log(max(len(reply), 1) / max(len(source), 1)))
+
+
+def _one_part_cost(source: str, reply: str) -> float:
+    """How badly a reply paragraph fits; a long paragraph off by a factor counts for more."""
+    return _mismatch(source, reply) * math.sqrt(max(len(source), MIN_TELLING_SENTENCE))
+
+
+def _two_part_cost(source: str, narration: str, speech: str) -> float | None:
+    """How badly narration and speech fit one source paragraph; None if they can't be it."""
+    parts = _NARRATION_THEN_SPEECH_RE.match(source)
+    if parts is None or _REPLY_SPEECH_RE.search(narration):
+        return None
+    if not _OPENS_AS_SPEECH_RE.match(speech):
+        return None
+    if max(_mismatch(parts[1], narration), _mismatch(parts[2], speech)) >= _MAX_PART_MISMATCH:
+        return None
+    return _SPLIT_PENALTY + _one_part_cost(parts[1], narration) + _one_part_cost(parts[2], speech)
+
+
+def _keep_cheaper(
+    states: dict[int, tuple[float, list[int]]], used: int, cost: float, sizes: list[int]
+) -> None:
+    if used not in states or cost < states[used][0]:
+        states[used] = (cost, sizes)
+
+
+def _group_sizes(sources: list[str], replies: list[str]) -> list[int] | None:
+    """How many reply paragraphs each source paragraph takes, 1 or 2; None if nothing fits.
+
+    The cheapest way to use every reply paragraph exactly once and in order. A state
+    is the number of extra markers used up so far: with that and the source paragraph,
+    the position in the reply is known.
+    """
+    extra = len(replies) - len(sources)
+    best: dict[int, tuple[float, list[int]]] = {0: (0.0, [])}
+    for index, source in enumerate(sources):
+        following: dict[int, tuple[float, list[int]]] = {}
+        for used, (cost, sizes) in best.items():
+            position = index + used
+            if position < len(replies):
+                one = cost + _one_part_cost(source, replies[position])
+                _keep_cheaper(following, used, one, [*sizes, 1])
+            if used < extra and position + 1 < len(replies):
+                split = _two_part_cost(source, replies[position], replies[position + 1])
+                if split is not None:
+                    _keep_cheaper(following, used + 1, cost + split, [*sizes, 2])
+        best = following
+    return best[extra][1] if extra in best else None
+
+
+def rebuild_over_split_reply(text: str, source_fragments: list[str]) -> tuple[str, list[int]]:
+    """Put a complete reply with too many markers back under one marker per paragraph.
+
+    Returns the reply and the numbers of the source paragraphs rebuilt; a reply this
+    can't place comes back as it was, to be rejected for its count.
+
+    The model's first answer often has every line and splits narration from speech,
+    as Russian typography would. Asked again for "exactly N", it stops at marker N and
+    loses the end of the chunk, so this first answer is the best one there will be.
+    Only that one shape is put back: see the limits at the top of this module. Numbering
+    that isn't 1 to M means two answers in one reply or a lost marker, not a split.
+    """
+    fragments = split_markers(text)
+    if fragments is None or len(fragments) <= len(source_fragments):
+        return text, []
+    numbers = [int(n) for n in PARAGRAPH_MARKER_RE.findall(_strip_code_fence(text))]
+    if numbers != list(range(1, len(fragments) + 1)):
+        return text, []
+    sizes = _group_sizes(
+        [_visible_text(source) for source in source_fragments],
+        [_visible_text(fragment) for fragment in fragments],
+    )
+    if sizes is None:
+        return text, []
+    grouped: list[str] = []
+    rebuilt: list[int] = []
+    position = 0
+    for number, size in enumerate(sizes, start=1):
+        if size == 1:
+            grouped.append(fragments[position])
+        else:
+            parts = _sibling_parts("\n".join(fragments[position : position + size]))
+            if parts is None:
+                return text, []
+            grouped.append(_merged(parts))
+            rebuilt.append(number)
+        position += size
+    return _with_markers(grouped), rebuilt
 
 
 def parse_cached_paragraphs(
@@ -168,6 +593,17 @@ class CheckedReply:
     elements: list[etree._Element]
     input_tokens: int
     output_tokens: int
+    joined: list[int] = field(default_factory=list)
+    rebuilt: list[int] = field(default_factory=list)
+
+    def meta(self, chunk_id: str) -> dict:
+        """What a stage stores beside the text; a repair is recorded, never silent."""
+        meta: dict = {"chunk_id": chunk_id}
+        if self.joined:
+            meta["joined_paragraphs"] = self.joined
+        if self.rebuilt:
+            meta["rebuilt_paragraphs"] = self.rebuilt
+        return meta
 
 
 class ReplyChecker:
@@ -176,6 +612,11 @@ class ReplyChecker:
     Shared by translate and reflect so the two cannot drift apart. Every call
     made is added to the stats, including rejected ones: they were paid for.
     A reply that fails twice is written to `failed/` and the error re-raised.
+
+    The repairs live here, not in `parse_fragment`: post-processing checks its patches
+    with that function, and a patch with two elements must stay rejected.
+    `CheckedReply.text` holds the repaired reply, so that every later reader of the
+    cached row sees one element per marker.
     """
 
     def __init__(
@@ -186,7 +627,9 @@ class ReplyChecker:
         prompt_version: str,
         cache_path: Path | None,
         lock: threading.Lock,
+        allowed: str = "",
     ):
+        self.allowed = allowed
         self.stage = stage
         self.model = model
         self.prompt_version = prompt_version
@@ -201,19 +644,20 @@ class ReplyChecker:
         user: str,
         *,
         chunk_id: str,
-        expected: int,
+        source: list[str],
         stats: RetryStats,
     ) -> CheckedReply:
+        """`source` holds the XHTML paragraphs asked about, one per expected marker."""
         result = self._paid(complete(system, user), stats)
         try:
-            return self._checked(result.text, expected, result)
+            return self._checked(result.text, source, chunk_id, result)
         except ValueError as e:
-            retry = self._retry(complete, system, user, expected, e, stats)
+            retry = self._retry(complete, system, user, len(source), e, stats)
             if retry is None:
                 self._report(chunk_id, result, e)
                 raise
             try:
-                reply = self._checked(retry.text, expected, result, retry)
+                reply = self._checked(retry.text, source, chunk_id, result, retry)
             except ValueError as e2:
                 self._report(chunk_id, result, e2, retry)
                 raise e2 from e
@@ -226,19 +670,51 @@ class ReplyChecker:
             stats.output_tokens += result.output_tokens
         return result
 
-    @staticmethod
     def _checked(
+        self,
         text: str,
-        expected: int,
+        source: list[str],
+        chunk_id: str,
         result: CompletionResult,
         retry: CompletionResult | None = None,
     ) -> CheckedReply:
-        elements = parse_paragraphs(text, expected)
+        text, rebuilt = rebuild_over_split_reply(text, source)
+        text, joined = join_split_paragraphs(text, source)
+        elements = parse_paragraphs(text, len(source))
+        fragments = split_paragraphs(text, len(source))
+        check_alignment(source, fragments)
+        check_text(source, fragments, self.allowed)
+        for number, fragment in enumerate(fragments, start=1):
+            if words := untranslated_words(fragment):
+                logger.warning(
+                    "%s chunk %s: paragraph %d has Latin words in Russian text (%s). "
+                    "Kept as it is: check that they are meant.",
+                    self.stage,
+                    chunk_id,
+                    number,
+                    ", ".join(words),
+                )
+        if rebuilt:
+            logger.warning(
+                "%s chunk %s: %s came back split over two markers and rebuilt into one element.",
+                self.stage,
+                chunk_id,
+                _numbered(rebuilt),
+            )
+        if joined:
+            logger.warning(
+                "%s chunk %s: %s came back split in two and joined into one element.",
+                self.stage,
+                chunk_id,
+                _numbered(joined),
+            )
         return CheckedReply(
             text=text,
             elements=elements,
             input_tokens=result.input_tokens + (retry.input_tokens if retry else 0),
             output_tokens=result.output_tokens + (retry.output_tokens if retry else 0),
+            joined=joined,
+            rebuilt=rebuilt,
         )
 
     def _retry(

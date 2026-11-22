@@ -37,7 +37,7 @@ class Prompt:
     model: str | None
     temperature: float
     max_tokens: int | None
-    reasoning_effort: str | None  # none|low|medium|high; None => don't send the param
+    reasoning_effort: str | None  # see models.ReasoningEffort; None => don't send the param
     system_tmpl: str
     user_tmpl: str
 
@@ -59,19 +59,30 @@ def _split_sections(body: str) -> tuple[str, str]:
     return sections.get("system", ""), sections.get("user", "")
 
 
-def load_prompt(path: Path) -> Prompt:
-    """Parse a prompt markdown file into a `Prompt`."""
+def load_prompt(path: Path, reasoning_effort: str | None = None) -> Prompt:
+    """Parse a prompt markdown file into a `Prompt`.
+
+    `reasoning_effort` replaces the level in the frontmatter. A different level
+    gives a different answer, so it joins the version, and through it the cache
+    key. Asking for the level the prompt already has changes nothing.
+    """
     post = frontmatter.load(path)
     fm = post.metadata
     system_tmpl, user_tmpl = _split_sections(post.content)
 
+    version = str(fm.get("version", "1"))
+    effort = fm.get("reasoning_effort")
+    if reasoning_effort is not None and reasoning_effort != effort:
+        version = f"{version}+{reasoning_effort}"
+        effort = reasoning_effort
+
     return Prompt(
         name=path.stem,
-        version=str(fm.get("version", "1")),
+        version=version,
         model=fm.get("model"),
         temperature=float(fm.get("temperature", 0.3)),
         max_tokens=fm.get("max_tokens"),
-        reasoning_effort=fm.get("reasoning_effort"),
+        reasoning_effort=effort,
         system_tmpl=system_tmpl,
         user_tmpl=user_tmpl,
     )

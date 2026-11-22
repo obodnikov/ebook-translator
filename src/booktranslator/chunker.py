@@ -62,19 +62,36 @@ class ChunkSet:
 
     book: StructuredBook
     chunks: list[Chunk]
+    # Overlap per chunk id, (prev, next), rendered before anything can change the
+    # tree. It belongs to a neighbouring chunk, which the translator replaces in
+    # place, and it goes into the prompt and so into the cache key: read later, the
+    # key would depend on which neighbour happened to finish first, and a second
+    # run would pay again for chunks it already has.
+    _overlap: dict[str, tuple[list[str], list[str]]] = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        self._overlap = {
+            chunk.id: (
+                self._render(chunk, chunk.prev_overlap_indexes),
+                self._render(chunk, chunk.next_overlap_indexes),
+            )
+            for chunk in self.chunks
+        }
+
+    def _render(self, chunk: Chunk, indexes: list[int]) -> list[str]:
+        ch = self.book.chapters[chunk.chapter_index]
+        return [_element_to_xhtml_fragment(ch.paragraphs[i]) for i in indexes]
 
     # Helpers to render chunks into prompt strings ----------------------
 
     def render_main(self, chunk: Chunk) -> list[str]:
         """XHTML fragments for each paragraph in the chunk (to translate)."""
-        ch = self.book.chapters[chunk.chapter_index]
-        return [_element_to_xhtml_fragment(ch.paragraphs[i]) for i in chunk.paragraph_indexes]
+        return self._render(chunk, chunk.paragraph_indexes)
 
     def render_overlap(self, chunk: Chunk, side: str) -> list[str]:
-        """XHTML fragments for the before/after overlap (context only)."""
-        ch = self.book.chapters[chunk.chapter_index]
-        indexes = chunk.prev_overlap_indexes if side == "prev" else chunk.next_overlap_indexes
-        return [_element_to_xhtml_fragment(ch.paragraphs[i]) for i in indexes]
+        """XHTML fragments for the before/after overlap (context only), as in the source."""
+        prev_overlap, next_overlap = self._overlap[chunk.id]
+        return prev_overlap if side == "prev" else next_overlap
 
 
 def chunk_book(

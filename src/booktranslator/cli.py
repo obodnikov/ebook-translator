@@ -28,16 +28,25 @@ from rich.progress import (
 )
 from rich.table import Table
 
-from .cache import CLEARABLE_STAGES, STAGE_WATERFALL, Cache
+from .cache import CLEARABLE_STAGES, STAGE_WATERFALL, Cache, stages_on_disk
 from .chunker import chunk_book
 from .config import load_config
-from .epub_io import read_book, read_book_structured, write_translated_epub
+from .epub_io import (
+    PARAGRAPH_RULES,
+    ChapterDoc,
+    read_book,
+    read_book_structured,
+    write_translated_epub,
+)
 from .glossary import extract_glossary, save_glossary
+from .markup import restore_book_markup
 from .models import Glossary, SeriesGlossary, SeriesGlossaryEntry, Stage
 from .pipeline_helpers import (
     CHUNKER_META_KEY,
     ChunkerConfigMismatchError,
+    ParagraphRulesMismatchError,
     build_reflect_input,
+    check_paragraph_rules,
     collect_chunk_originals,
     collect_preferred_translations,
     collect_stage_translations,
@@ -49,6 +58,7 @@ from .pipeline_helpers import (
     save_chunker_params,
     verify_chunker_params,
 )
+from .provider import credits_used
 from .series import (
     SeriesWorkDir,
     init_series,
@@ -75,6 +85,37 @@ app.add_typer(cover_app, name="cover")
 app.add_typer(cache_app, name="cache")
 
 console = Console()
+
+
+def _require_current_paragraph_rules(wd: WorkDir, *, starting: bool = False) -> None:
+    """Exit before the first write when the workdir holds text of other paragraph rules."""
+    try:
+        check_paragraph_rules(wd, starting=starting)
+    except ParagraphRulesMismatchError as e:
+        console.print(f"[red]Error:[/red] {e}")
+        raise typer.Exit(code=1) from e
+
+
+def _restore_markup(chapters: list[ChapterDoc], source_chapters: list[ChapterDoc]) -> None:
+    """Take lost markers and attributes from the source book, and say so."""
+    report = restore_book_markup(chapters, source_chapters)
+    if not report:
+        return
+    console.print(f"[dim]Markup restored from the source in {len(report)} paragraph(s):[/dim]")
+    for name, number, done in report:
+        console.print(
+            f"  {name.rsplit('/', 1)[-1]}, paragraph {number}: {', '.join(done)}",
+            markup=False,
+            highlight=False,
+            soft_wrap=True,
+        )
+
+
+def _credits_note() -> str:
+    """The credits spent by this command, for providers that report them."""
+    used = credits_used()
+    return f" Credits: {used:,.1f}." if used else ""
+
 
 DEFAULT_WORK_DIR = Path("work")
 DEFAULT_CONFIG = Path("configs/default.yaml")
@@ -177,6 +218,7 @@ def glossary_extract(
             source_lang=cfg.source_lang,
             target_lang=cfg.target_lang,
             known_terms=known_terms,
+            reasoning_effort=cfg.reasoning.glossary,
         )
     except Exception as e:
         wd.raw_glossary_path.write_text(str(e), encoding="utf-8")
@@ -217,7 +259,10 @@ def _print_glossary_summary(glossary_obj: Glossary, result) -> None:
     console.print(table)
 
     if result is not None:
-        console.print(f"[dim]Tokens: {result.input_tokens} in, {result.output_tokens} out[/dim]")
+        console.print(
+            f"[dim]Tokens: {result.input_tokens} in, "
+            f"{result.output_tokens} out.{_credits_note()}[/dim]"
+        )
     else:
         console.print("[dim]Served from cache (no tokens used)[/dim]")
 
@@ -431,6 +476,14 @@ def translate(
         "--limit-chunks",
         help="Translate only the first N chunks (for quick tests).",
     ),
+    allow_failed_chunks: bool = typer.Option(
+        False,
+        "--allow-failed-chunks",
+        help=(
+            "Go on to the later stages and write the EPUB even though some chunks failed: "
+            "their paragraphs stay in the source language."
+        ),
+    ),
     parallelism: int | None = typer.Option(
         None,
         "--parallelism",
@@ -615,8 +668,12 @@ def translate(
         )
 
     wd = WorkDir.for_book(work_dir, book.meta.title)
+    _require_current_paragraph_rules(wd, starting=True)
     state = wd.load_state()
+    if "translate" not in stages_on_disk(wd.cache_path):
+        state.paragraph_rules = PARAGRAPH_RULES
     state.current_stage = Stage.TRANSLATE
+    state.last_error = None
     wd.save_state(state)
     console.print(f"[bold]Workdir:[/bold]  {wd.root}")
 
@@ -638,8 +695,9 @@ def translate(
     # source text the moment translation starts. Judge, reflect and verify all
     # need the real original to compare against, so they read it from a second
     # copy of the book that nothing writes to. Re-reading costs ~0.03s.
+    source_book = read_book_structured(epub)
     source_chunk_set = chunk_book(
-        read_book_structured(epub),
+        source_book,
         target_words=cfg.chunker.target_words,
         overlap_paragraphs=cfg.chunker.overlap_paragraphs,
     )
@@ -672,6 +730,7 @@ def translate(
         model=chosen_model,
         source_lang=cfg.source_lang,
         target_lang=cfg.target_lang,
+        reasoning_effort=cfg.reasoning.translate,
     )
 
     with Progress(
@@ -701,11 +760,31 @@ def translate(
         )
 
     if stats.chunks_failed:
+        failed_ids = ", ".join(sorted(stats.failed_chunk_ids))
+        state.last_error = f"translate: {stats.chunks_failed} chunks failed: {failed_ids}"
+        wd.save_state(state)
+        if not allow_failed_chunks:
+            # The later stages cost money and only polish what is there. Going on would
+            # end in a part-English book marked as done.
+            cache.close()
+            console.print(
+                f"[red]Error:[/red] {stats.chunks_failed} chunks failed: {failed_ids}\n"
+                "[dim]Stopped before the later stages; no EPUB was written.\n"
+                "Re-run the same command to ask for them again (the cache keeps the rest). "
+                f"Rejected replies are in {wd.root / 'failed'}.\n"
+                "To go on anyway, with those paragraphs left in the original language, "
+                "add --allow-failed-chunks.[/dim]",
+                soft_wrap=True,  # keep the chunk ids and the path on one line
+            )
+            raise typer.Exit(code=1)
         console.print(
-            f"[yellow]Warning:[/yellow] {stats.chunks_failed} chunks failed; "
-            "the output EPUB will have those paragraphs in the original language. "
-            "Re-run the same command to retry failed chunks (cache keeps successes)."
+            f"[yellow]Warning:[/yellow] {stats.chunks_failed} chunks failed: {failed_ids}; "
+            "the output EPUB will have those paragraphs in the original language."
         )
+    # A translation begun under earlier rules earns the mark only here, with every chunk
+    # asked under these ones: until then its old rows could still be assembled.
+    state.paragraph_rules = PARAGRAPH_RULES
+    wd.save_state(state)
 
     # ------------------------------------------------------------------
     # Judge pass
@@ -738,6 +817,7 @@ def translate(
                     model=judge_model,
                     source_lang=cfg.source_lang,
                     target_lang=cfg.target_lang,
+                    reasoning_effort=cfg.reasoning.judge,
                 )
 
                 judge_parallelism = min(parallelism or cfg.translate.parallelism, 8) or 4
@@ -824,6 +904,7 @@ def translate(
                 model=reflect_model,
                 source_lang=cfg.source_lang,
                 target_lang=cfg.target_lang,
+                reasoning_effort=cfg.reasoning.reflect,
             )
 
             # Build reflect input using shared helper (O(n), not O(n²))
@@ -952,6 +1033,7 @@ def translate(
             model=pp_model,
             source_lang=cfg.source_lang,
             target_lang=cfg.target_lang,
+            reasoning_effort=getattr(cfg.reasoning, pp_stage),
         )
 
         pp_parallelism = min(parallelism or cfg.translate.parallelism, 8) or 4
@@ -1008,6 +1090,9 @@ def translate(
         rehydrated, _ = rehydrate_book_from_waterfall(cache, chunk_set)
         if rehydrated:
             console.print(f"[dim]Rehydrated {rehydrated} chunks from post-processing.[/dim]")
+
+    # Before the notes, which add ids of their own that the source does not have.
+    _restore_markup(book.chapters, source_book.chapters)
 
     # --- Reader notes injection (after rehydrate, before write) ---
     from .reader_notes import GlossaryLoadError, inject_notes_for_cli
@@ -1111,7 +1196,7 @@ def translate(
         f"\n[green]Translated EPUB:[/green] {out_path}\n"
         f"[dim]{' '.join(summary_parts)}\n"
         f"Tokens: {stats.input_tokens:,} in, "
-        f"{stats.output_tokens:,} out.[/dim]"
+        f"{stats.output_tokens:,} out.{_credits_note()}[/dim]"
     )
 
     # Helpful tips
@@ -1217,6 +1302,7 @@ def judge_cmd(
     glossary = _resolve_glossary(series, glossary_path, work_dir, cfg, book)
 
     wd = WorkDir.for_book(work_dir, book.meta.title)
+    _require_current_paragraph_rules(wd)
     cache = Cache(wd.cache_path)
 
     # Get translated chunk IDs
@@ -1287,6 +1373,7 @@ def judge_cmd(
         target_lang=cfg.target_lang,
         judged_stage=from_stage,
         run_id=run_id,
+        reasoning_effort=cfg.reasoning.judge,
     )
 
     if parallelism is not None and parallelism < 1:
@@ -1337,7 +1424,7 @@ def judge_cmd(
             f"{judge_stats.chunks_cached} cached, "
             f"{judge_stats.chunks_failed} failed. "
             f"Tokens: {judge_stats.input_tokens:,} in, "
-            f"{judge_stats.output_tokens:,} out.[/dim]"
+            f"{judge_stats.output_tokens:,} out.{_credits_note()}[/dim]"
         )
     else:
         console.print("[yellow]No chunks were judged.[/yellow]")
@@ -1420,6 +1507,7 @@ def reflect_cmd(
     glossary = _resolve_glossary(series, glossary_path, work_dir, cfg, book)
 
     wd = WorkDir.for_book(work_dir, book.meta.title)
+    _require_current_paragraph_rules(wd)
     cache = Cache(wd.cache_path)
 
     # Get judge scores
@@ -1496,6 +1584,7 @@ def reflect_cmd(
         model=reflect_model,
         source_lang=cfg.source_lang,
         target_lang=cfg.target_lang,
+        reasoning_effort=cfg.reasoning.reflect,
     )
 
     if parallelism is not None and parallelism < 1:
@@ -1539,7 +1628,7 @@ def reflect_cmd(
         f"  No change: {reflect_stats.chunks_unchanged}/{reflect_stats.chunks_total}\n"
         f"  Failed: {reflect_stats.chunks_failed}/{reflect_stats.chunks_total}\n"
         f"[dim]Tokens: {reflect_stats.input_tokens:,} in, "
-        f"{reflect_stats.output_tokens:,} out.[/dim]"
+        f"{reflect_stats.output_tokens:,} out.{_credits_note()}[/dim]"
     )
 
 
@@ -1822,6 +1911,7 @@ def repair_cmd(
 
     glossary = _resolve_glossary(series, glossary_path, work_dir, cfg, book)
     wd = WorkDir.for_book(work_dir, book.meta.title)
+    _require_current_paragraph_rules(wd)
     cache = Cache(wd.cache_path)
 
     try:
@@ -1877,6 +1967,7 @@ def repair_cmd(
             categories=wanted,
             source_lang=cfg.source_lang,
             target_lang=cfg.target_lang,
+            reasoning_effort=cfg.reasoning.repair,
         )
 
         stats = RepairStats(chunks_total=len(waterfall))
@@ -1920,7 +2011,8 @@ def repair_cmd(
             f"  Rejected:   {stats.rejected}\n"
             f"  Chunks changed: {stats.chunks_repaired}/{stats.chunks_total}\n"
             f"  Failed: {stats.chunks_failed}\n"
-            f"[dim]Tokens: {stats.input_tokens:,} in, {stats.output_tokens:,} out.[/dim]"
+            f"[dim]Tokens: {stats.input_tokens:,} in, "
+            f"{stats.output_tokens:,} out.{_credits_note()}[/dim]"
         )
         unhandled_path = wd.root / "repair-unhandled.txt"
         if stats.unhandled:
@@ -1969,6 +2061,7 @@ def _run_postprocess_cmd(
     glossary = _resolve_glossary(series, glossary_path, work_dir, cfg, book)
 
     wd = WorkDir.for_book(work_dir, book.meta.title)
+    _require_current_paragraph_rules(wd)
     cache = Cache(wd.cache_path)
 
     try:
@@ -2050,6 +2143,7 @@ def _run_postprocess_cmd(
             model=chosen_model,
             source_lang=cfg.source_lang,
             target_lang=cfg.target_lang,
+            reasoning_effort=getattr(cfg.reasoning, stage),
         )
 
         effective_parallelism = parallelism or 4
@@ -2087,7 +2181,7 @@ def _run_postprocess_cmd(
             f"  Unchanged: {pp_stats.chunks_unchanged}/{pp_stats.chunks_total}\n"
             f"  Failed: {pp_stats.chunks_failed}/{pp_stats.chunks_total}\n"
             f"[dim]Tokens: {pp_stats.input_tokens:,} in, "
-            f"{pp_stats.output_tokens:,} out.[/dim]"
+            f"{pp_stats.output_tokens:,} out.{_credits_note()}[/dim]"
         )
     finally:
         cache.close()
@@ -2808,6 +2902,7 @@ def assemble_cmd(
         )
         raise typer.Exit(code=1)
 
+    _require_current_paragraph_rules(WorkDir(root=work_path, slug=work_path.name))
     cache = Cache(cache_path)
     try:
         # Total unique chunks
@@ -2960,6 +3055,10 @@ def assemble_cmd(
                         soft_wrap=True,  # keep the command copyable on one line
                     )
             raise typer.Exit(code=1)
+
+        # Before the notes, as in translate. The trees hold the translation by now,
+        # so the source is read again.
+        _restore_markup(book.chapters, read_book_structured(epub).chapters)
 
         # --- Reader notes injection ---
         from .reader_notes import GlossaryLoadError, inject_notes_for_cli

@@ -1,5 +1,5 @@
 ---
-version: 3
+version: 5
 model: anthropic/claude-sonnet-4.6
 temperature: 0.3
 max_tokens: 12000
@@ -67,6 +67,32 @@ Your translation must be an XHTML fragment with:
   similar elements — copy them verbatim.
 
 Do not introduce new tags. Do not strip existing ones.
+
+One source paragraph is always exactly one element in your translation. Never split a paragraph
+in two, not even to put a line of dialogue on its own line as {{ target_lang_name }} typography
+would: keep the narration and the speech inside the same element, in the same order as the source.
+
+## Direct speech
+
+{% if target_lang == "ru" %}
+Mark direct speech the same way in every paragraph of the book: with an em dash (—), never with
+guillemets and never with an en dash (–).
+
+- A paragraph that opens with speech opens with `— `:
+  `<p>— Кто это был? — спросил я.</p>`
+- Narration between pieces of speech is set off with em dashes:
+  `<p>— Иди, — сказал он. — И не возвращайся.</p>`
+- Speech that follows narration in the same paragraph follows an em dash too:
+  `<p>Она пожала плечами. — Не знаю, сэр. Спросите экономку.</p>`
+  `<p>Я наклонился к нему и прошептал: — Уходим.</p>`
+
+Guillemets « » are only for titles, quoted words, written text, and speech quoted inside speech.
+{% else %}
+Mark direct speech the same way in every paragraph of the book, the way {{ target_lang_name }}
+fiction does.
+{% endif %}
+
+Keep every ellipsis as the source writes it: the single character `…` stays `…`, never three dots.
 
 ## Output format
 

@@ -33,7 +33,7 @@ Thumbs.db
 .index/
 
 # OwnCloud
-.owncloudsync.log
+.owncloudsync.log*
 .sync_journal.*
 
 .kiro/

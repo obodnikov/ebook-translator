@@ -1,7 +1,8 @@
 # AI rules — EPUB I/O, chunking, cover, assembly (Python)
 
-Scope: `src/booktranslator/epub_io.py`, `chunker.py`, `cover.py`, `reader_notes.py`, and the
-assemble path in `postprocess.py` / `cli.py` (`assemble`, `cover extract|replace|translate|fix`).
+Scope: `src/booktranslator/epub_io.py`, `markup.py`, `chunker.py`, `cover.py`, `reader_notes.py`,
+and the assemble path in `postprocess.py` / `cli.py` (`assemble`,
+`cover extract|replace|translate|fix`).
 This layer turns an EPUB into translatable units and rebuilds it byte-faithfully. See
 [ARCHITECTURE.md §3 (steps 1–2, 7, 11), §4–5](ARCHITECTURE.md); this file is the coding contract.
 
@@ -29,6 +30,37 @@ source EPUB as immutable reference data:
 - **Never reorder or rename** spine items, manifest entries, or asset paths. New bytes (translated
   cover) go into a *new* output EPUB; the source file is never mutated in place.
 
+## What counts as a paragraph (`_find_paragraphs`)
+
+- **Units never nest.** A wrapper whose text is all inside its paragraphs (the usual
+  `<blockquote><p>…`) gives those paragraphs; one with text of its own is a single unit, paragraphs
+  and all. A unit inside another is sent to the model twice, and its own translation is spliced
+  into an element that replacing the outer one already detached: A Drop of Corruption lost every
+  later edit inside its quotes that way, silently.
+- **Text counts however deep it is** (`<p><em><span>T</span>he…`). Only text found deep down is
+  filtered, for the watermark, bare addresses and numbers without letters. Don't apply that filter
+  to direct text: it would move the paragraph positions of every book.
+- **A change to which elements are listed bumps `PARAGRAPH_RULES`.** Cached text fits a book by
+  position, and a shifted chunk can keep its count (Shroud ch11_c02, 23 paragraphs both ways), so
+  no count check catches it. Measure on the source books first: how many chunks change, and that
+  no text drops out.
+
+## Markup a translation lost (`markup.py`)
+
+- `restore_book_markup` runs at every build (translate, assemble) on the final trees, against a
+  freshly read source: **after rehydrate and before reader notes**, which add ids of their own. A
+  new path that writes a translated book calls it at the same point.
+- It is the only place that repairs markup, and it runs on the tree: the cache keeps what the model
+  wrote, so a fix here reaches every book of the current rules through a free `assemble`. Don't
+  move it into the reply check or the cache, and don't turn a lost marker into a paid re-ask.
+- **Never a letter of text.** A paragraph ends up with exactly the ids of its source paragraph.
+  Copy attributes only where the source element is certain (the paragraph itself, the same id, all
+  candidates identical, block children in order): inline elements get reordered by a translation.
+  Attributes with words (`alt`, `title`, `aria-label`) stay translated. An inline wrapper lost
+  around words is left lost. Don't guess the word it belonged on.
+- Measure a change on real caches: text unchanged, ids equal to the source, a second run changes
+  nothing, and an untouched source book gives zero changes.
+
 ## XML / entity hygiene
 
 - The translation round-trips through JSON and Jinja2, so XML special characters (`&`, `<`, `>`)
@@ -47,6 +79,9 @@ source EPUB as immutable reference data:
   deterministic.
 - Overlap paragraphs (prev/next) are **context only** — they are fed to the model but never
   re-translated or written back. Don't let overlap text leak into the output.
+- Overlap is **always source text**: `ChunkSet` renders it once, before the translator starts
+  replacing paragraphs in the same tree. It goes into the prompt and so into the cache key; read
+  from the live tree, the key would depend on which neighbour finished first.
 
 ## Cover (`cover.py`)
 

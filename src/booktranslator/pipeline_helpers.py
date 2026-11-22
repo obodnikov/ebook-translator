@@ -6,6 +6,7 @@ CLI commands. Addresses code review concerns about:
 - Correct preferred-stage selection (not stale translations)
 - O(1) chunk lookup instead of O(n) linear scan
 - Chunker config persistence and mismatch detection
+- Refusing a workdir translated under other paragraph rules
 """
 
 from __future__ import annotations
@@ -13,11 +14,13 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from .cache import Cache
+from .cache import STAGE_WATERFALL, Cache, stages_on_disk
 from .chunker import ChunkSet
-from .models import Config, ProviderConfig
+from .epub_io import PARAGRAPH_RULES
+from .models import Config, ProviderConfig, Stage
 from .provider import OpenRouterProvider
 from .replies import parse_fragment, split_markers
+from .state import WorkDir
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +34,45 @@ class ChunkerConfigMismatchError(Exception):
     pass
 
 
+class ParagraphRulesMismatchError(Exception):
+    """Raised for a workdir translated under other rules of what a paragraph is."""
+
+    pass
+
+
+def check_paragraph_rules(wd: WorkDir, *, starting: bool = False) -> None:
+    """Refuse a workdir of other paragraph rules, before anything is written to it.
+
+    Cached paragraphs fit the book by position. Under other rules a chunk can keep
+    its count and change its content, and then the text goes to the wrong places
+    with every check green: Shroud ch11_c02, 23 paragraphs both ways.
+
+    `translate` (`starting=True`) may go on with a book that has translations and
+    nothing after them: its cache key holds the source text, so a chunk that changed
+    is translated again. A finished book, or one with later stages, whose rows would
+    outrank the new translation, is refused by every command.
+    """
+    if not wd.state_path.is_file():
+        return
+    state = wd.load_state()
+    if state.paragraph_rules == PARAGRAPH_RULES:
+        return
+    stages = stages_on_disk(wd.cache_path)
+    if Stage.DONE in state.completed_stages or stages & set(STAGE_WATERFALL[1:]):
+        raise ParagraphRulesMismatchError(
+            f"{wd.root} was translated by a version that split books into paragraphs "
+            "differently, so its cached text no longer fits the book paragraph by paragraph. "
+            "Nothing was changed, and an EPUB already built stays good. To translate this "
+            "book again, give another folder with --work."
+        )
+    if not starting and "translate" in stages:
+        raise ParagraphRulesMismatchError(
+            f"{wd.root} holds an unfinished translation of a version that split books into "
+            "paragraphs differently. Nothing was changed. Run `btrans translate` first: "
+            "it asks again only for the chunks that changed."
+        )
+
+
 def _create_provider_from_config(provider_cfg: ProviderConfig) -> OpenRouterProvider:
     """Instantiate a provider from a ProviderConfig section."""
     return OpenRouterProvider(
@@ -38,6 +80,7 @@ def _create_provider_from_config(provider_cfg: ProviderConfig) -> OpenRouterProv
         api_key_env=provider_cfg.api_key_env,
         extra_headers=provider_cfg.extra_headers or None,
         max_response_bytes=provider_cfg.max_response_bytes,
+        timeout_seconds=provider_cfg.timeout_seconds,
     )
 
 
@@ -315,8 +358,6 @@ def collect_waterfall_translations(
     Returns {chunk_id: content} for chunks that have at least one
     preceding stage available.
     """
-    from .cache import STAGE_WATERFALL
-
     if not chunk_ids:
         return {}
 
@@ -373,8 +414,6 @@ def collect_waterfall_paragraphs(
 
     Returns {chunk_id: [paragraph_fragments]} for chunks with valid content.
     """
-    from .cache import STAGE_WATERFALL
-
     if not chunk_ids:
         return {}
 
@@ -485,8 +524,6 @@ def rehydrate_book_from_waterfall(
         it contains IDs of chunks that could not be rehydrated.
     """
     from lxml import etree
-
-    from .cache import STAGE_WATERFALL
 
     # Build chunk lookup: id -> Chunk
     chunk_by_id = {c.id: c for c in chunk_set.chunks}

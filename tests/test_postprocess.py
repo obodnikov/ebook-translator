@@ -1738,3 +1738,15 @@ class TestPatchesAreCheckedOneByOne:
         patches = json.dumps([{"p": 2, "text": "<p>– Нет. – Да. – сказал я.</p>"}])
         out, _ = proofreader._parse_delta_response(patches, paragraphs)
         assert out[1] == "<p>– Нет. – Да. – сказал я.</p>"
+
+
+def test_a_patch_that_lost_the_epub_declaration_is_not_thrown_away(proofreader: PostProcessor):
+    """The same slip as The Tainted Cup ch36_c04, in an edit: one attribute must not cost it."""
+    span = '<span epub:type="pagebreak" id="page_9" title="9"/>'
+    before = f'<p xmlns:epub="http://www.idpf.org/2007/ops">{span}Он сказл это.</p>'
+    after = f"<p>{span}Он сказал это.</p>"
+
+    output, changed = proofreader._apply_patches([{"p": 1, "text": after}], [before])
+
+    assert changed
+    assert output == [after]

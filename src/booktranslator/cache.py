@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -74,6 +75,21 @@ def _judged_stage_of(meta_json: str | None) -> str:
         return json.loads(meta_json).get("judged_stage", "translate")
     except (json.JSONDecodeError, AttributeError):
         return "translate"
+
+
+def stages_on_disk(path: Path) -> set[str]:
+    """The stages a cache file has rows for, read without writing to it.
+
+    For checks that may refuse a workdir: opening a `Cache` creates and migrates
+    tables, and a refused workdir must stay byte for byte as it was.
+    """
+    if not path.is_file():
+        return set()
+    uri = f"{path.resolve().as_uri()}?mode=ro"
+    with closing(sqlite3.connect(uri, uri=True)) as conn:
+        if not conn.execute("SELECT 1 FROM sqlite_master WHERE name = 'cache'").fetchone():
+            return set()
+        return {row[0] for row in conn.execute("SELECT DISTINCT stage FROM cache")}
 
 
 @dataclass

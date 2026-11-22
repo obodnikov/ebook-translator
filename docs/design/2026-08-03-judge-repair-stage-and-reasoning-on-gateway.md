@@ -7,6 +7,9 @@
 > `chunker.target_words` и предел ответа у провайдеров), тесты.
 > Related rules: [AI_PIPELINE.md](../../AI_PIPELINE.md), [AI_PROVIDER.md](../../AI_PROVIDER.md),
 > [ARCHITECTURE.md](../../ARCHITECTURE.md).
+> Superseded in part by: [2026-11-01-native-reasoning-on-gateway.md](2026-11-01-native-reasoning-on-gateway.md)
+> (§3.6, §4.4, §4.6, §4.8, §4.9, §5.8-в): на шлюзе появилось настоящее рассуждение, а предел ответа
+> около 23 КБ больше не воспроизводится.
 > Supersedes: решение «thinking выключаем на всех текстовых стадиях» из
 > [2026-06-30-kiro-glossary-truncation-and-per-stage-provider-routing.md](2026-06-30-kiro-glossary-truncation-and-per-stage-provider-routing.md) §3.
 

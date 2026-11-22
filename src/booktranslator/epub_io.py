@@ -7,6 +7,8 @@
 
 Iteration 3 scope: replace text inside <p>/<h1..6>/<blockquote> tags
 while preserving inline formatting (<em>, <strong>, <i>, <b>, <a>, etc).
+Each piece of that text is one unit of translation and no more: units
+never nest (see `_find_paragraphs`).
 Other document content (e.g. <table>, <ul>, raw structural XHTML) is
 left untouched in this first cut.
 """
@@ -14,6 +16,7 @@ left untouched in this first cut.
 from __future__ import annotations
 
 import logging
+import re
 import warnings
 import zipfile
 from dataclasses import dataclass, field
@@ -204,31 +207,65 @@ class StructuredBook:
 # them in a later iteration.
 TRANSLATABLE_TAGS = {"p", "h1", "h2", "h3", "h4", "h5", "h6", "blockquote"}
 
+# The version of the rules below. Cached translations fit a book by the position of
+# a paragraph, so raise it with any change to which elements are listed: a workdir
+# of other rules is then refused (`pipeline_helpers.check_paragraph_rules`).
+PARAGRAPH_RULES = 2
+
+_WEB_ADDRESS_RE = re.compile(
+    r"(?:https?://|www\.)\S+|[\w-]+\.(?:com|org|net)(?:/\S*)?", re.IGNORECASE
+)
+
 
 def _is_translatable(el: etree._Element) -> bool:
     tag = etree.QName(el.tag).localname.lower() if isinstance(el.tag, str) else ""
     if tag not in TRANSLATABLE_TAGS:
         return False
-    # Skip empty paragraphs.
-    has_text = (el.text or "").strip() or any(
-        (child.text or child.tail or "").strip() for child in el
-    )
-    return bool(has_text)
+    if (el.text or "").strip() or any((child.text or child.tail or "").strip() for child in el):
+        return True
+    # Text further down: <p><em><span>T</span>he swarm walks...</em></p>. Down there
+    # are also the site's watermark and linked chapter numbers, which are no text
+    # to translate and would only be paid for.
+    deep_text = " ".join("".join(el.itertext()).split())
+    return any(c.isalpha() for c in deep_text) and not _WEB_ADDRESS_RE.fullmatch(deep_text)
+
+
+def _has_text_outside(el: etree._Element, units: set[etree._Element]) -> bool:
+    """True when `el` has text that none of the `units` inside it would carry."""
+    if (el.text or "").strip():
+        return True
+    for child in el:
+        if (child.tail or "").strip():
+            return True
+        if isinstance(child.tag, str) and child not in units and _has_text_outside(child, units):
+            return True
+    return False
 
 
 def _find_paragraphs(tree: etree._ElementTree) -> list[etree._Element]:
     """Return the list of translatable elements in document order.
 
+    No unit lies inside another. A quote made of paragraphs gives its paragraphs;
+    a quote with text of its own (a lead-in, an attribution) is one unit, paragraphs
+    and all. Were both listed, the model would be sent the text twice, and the
+    paragraph's own translation would be spliced into an element that replacing
+    the quote had already taken out of the book.
+
     Uses local-name() so it works with or without XHTML namespace.
     """
-    root = tree.getroot()
-    out: list[etree._Element] = []
-    for el in root.iter():
-        if not isinstance(el.tag, str):
+    candidates = [el for el in tree.getroot().iter() if _is_translatable(el)]
+    candidate_set = set(candidates)
+    units: list[etree._Element] = []
+    taken: set[etree._Element] = set()
+    for el in candidates:
+        if any(ancestor in taken for ancestor in el.iterancestors()):
             continue
-        if _is_translatable(el):
-            out.append(el)
-    return out
+        holds_units = any(inner in candidate_set for inner in el.iterdescendants())
+        if holds_units and not _has_text_outside(el, candidate_set):
+            continue  # a wrapper: the paragraphs in it are the units
+        units.append(el)
+        taken.add(el)
+    return units
 
 
 def _parse_xhtml(content: bytes) -> etree._ElementTree:

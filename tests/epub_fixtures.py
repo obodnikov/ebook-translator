@@ -45,7 +45,17 @@ MINIMAL_CONTAINER = """\
 </container>"""
 
 
-def write_minimal_epub(path: Path) -> Path:
+def xhtml_with_paragraphs(*paragraphs: str) -> str:
+    """The minimal chapter, with these paragraphs (plain text) as its body."""
+    body = "\n".join(f"<p>{paragraph}</p>" for paragraph in paragraphs)
+    return (
+        '<?xml version="1.0" encoding="utf-8"?>\n'
+        '<html xmlns="http://www.w3.org/1999/xhtml">\n'
+        f"<head><title>Test</title></head>\n<body>\n{body}\n</body>\n</html>"
+    )
+
+
+def write_minimal_epub(path: Path, xhtml: str = MINIMAL_XHTML) -> Path:
     """Write the minimal EPUB to `path` and return it."""
     with zipfile.ZipFile(path, "w") as zf:
         # mimetype must come first and stay uncompressed
@@ -56,5 +66,5 @@ def write_minimal_epub(path: Path) -> Path:
         )
         zf.writestr("META-INF/container.xml", MINIMAL_CONTAINER)
         zf.writestr("content.opf", MINIMAL_OPF)
-        zf.writestr("ch01.xhtml", MINIMAL_XHTML)
+        zf.writestr("ch01.xhtml", xhtml)
     return path

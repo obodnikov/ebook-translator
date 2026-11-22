@@ -546,6 +546,97 @@ class TestJudgeReceivesTheSourceText:
         assert "вестигиум" in "\n".join(capture["translations"].values())
 
 
+class TestTranslateStopsWhenChunksFail:
+    """A chunk left untranslated must not end in an EPUB marked as done.
+
+    The Tainted Cup run went on from translate through every later stage with five
+    chunks missing, then would have written a half-English book and marked it done.
+    """
+
+    GOOD = (
+        "===PARAGRAPH 1===\n<p>Это тестовый абзац про вестигиум.</p>\n"
+        "===PARAGRAPH 2===\n<p>Ещё абзац с Сиуоллом.</p>"
+    )
+    BROKEN = "===PARAGRAPH 1===\n<p>Обрыв\n===PARAGRAPH 2===\n<p>Обрыв"
+
+    def _run(self, tmp_path: Path, reply: str, *flags: str):
+        calls: list[str] = []
+
+        def fake_complete(**kwargs):
+            calls.append(kwargs.get("system", ""))
+            result = MagicMock()
+            if "score" in (kwargs.get("system", "") + kwargs.get("user", "")).lower():
+                result.text = '{"score": 5, "issues": []}'
+            else:
+                result.text = reply
+            result.input_tokens = 10
+            result.output_tokens = 10
+            result.finish_reason = "stop"
+            return result
+
+        provider = MagicMock()
+        provider.complete.side_effect = fake_complete
+        epub = tmp_path / "book.epub"
+        if not epub.exists():
+            write_minimal_epub(epub)
+        with patch("booktranslator.cli.create_stage_provider", return_value=provider):
+            result = runner.invoke(
+                app,
+                [
+                    "translate",
+                    str(epub),
+                    "--work",
+                    str(tmp_path / "work"),
+                    "--no-notes",
+                    "--no-proofread",
+                    "--no-style",
+                    "--no-verify",
+                    "--no-reflect",
+                    "--out",
+                    str(tmp_path / "out.epub"),
+                    *flags,
+                ],
+            )
+        return result, calls
+
+    @staticmethod
+    def _state(tmp_path: Path) -> dict:
+        return json.loads((tmp_path / "work" / "test-book" / "state.json").read_text("utf-8"))
+
+    def test_stops_before_the_later_stages_and_writes_no_epub(self, tmp_path: Path):
+        result, calls = self._run(tmp_path, self.BROKEN)
+
+        assert result.exit_code == 1
+        assert "ch01_c01" in result.output
+        assert "--allow-failed-chunks" in result.output
+        assert len(calls) == 2, "the first ask and the retry, and no judge call after them"
+        assert not (tmp_path / "out.epub").exists()
+        state = self._state(tmp_path)
+        assert state["current_stage"] == "translate"
+        assert "done" not in state["completed_stages"]
+        assert "ch01_c01" in state["last_error"]
+
+    def test_the_flag_goes_on_and_the_state_still_says_what_failed(self, tmp_path: Path):
+        result, _ = self._run(tmp_path, self.BROKEN, "--allow-failed-chunks")
+
+        assert result.exit_code == 0, result.output
+        assert (tmp_path / "out.epub").exists()
+        state = self._state(tmp_path)
+        assert state["current_stage"] == "done"
+        assert "ch01_c01" in state["last_error"]
+
+    def test_a_later_clean_run_clears_the_error_and_finishes(self, tmp_path: Path):
+        self._run(tmp_path, self.BROKEN)
+
+        result, _ = self._run(tmp_path, self.GOOD)
+
+        assert result.exit_code == 0, result.output
+        assert (tmp_path / "out.epub").exists()
+        state = self._state(tmp_path)
+        assert state["current_stage"] == "done"
+        assert state["last_error"] is None
+
+
 # ---------------------------------------------------------------------------
 # btrans cache clear
 # ---------------------------------------------------------------------------

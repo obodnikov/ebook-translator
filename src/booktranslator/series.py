@@ -188,3 +188,8 @@ def render_for_prompt(series: SeriesGlossary) -> str:
             line += f" | {short}"
         lines.append(line)
     return "\n".join(lines)
+
+
+def translations_text(glossary: SeriesGlossary | None) -> str:
+    """Every translation the glossary prescribes, for checks that must not reject one."""
+    return " ".join(e.translation for e in glossary.entries) if glossary else ""

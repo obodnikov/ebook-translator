@@ -107,6 +107,7 @@ def extract_glossary(
     source_lang: str = "en",
     target_lang: str = "ru",
     known_terms: str | None = None,
+    reasoning_effort: str | None = None,
 ) -> tuple[Glossary, CompletionResult | None, str]:
     """Run the glossary extraction pass on the whole book.
 
@@ -121,7 +122,7 @@ def extract_glossary(
     meaning the provider silently truncated the book text. The cache is
     NOT written in that case.
     """
-    prompt = load_prompt(prompt_path)
+    prompt = load_prompt(prompt_path, reasoning_effort)
     chosen_model = model or prompt.model
     if not chosen_model:
         raise ValueError("No model specified (neither CLI/config nor prompt frontmatter)")
@@ -203,8 +204,7 @@ def extract_glossary(
             )
             raise EmptyCompletionError(
                 f"Model returned empty content{finish_info}. "
-                "Reasoning shares the response budget with the answer — lower "
-                "reasoning_effort in the prompt, or shrink the request."
+                "If it reasoned at length, lower the reasoning level."
             )
 
         # Parse and validate bookend BEFORE writing to cache.
